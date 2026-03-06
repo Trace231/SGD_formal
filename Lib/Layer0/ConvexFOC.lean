@@ -5,13 +5,21 @@ import Mathlib.LinearAlgebra.AffineSpace.AffineMap
 import Mathlib.Analysis.InnerProductSpace.Calculus
 
 /-!
-# First-Order Conditions for Convex and Strongly Convex Functions
+# First-Order Conditions for Convex and Strongly Convex Functions (Layer 0 Infrastructure)
 
-Mathlib lacks the multi-dimensional first-order condition for convex functions:
-`f(y) ≥ f(x) + ⟪∇f(x), y - x⟫` when `f` is convex and differentiable.
+Layer: 0 (pure math tools, no stochastic content)
 
-We prove this by reducing to the scalar case via line segments, reusing
-`hasDerivAt_comp_lineSegment` from `SmoothDescent.lean`.
+Mathlib has `ConvexOn`, `StrongConvexOn`, and scalar FOC (`ConvexOn.le_slope_of_hasDerivAt`),
+but lacks the multivariate first-order conditions for Hilbert spaces connected to `HasGradientAt`.
+
+This file provides:
+1. `convex_first_order_condition`: f(y) ≥ f(x) + ⟪∇f(x), y−x⟫
+   Gap type: Level 1 (completely missing for Hilbert spaces in Mathlib).
+2. `strong_convex_first_order_condition`: f(y) ≥ f(x) + ⟪∇f(x), y−x⟫ + μ/2·‖y−x‖²
+   Gap type: Level 1 (completely missing), with Level 3 sub-step for gradient computation.
+3. Corollaries `convex_inner_lower_bound` and `strong_convex_inner_lower_bound` for minimizers.
+
+Triggered by: SGD convex and strongly convex convergence theorems.
 -/
 
 open MeasureTheory Set
@@ -23,10 +31,22 @@ variable {E : Type*} [NormedAddCommGroup E] [InnerProductSpace ℝ E] [CompleteS
 -- Part 1: Convex first-order condition
 -- ============================================================================
 
-/-- **First-order condition for convex functions.**
+/-- First-order condition for convex functions (multivariate, Hilbert space).
+
+Layer: 0 | Gap: Level 1 (result absent from Mathlib for Hilbert spaces)
+Technique: line-segment reduction to scalar — compose f with AffineMap.lineMap,
+  apply scalar FOC `ConvexOn.le_slope_of_hasDerivAt`, identify derivative via
+  `hasDerivAt_comp_lineSegment`.
+Proof steps:
+  [L3: g = f ∘ AffineMap.lineMap (form matching via ext+simp+abel)]
+  [L0: ConvexOn.comp_affineMap]
+  [L2: hasDerivAt_comp_lineSegment + simp at t=0]
+  [L0: ConvexOn.le_slope_of_hasDerivAt]
+  [L0: simp + linarith to conclude]
+Used in: `strong_convex_first_order_condition`, `convex_inner_lower_bound`
 
 If `f : E → ℝ` is convex on `Set.univ` and has gradient `gradF` everywhere, then
-`f(y) ≥ f(x) + ⟪∇f(x), y - x⟫` for all `x, y`. -/
+`f(y) ≥ f(x) + ⟪∇f(x), y − x⟫` for all `x, y`. -/
 theorem convex_first_order_condition
     {f : E → ℝ} {gradF : E → E}
     (hconv : ConvexOn ℝ univ f)
@@ -56,15 +76,21 @@ theorem convex_first_order_condition
 -- Part 2: Strong convexity first-order condition
 -- ============================================================================
 
-/-- **First-order condition for strongly convex functions.**
+/-- First-order condition for strongly convex functions (multivariate, Hilbert space).
+
+Layer: 0 | Gap: Level 1 (result absent from Mathlib for Hilbert spaces)
+Technique: reduce to convex FOC via `strongConvexOn_iff_convex` (h = f − μ/2·‖·‖²),
+  compute ∇h via `hasStrictFDerivAt_norm_sq`, apply `convex_first_order_condition`,
+  recover result via norm algebraic identity.
+Proof steps:
+  [L0: strongConvexOn_iff_convex]
+  [L3: gradient of h: hasStrictFDerivAt_norm_sq + CLM form matching via convert+simp]
+  [dep: convex_first_order_condition applied to h]
+  [L0: norm_sub_sq_real + inner_sub_right + linarith]
+Used in: `strong_convex_inner_lower_bound`
 
 If `f : E → ℝ` is `μ`-strongly convex and has gradient `gradF` everywhere, then
-`f(y) ≥ f(x) + ⟪∇f(x), y - x⟫ + μ/2 · ‖y - x‖²`.
-
-Proof: By `strongConvexOn_iff_convex`, `h(w) = f(w) - μ/2·‖w‖²` is convex.
-Apply the convex FOC to `h`, whose gradient is `∇h(w) = ∇f(w) - μ·w`
-(since `∇(‖·‖²/2) = id`). An algebraic identity relating `⟪x, y-x⟫` to
-norms then gives the result. -/
+`f(y) ≥ f(x) + ⟪∇f(x), y − x⟫ + μ/2 · ‖y − x‖²`. -/
 theorem strong_convex_first_order_condition
     {f : E → ℝ} {gradF : E → E} {μ : ℝ}
     (hsc : StrongConvexOn univ μ f)
@@ -104,7 +130,13 @@ theorem strong_convex_first_order_condition
 -- Part 3: Corollaries for minimizers
 -- ============================================================================
 
-/-- For a convex function, `⟪∇f(w), w - w*⟫ ≥ f(w) - f(w*)`. -/
+/-- Convex lower bound on inner product with gradient at a minimizer.
+
+Layer: 0 | Gap: Level 1 corollary
+Proof steps: [dep: convex_first_order_condition at (w, wStar)] [L0: inner_neg_right + linarith]
+Used in: `one_step_progress_convex` (Algorithms/SGD.lean, Step 4)
+
+For a convex function, `⟪∇f(w), w − w*⟫ ≥ f(w) − f(w*)`. -/
 theorem convex_inner_lower_bound
     {f : E → ℝ} {gradF : E → E}
     (hconv : ConvexOn ℝ univ f)
@@ -115,8 +147,14 @@ theorem convex_inner_lower_bound
   rw [show wStar - w = -(w - wStar) from by abel, inner_neg_right] at h
   linarith
 
-/-- For a μ-strongly convex function with minimizer `w*`:
-`⟪∇f(w), w - w*⟫ ≥ μ/2 · ‖w - w*‖²`. -/
+/-- Strong convex lower bound on inner product with gradient at a minimizer.
+
+Layer: 0 | Gap: Level 1 corollary
+Proof steps: [dep: strong_convex_first_order_condition at (w, wStar)] [L0: norm_neg + linarith]
+Used in: `one_step_progress_sc` (Algorithms/SGD.lean, Step 4) — produces contraction factor (1−ημ)
+
+For a μ-strongly convex function with minimizer `w*`:
+`⟪∇f(w), w − w*⟫ ≥ μ/2 · ‖w − w*‖²`. -/
 theorem strong_convex_inner_lower_bound
     {f : E → ℝ} {gradF : E → E} {μ : ℝ} {wStar : E}
     (hsc : StrongConvexOn univ μ f)

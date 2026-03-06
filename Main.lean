@@ -10,8 +10,8 @@ import Mathlib.Data.NNReal.Defs
 import Mathlib.Analysis.Calculus.Gradient.Basic
 import Mathlib.Analysis.Convex.Strong
 import Mathlib.Algebra.BigOperators.Group.Finset.Basic
-import IndepExpect
-import ConvexGradient
+import Lib.Layer0.IndepExpect
+import Lib.Layer0.ConvexFOC
 
 
 open MeasureTheory ProbabilityTheory
