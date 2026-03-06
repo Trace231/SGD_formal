@@ -35,7 +35,7 @@ whose update has the form `wₜ₊₁ = wₜ − η · gradL(wₜ, ξₜ)`.
 
 * `StochasticDescentHyps` — one-step stochastic setup structure
 * `descent_lemma'` — deterministic L-smooth per-step bound
-* `stochastic_descent_nonconvex` — expected one-step descent (non-convex)
+* `stochastic_descent_nonconvex'` — expected one-step descent (non-convex)
 * `stochastic_descent_convex'` — one-step distance progress (convex)
 * `stochastic_descent_strongly_convex'` — one-step contraction (strongly convex)
 
@@ -177,10 +177,10 @@ Proof steps:
   [dep: expectation_inner_gradL_eq with h = gradF]
   [dep: expectation_norm_sq_gradL_bound]
   [L0: linarith to combine]
-Used in: Algorithms/SGD.lean `stochastic_descent_nonconvex_step`
+Used in: Algorithms/SGD.lean `sgd_convergence_nonconvex_v2`
 
 `E[f(wt − η·gradL(wt, ξt))] ≤ E[f(wt)] − η·E[‖∇f(wt)‖²] + η²·L·σ²/2` -/
-theorem stochastic_descent_nonconvex
+theorem stochastic_descent_nonconvex'
     (hyps : StochasticDescentHyps E S Ω) (f : E → ℝ) {L : NNReal} {σ : ℝ}
     (hgrad : IsGradientOf' f hyps.gradF)
     (hsmooth : IsLSmooth' hyps.gradF L)

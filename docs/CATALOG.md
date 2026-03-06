@@ -224,7 +224,7 @@ All three meta-theorems below share the 5-step proof skeleton:
 
 ---
 
-#### `stochastic_descent_nonconvex`
+#### `stochastic_descent_nonconvex'`
 
 | Field | Value |
 |---|---|
