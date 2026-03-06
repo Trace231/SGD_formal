@@ -9,15 +9,20 @@ import Mathlib.Topology.MetricSpace.Lipschitz
 import Mathlib.Data.NNReal.Defs
 
 /-!
-# L-Smooth Descent Infrastructure
+# Gradient FTC and L-Smooth Quadratic Bound (Layer 0 Infrastructure)
 
-Missing Mathlib infrastructure for SGD convergence proofs:
+Layer: 0 (pure math tools, no stochastic content)
 
-1. `integral_inner_gradient_segment`: Fundamental theorem of calculus along a line segment
-   for functions `f : E → ℝ` with known gradient, expressed as an inner product integral.
+This file provides two infrastructure lemmas missing from Mathlib:
 
-2. `lipschitz_gradient_quadratic_bound`: The classical L-smooth quadratic upper bound:
-   if `∇f` is `L`-Lipschitz, then `f(y) ≤ f(x) + ⟪∇f(x), y - x⟫ + L/2 · ‖y - x‖²`.
+1. `integral_inner_gradient_segment`: FTC along a line segment for `f : E → ℝ`
+   with known gradient, expressed as an inner product integral.
+   Gap type: Level 3 (form mismatch — Mathlib has scalar FTC but not Hilbert gradient form).
+
+2. `lipschitz_gradient_quadratic_bound`: The classical L-smooth quadratic upper bound.
+   Gap type: Level 2/3 composite (FTC composition + Lipschitz integral estimate).
+
+Triggered by: SGD non-convex convergence (`descent_lemma` in Algorithms/SGD.lean).
 -/
 
 open MeasureTheory Set NNReal
@@ -29,7 +34,14 @@ variable {E : Type*} [NormedAddCommGroup E] [InnerProductSpace ℝ E] [CompleteS
 -- Part 1: Composing HasGradientAt with a line segment
 -- ============================================================================
 
-/-- If `f : E → ℝ` has gradient `gradF w` at every `w`, then the composition
+/-- Derivative of f composed with a line segment parametrization.
+
+Layer: 0 | Gap: Level 3 (form mismatch)
+Technique: gradient-to-derivative bridge via `InnerProductSpace.toDual_apply_apply`
+Proof steps: [L0: hasFDerivAt] [L0: hasDerivAt chain rule] [L3: toDual rewrite]
+Used in: `integral_inner_gradient_segment`, `convex_first_order_condition`
+
+If `f : E → ℝ` has gradient `gradF w` at every `w`, then the composition
 `φ(t) = f(x + t • d)` has derivative `⟪gradF(x + t • d), d⟫` at every `t ∈ ℝ`. -/
 theorem hasDerivAt_comp_lineSegment
     {f : E → ℝ} {gradF : E → E}
@@ -47,12 +59,16 @@ theorem hasDerivAt_comp_lineSegment
 -- Part 2: FTC along a segment (gradient form)
 -- ============================================================================
 
-/-- **Fundamental theorem of calculus along a line segment (gradient form).**
+/-- Fundamental theorem of calculus along a line segment (gradient form).
+
+Layer: 0 | Gap: Level 3 (form mismatch)
+Technique: reduce to scalar FTC via `hasDerivAt_comp_lineSegment`
+Proof steps: [dep: hasDerivAt_comp_lineSegment] [L3: continuity of inner product composition]
+             [L0: intervalIntegral.integral_eq_sub_of_hasDerivAt]
+Used in: `lipschitz_gradient_quadratic_bound`, `convex_first_order_condition`
 
 If `f : E → ℝ` has gradient `gradF w` at every `w`, and `gradF` is continuous, then
-`f(x + d) - f(x) = ∫ t in 0..1, ⟪gradF(x + t • d), d⟫`.
-
-This is the key infrastructure lemma missing from Mathlib. -/
+`f(x + d) - f(x) = ∫ t in 0..1, ⟪gradF(x + t • d), d⟫`. -/
 theorem integral_inner_gradient_segment
     {f : E → ℝ} {gradF : E → E}
     (hgrad : ∀ w, HasGradientAt f (gradF w) w)
@@ -111,7 +127,14 @@ private theorem integral_id_zero_one : ∫ x in (0 : ℝ)..1, id x = (1 : ℝ) /
     (continuous_id.continuousOn.intervalIntegrable)]
   norm_num
 
-/-- **L-smooth quadratic upper bound.**
+/-- L-smooth quadratic upper bound.
+
+Layer: 0 | Gap: Level 2+3 composite
+Technique: FTC + Cauchy-Schwarz + Lipschitz integral estimate
+Proof steps: [dep: integral_inner_gradient_segment] [L0: inner_add_left split]
+             [L0: integral_add] [L2: real_inner_le_norm + LipschitzWith.dist_le_mul]
+             [L3: integral_id_zero_one (manual FTC for ∫₀¹ t dt = 1/2)]
+Used in: `descent_lemma` (Algorithms/SGD.lean)
 
 If `∇f` is `L`-Lipschitz (i.e., `f` is L-smooth), then for all `x, d`:
 `f(x + d) ≤ f(x) + ⟪∇f(x), d⟫ + L/2 · ‖d‖²`. -/
@@ -156,7 +179,7 @@ theorem lipschitz_gradient_quadratic_bound
             (fun t : ℝ => ((↑L : ℝ) * ‖d‖ ^ 2) * (id t)) from by ext; simp [id]]
         rw [intervalIntegral.integral_const_mul, integral_id_zero_one]; ring
 
-/-- **L-smooth quadratic upper bound (point-to-point form).**
+/-- L-smooth quadratic upper bound (point-to-point form).
 
 `f(y) ≤ f(x) + ⟪∇f(x), y - x⟫ + L/2 · ‖y - x‖²` -/
 theorem lipschitz_gradient_quadratic_bound'

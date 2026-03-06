@@ -1,5 +1,5 @@
 import Mathlib.Analysis.InnerProductSpace.Basic
-import SmoothDescent
+import Lib.Layer0.GradientFTC
 import Mathlib.MeasureTheory.Integral.Bochner.Basic
 import Mathlib.MeasureTheory.Function.L2Space
 import Mathlib.Probability.Martingale.Basic

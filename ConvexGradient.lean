@@ -1,4 +1,4 @@
-import SmoothDescent
+import Lib.Layer0.GradientFTC
 import Mathlib.Analysis.Convex.Deriv
 import Mathlib.Analysis.Convex.Strong
 import Mathlib.LinearAlgebra.AffineSpace.AffineMap
