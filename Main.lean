@@ -160,6 +160,55 @@ theorem sgdProcess_adapted {w₀ : E} {η : ℕ → ℝ}
     exact h_wt.sub ((hg.comp (h_wt.prodMk h_ξt)).const_smul _)
 
 -- ============================================================================
+-- Section 5b : Independence of process t from ξ t
+-- ============================================================================
+
+/-- The SGD process at step `t` is independent of the random sample `ξ t`.
+
+**Proof**: `process t` depends only on `ξ 0, …, ξ (t−1)`, so it is measurable w.r.t.
+`ℱ_t = σ(ξ₀, …, ξ_{t−1})`. By `iIndepFun`, `ℱ_t ⊥ σ(ξ_t)`, hence
+`process t ⊥ ξ t` by sigma-algebra monotonicity. -/
+lemma sgdProcess_indepFun_xi
+    {w₀ : E} {η : ℕ → ℝ} {gradL : E → S → E} {ξ : ℕ → Ω → S}
+    {P : Measure Ω}
+    (hξ_meas : ∀ t, Measurable (ξ t))
+    (hξ_indep : iIndepFun (β := fun _ => S) ξ P)
+    (hgL : Measurable (Function.uncurry gradL))
+    (t : ℕ) :
+    IndepFun (sgdProcess w₀ η gradL ξ t) (ξ t) P := by
+  -- The natural filtration
+  set F := sgdFiltration ξ hξ_meas with hF_def
+  -- process t is F t -measurable (adaptedness)
+  have h_adapted : Measurable[F t] (sgdProcess w₀ η gradL ξ t) :=
+    sgdProcess_adapted hξ_meas hgL t
+  -- comap(process t) ≤ F t
+  have h_comap_le :
+      (inferInstance : MeasurableSpace E).comap (sgdProcess w₀ η gradL ξ t) ≤ F t :=
+    measurable_iff_comap_le.mp h_adapted
+  -- iIndepFun gives iIndep on comap sigma-algebras (definitionally)
+  have h_iIndep : iIndep (fun i => (inferInstance : MeasurableSpace S).comap (ξ i)) P :=
+    hξ_indep
+  -- F t and comap(ξ t) are independent: from iIndep + disjoint index sets
+  have h_filt_indep : Indep (F t) ((inferInstance : MeasurableSpace S).comap (ξ t)) P := by
+    have h_le : ∀ i, (inferInstance : MeasurableSpace S).comap (ξ i) ≤ mΩ :=
+      fun i => (hξ_meas i).comap_le
+    have h_disj : Disjoint ({j : ℕ | j < t}) ({t} : Set ℕ) :=
+      Set.disjoint_left.mpr fun j hj ht => absurd (ht ▸ hj) (Nat.lt_irrefl t)
+    -- F t = ⨆ j ∈ {j | j < t}, comap(ξ j)  (matches filtration definition)
+    have h_F_eq : F t = ⨆ j ∈ {j : ℕ | j < t},
+        (inferInstance : MeasurableSpace S).comap (ξ j) := by
+      simp [hF_def, sgdFiltration, Set.mem_setOf_eq]
+    -- ⨆ i ∈ {t}, comap(ξ i) = comap(ξ t)
+    have h_sing : ⨆ i ∈ ({t} : Set ℕ),
+        (inferInstance : MeasurableSpace S).comap (ξ i) =
+        (inferInstance : MeasurableSpace S).comap (ξ t) := by
+      simp [iSup_singleton]
+    rw [h_F_eq, ← h_sing]
+    exact indep_iSup_of_disjoint h_le h_iIndep h_disj
+  -- Conclude by monotonicity: comap(process t) ≤ F t
+  exact indep_of_indep_of_le_left h_filt_indep h_comap_le
+
+-- ============================================================================
 -- Section 6 : Assumptions on Stochastic Gradient
 -- ============================================================================
 
@@ -272,13 +321,32 @@ lemma stochastic_descent_nonconvex
     (hsmooth : IsLSmooth setup.gradF L)
     (hvar : HasBoundedVariance setup.gradL setup.sampleDist σ)
     (hunb : IsUnbiased setup.gradL setup.gradF setup.sampleDist)
-    (hη : setup.η t = η) :
+    (hη : setup.η t = η)
+    -- Measurability and integrability hypotheses
+    (hgL : Measurable (Function.uncurry setup.gradL))
+    (h_intL : ∀ w, Integrable (setup.gradL w) setup.sampleDist)
+    (h_int_ft : Integrable (fun ω => f (setup.process t ω)) setup.P)
+    (h_int_ft1 : Integrable (fun ω => f (setup.process (t + 1) ω)) setup.P)
+    (h_int_inner : Integrable (fun ω =>
+        ⟪setup.gradF (setup.process t ω), setup.gradL (setup.process t ω) (setup.ξ t ω)⟫_ℝ)
+      setup.P)
+    (h_int_sq : Integrable (fun ω =>
+        ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2) setup.P)
+    (h_int_gF_sq : Integrable (fun ω =>
+        ‖setup.gradF (setup.process t ω)‖ ^ 2) setup.P) :
     ∫ ω, f (setup.process (t + 1) ω) ∂setup.P ≤
       ∫ ω, f (setup.process t ω) ∂setup.P
       - η * ∫ ω, ‖setup.gradF (setup.process t ω)‖ ^ 2 ∂setup.P
       + η ^ 2 * (L : ℝ) * σ ^ 2 / 2 := by
   set wt := setup.process t
   set gt := fun ω => setup.gradL (wt ω) (setup.ξ t ω)
+  haveI := setup.hP
+  -- Auxiliary: distribution of ξ t equals sampleDist
+  have h_dist_t : Measure.map (setup.ξ t) setup.P = setup.sampleDist :=
+    (setup.hξ_ident t).map_eq
+  -- Auxiliary: process t ⊥ ξ t (Phase 2a)
+  have h_indep_t : IndepFun wt (setup.ξ t) setup.P :=
+    sgdProcess_indepFun_xi setup.hξ_meas setup.hξ_indep hgL t
   -- Step 1: Pointwise descent from descent_lemma
   have h_pw : ∀ ω,
       f (wt ω - η • gt ω) ≤
@@ -289,15 +357,73 @@ lemma stochastic_descent_nonconvex
   have h_step_eq : ∀ ω,
       f (setup.process (t + 1) ω) = f (wt ω - η • gt ω) := by
     intro ω; simp [SGDSetup.process, sgdProcess, hη, wt, gt]
-  -- Step 3: Integrate the pointwise bound
-  -- f(w_{t+1}) ≤ f(w_t) - η⟪∇f(w_t), g_t⟫ + (L/2)η²‖g_t‖²
-  -- ∫ f(w_{t+1}) ≤ ∫ f(w_t) - η ∫ ⟪∇f(w_t), g_t⟫ + (L/2)η² ∫ ‖g_t‖²
-  -- Step 4: Use independence + unbiasedness:
-  --   ∫ ⟪∇f(w_t), g_t⟫ = ∫ ⟪∇f(w_t), ∇f(w_t)⟫ = ∫ ‖∇f(w_t)‖²
-  -- Step 5: Use bounded variance: ∫ ‖g_t‖² ≤ σ²
-  -- The deep measure-theory steps (integration, Fubini, independence)
-  -- are left as sorry pending IndepExpect infrastructure
-  sorry
+  -- Integrability of the RHS pointwise bound
+  have h_int_rhs : Integrable (fun ω =>
+      f (wt ω) - η * ⟪setup.gradF (wt ω), gt ω⟫_ℝ +
+        (L : ℝ) / 2 * η ^ 2 * ‖gt ω‖ ^ 2) setup.P :=
+    (h_int_ft.sub (h_int_inner.const_mul η)).add
+      (h_int_sq.const_mul ((L : ℝ) / 2 * η ^ 2))
+  -- Step 3: Integrate the pointwise bound (use ▸ to handle beta-unreduced goal from integral_mono)
+  have h_int3 : ∫ ω, f (setup.process (t + 1) ω) ∂setup.P ≤
+      ∫ ω, (f (wt ω) - η * ⟪setup.gradF (wt ω), gt ω⟫_ℝ +
+        (L : ℝ) / 2 * η ^ 2 * ‖gt ω‖ ^ 2) ∂setup.P :=
+    integral_mono h_int_ft1 h_int_rhs fun ω => h_step_eq ω ▸ h_pw ω
+  -- Simplify the RHS integral using linearity (term-level, avoids rw pattern issues)
+  have h_rhs_lin :
+      ∫ ω, (f (wt ω) - η * ⟪setup.gradF (wt ω), gt ω⟫_ℝ +
+        (L : ℝ) / 2 * η ^ 2 * ‖gt ω‖ ^ 2) ∂setup.P =
+      ∫ ω, f (wt ω) ∂setup.P
+      - η * ∫ ω, ⟪setup.gradF (wt ω), gt ω⟫_ℝ ∂setup.P
+      + (L : ℝ) / 2 * η ^ 2 * ∫ ω, ‖gt ω‖ ^ 2 ∂setup.P := by
+    have h1 : ∫ ω, (f (wt ω) - η * ⟪setup.gradF (wt ω), gt ω⟫_ℝ +
+        (L : ℝ) / 2 * η ^ 2 * ‖gt ω‖ ^ 2) ∂setup.P =
+        ∫ ω, (f (wt ω) - η * ⟪setup.gradF (wt ω), gt ω⟫_ℝ) ∂setup.P +
+        ∫ ω, ((L : ℝ) / 2 * η ^ 2 * ‖gt ω‖ ^ 2) ∂setup.P :=
+      integral_add (h_int_ft.sub (h_int_inner.const_mul η)) (h_int_sq.const_mul _)
+    have h2 : ∫ ω, (f (wt ω) - η * ⟪setup.gradF (wt ω), gt ω⟫_ℝ) ∂setup.P =
+        ∫ ω, f (wt ω) ∂setup.P - ∫ ω, (η * ⟪setup.gradF (wt ω), gt ω⟫_ℝ) ∂setup.P :=
+      integral_sub h_int_ft (h_int_inner.const_mul η)
+    have h3 : ∫ ω, (η * ⟪setup.gradF (wt ω), gt ω⟫_ℝ) ∂setup.P =
+        η * ∫ ω, ⟪setup.gradF (wt ω), gt ω⟫_ℝ ∂setup.P :=
+      integral_const_mul η _
+    have h4 : ∫ ω, ((L : ℝ) / 2 * η ^ 2 * ‖gt ω‖ ^ 2) ∂setup.P =
+        (L : ℝ) / 2 * η ^ 2 * ∫ ω, ‖gt ω‖ ^ 2 ∂setup.P :=
+      integral_const_mul _ _
+    linarith
+  -- Step 4: Unbiasedness — ∫ ⟪∇f(wt), gt⟫ = ∫ ‖∇f(wt)‖²
+  have h_unb : ∫ ω, ⟪setup.gradF (wt ω), gt ω⟫_ℝ ∂setup.P =
+      ∫ ω, ‖setup.gradF (wt ω)‖ ^ 2 ∂setup.P := by
+    have h_sq_eq : ∀ ω, ⟪setup.gradF (wt ω), setup.gradF (wt ω)⟫_ℝ =
+        ‖setup.gradF (wt ω)‖ ^ 2 := fun ω => real_inner_self_eq_norm_sq _
+    rw [show ∫ ω, ‖setup.gradF (wt ω)‖ ^ 2 ∂setup.P =
+        ∫ ω, ⟪setup.gradF (wt ω), setup.gradF (wt ω)⟫_ℝ ∂setup.P by
+          congr 1; ext ω; rw [h_sq_eq ω]]
+    exact expectation_inner_gradL_eq
+      hunb h_indep_t h_dist_t (fun w => setup.gradF w)
+      (sgdProcess_measurable setup.hξ_meas hgL t)
+      (setup.hξ_meas t)
+      hgL hsmooth.continuous.measurable hsmooth.continuous.measurable h_intL h_int_inner
+  -- Step 5: Bounded variance — ∫ ‖gt‖² ≤ σ²
+  have h_var : ∫ ω, ‖gt ω‖ ^ 2 ∂setup.P ≤ σ ^ 2 :=
+    expectation_norm_sq_gradL_bound
+      hvar h_indep_t h_dist_t
+      (sgdProcess_measurable setup.hξ_meas hgL t)
+      (setup.hξ_meas t) hgL h_int_sq
+  -- Combine
+  calc ∫ ω, f (setup.process (t + 1) ω) ∂setup.P
+      ≤ ∫ ω, f (wt ω) ∂setup.P
+        - η * ∫ ω, ⟪setup.gradF (wt ω), gt ω⟫_ℝ ∂setup.P
+        + (L : ℝ) / 2 * η ^ 2 * ∫ ω, ‖gt ω‖ ^ 2 ∂setup.P :=
+          h_int3.trans_eq h_rhs_lin
+    _ = ∫ ω, f (wt ω) ∂setup.P
+        - η * ∫ ω, ‖setup.gradF (wt ω)‖ ^ 2 ∂setup.P
+        + (L : ℝ) / 2 * η ^ 2 * ∫ ω, ‖gt ω‖ ^ 2 ∂setup.P := by rw [h_unb]
+    _ ≤ ∫ ω, f (wt ω) ∂setup.P
+        - η * ∫ ω, ‖setup.gradF (wt ω)‖ ^ 2 ∂setup.P
+        + η ^ 2 * (L : ℝ) * σ ^ 2 / 2 := by
+          have h_var_mul := mul_le_mul_of_nonneg_left h_var
+            (show (0:ℝ) ≤ (L:ℝ)/2 * η^2 by positivity)
+          linarith
 
 /-- **Non-Convex SGD Convergence Theorem**.
 With constant step size η > 0, after T steps:
@@ -320,7 +446,18 @@ theorem sgd_convergence_nonconvex
     (hlower : ∀ w, f_star ≤ f w)
     (hη_pos : 0 < η)
     (hη : ∀ t, setup.η t = η)
-    (T : ℕ) (hT : 0 < T) :
+    (T : ℕ) (hT : 0 < T)
+    -- Measurability and per-step integrability (provided by caller)
+    (hgL : Measurable (Function.uncurry setup.gradL))
+    (h_intL : ∀ w, Integrable (setup.gradL w) setup.sampleDist)
+    (h_int_f : ∀ t, Integrable (fun ω => f (setup.process t ω)) setup.P)
+    (h_int_sq : ∀ t, Integrable (fun ω =>
+        ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2) setup.P)
+    (h_int_gF_sq : ∀ t, Integrable (fun ω =>
+        ‖setup.gradF (setup.process t ω)‖ ^ 2) setup.P)
+    (h_int_inner : ∀ t, Integrable (fun ω =>
+        ⟪setup.gradF (setup.process t ω), setup.gradL (setup.process t ω) (setup.ξ t ω)⟫_ℝ)
+      setup.P) :
     (1 / (T : ℝ)) * ∑ t ∈ Finset.range T,
         ∫ ω, ‖setup.gradF (setup.process t ω)‖ ^ 2 ∂setup.P ≤
       2 * (f setup.w₀ - f_star) / (η * T) + η * (L : ℝ) * σ ^ 2 := by
@@ -331,6 +468,8 @@ theorem sgd_convergence_nonconvex
         - η * ∫ ω, ‖setup.gradF (setup.process t ω)‖ ^ 2 ∂setup.P
         + η ^ 2 * (L : ℝ) * σ ^ 2 / 2 :=
     fun t _ => stochastic_descent_nonconvex setup f hgrad hsmooth hvar hunb (hη t)
+      hgL h_intL (h_int_f t) (h_int_f (t + 1)) (h_int_inner t)
+      (h_int_sq t) (h_int_gF_sq t)
   -- Step 2: sum and telescope → η · Σ‖∇f‖² ≤ (f(w₀) − E[f(w_T)]) + T·η²Lσ²/2
   have hsum : η * ∑ t ∈ Finset.range T,
         ∫ ω, ‖setup.gradF (setup.process t ω)‖ ^ 2 ∂setup.P ≤
@@ -356,9 +495,8 @@ theorem sgd_convergence_nonconvex
     haveI := setup.hP
     calc f_star = ∫ _, f_star ∂setup.P := by rw [integral_const, smul_eq_mul, probReal_univ, one_mul]
       _ ≤ ∫ ω, f (setup.process T ω) ∂setup.P := by
-            apply integral_mono (integrable_const _)
-            · sorry -- integrability of f ∘ process T
-            · intro ω; exact hlower _
+            apply integral_mono (integrable_const _) (h_int_f T)
+            intro ω; exact hlower _
   -- Step 4: algebraic rearrangement and division by η·T
   have hT_pos : (0 : ℝ) < T := Nat.cast_pos.mpr hT
   have hηT_pos : (0 : ℝ) < η * T := mul_pos hη_pos hT_pos
@@ -411,35 +549,113 @@ lemma one_step_progress_convex
     (hvar : HasBoundedVariance setup.gradL setup.sampleDist σ)
     (hunb : IsUnbiased setup.gradL setup.gradF setup.sampleDist)
     (hmin : IsMinimizer f wStar)
-    (hη : setup.η t = η) :
+    (hη : setup.η t = η)
+    (hη_pos : 0 < η)
+    -- Measurability and integrability hypotheses
+    (hgL : Measurable (Function.uncurry setup.gradL))
+    (h_intL : ∀ w, Integrable (setup.gradL w) setup.sampleDist)
+    (h_int_inner : Integrable (fun ω =>
+        ⟪setup.process t ω - wStar, setup.gradL (setup.process t ω) (setup.ξ t ω)⟫_ℝ)
+      setup.P)
+    (h_int_sq : Integrable (fun ω =>
+        ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2) setup.P)
+    (h_int_norm_sq : Integrable (fun ω => ‖setup.process t ω - wStar‖ ^ 2) setup.P)
+    (h_int_ft : Integrable (fun ω => f (setup.process t ω)) setup.P)
+    (h_int_gF_inner : Integrable (fun ω =>
+        ⟪setup.process t ω - wStar, setup.gradF (setup.process t ω)⟫_ℝ) setup.P) :
     ∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P ≤
       ∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P
       - 2 * η * (∫ ω, f (setup.process t ω) ∂setup.P - f wStar)
       + η ^ 2 * σ ^ 2 := by
+  set wt := setup.process t
+  set gt := fun ω => setup.gradL (wt ω) (setup.ξ t ω)
+  haveI := setup.hP
+  -- Auxiliary: distribution of ξ t equals sampleDist
+  have h_dist_t : Measure.map (setup.ξ t) setup.P = setup.sampleDist :=
+    (setup.hξ_ident t).map_eq
+  -- Auxiliary: process t ⊥ ξ t
+  have h_indep_t : IndepFun wt (setup.ξ t) setup.P :=
+    sgdProcess_indepFun_xi setup.hξ_meas setup.hξ_indep hgL t
   -- Step 1: Pointwise norm expansion
-  -- ‖w_{t+1} - w*‖² = ‖(w_t - η·g_t) - w*‖²
-  --   = ‖w_t - w*‖² - 2η⟪w_t - w*, g_t⟫ + η²‖g_t‖²
   have h_expand : ∀ ω,
       ‖setup.process (t + 1) ω - wStar‖ ^ 2 =
-        ‖setup.process t ω - wStar‖ ^ 2
-        - 2 * η * ⟪setup.process t ω - wStar, setup.gradL (setup.process t ω) (setup.ξ t ω)⟫_ℝ
-        + η ^ 2 * ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 := by
+        ‖wt ω - wStar‖ ^ 2
+        - 2 * η * ⟪wt ω - wStar, gt ω⟫_ℝ
+        + η ^ 2 * ‖gt ω‖ ^ 2 := by
     intro ω
-    have h_step : setup.process (t + 1) ω =
-        setup.process t ω - η • setup.gradL (setup.process t ω) (setup.ξ t ω) := by
-      simp [SGDSetup.process_succ, hη]
+    have h_step : setup.process (t + 1) ω = wt ω - η • gt ω := by
+      simp [SGDSetup.process_succ, hη]; rfl
     rw [h_step]
-    set w := setup.process t ω
-    set g := setup.gradL w (setup.ξ t ω)
-    show ‖w - η • g - wStar‖ ^ 2 = ‖w - wStar‖ ^ 2 - 2 * η * ⟪w - wStar, g⟫_ℝ + η ^ 2 * ‖g‖ ^ 2
-    have : w - η • g - wStar = (w - wStar) - η • g := by abel
+    have : wt ω - η • gt ω - wStar = (wt ω - wStar) - η • gt ω := by abel
     rw [this, norm_sub_sq_real]
     simp [inner_smul_right, norm_smul, mul_pow, sq_abs]; ring
-  -- Step 2: Integrate the expansion
-  -- Step 3: Unbiased cross-term: ∫ ⟪wₜ-w*, g_t⟫ = ∫ ⟪wₜ-w*, ∇f(wₜ)⟫
-  -- Step 4: Convex FOC: ⟪∇f(w), w - w*⟫ ≥ f(w) - f(w*)
-  -- Step 5: Bounded variance: ∫ ‖g_t‖² ≤ σ²
-  sorry
+  -- Integrability of the expanded form
+  have h_int_exp : Integrable (fun ω =>
+      ‖wt ω - wStar‖ ^ 2 - 2 * η * ⟪wt ω - wStar, gt ω⟫_ℝ + η ^ 2 * ‖gt ω‖ ^ 2) setup.P :=
+    (h_int_norm_sq.sub (h_int_inner.const_mul (2 * η))).add (h_int_sq.const_mul (η ^ 2))
+  -- Integrability of ‖process(t+1) - w*‖²
+  have h_int_t1 : Integrable (fun ω => ‖setup.process (t + 1) ω - wStar‖ ^ 2) setup.P :=
+    h_int_exp.congr (Filter.Eventually.of_forall fun ω => (h_expand ω).symm)
+  -- Step 2: Integrate the expansion (term-level linearity facts, then linarith)
+  have h_int_eq :
+      ∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P =
+        ∫ ω, ‖wt ω - wStar‖ ^ 2 ∂setup.P
+        - 2 * η * ∫ ω, ⟪wt ω - wStar, gt ω⟫_ℝ ∂setup.P
+        + η ^ 2 * ∫ ω, ‖gt ω‖ ^ 2 ∂setup.P := by
+    have hkey : ∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P =
+        ∫ ω, (‖wt ω - wStar‖ ^ 2 - 2 * η * ⟪wt ω - wStar, gt ω⟫_ℝ
+          + η ^ 2 * ‖gt ω‖ ^ 2) ∂setup.P :=
+      integral_congr_ae (Filter.Eventually.of_forall h_expand)
+    have h1 : ∫ ω, (‖wt ω - wStar‖ ^ 2 - 2 * η * ⟪wt ω - wStar, gt ω⟫_ℝ +
+        η ^ 2 * ‖gt ω‖ ^ 2) ∂setup.P =
+        ∫ ω, (‖wt ω - wStar‖ ^ 2 - 2 * η * ⟪wt ω - wStar, gt ω⟫_ℝ) ∂setup.P +
+        ∫ ω, (η ^ 2 * ‖gt ω‖ ^ 2) ∂setup.P :=
+      integral_add (h_int_norm_sq.sub (h_int_inner.const_mul _)) (h_int_sq.const_mul _)
+    have h2 : ∫ ω, (‖wt ω - wStar‖ ^ 2 - 2 * η * ⟪wt ω - wStar, gt ω⟫_ℝ) ∂setup.P =
+        ∫ ω, ‖wt ω - wStar‖ ^ 2 ∂setup.P -
+        ∫ ω, (2 * η * ⟪wt ω - wStar, gt ω⟫_ℝ) ∂setup.P :=
+      integral_sub h_int_norm_sq (h_int_inner.const_mul _)
+    have h3 : ∫ ω, (2 * η * ⟪wt ω - wStar, gt ω⟫_ℝ) ∂setup.P =
+        2 * η * ∫ ω, ⟪wt ω - wStar, gt ω⟫_ℝ ∂setup.P :=
+      integral_const_mul (2 * η) _
+    have h4 : ∫ ω, (η ^ 2 * ‖gt ω‖ ^ 2) ∂setup.P =
+        η ^ 2 * ∫ ω, ‖gt ω‖ ^ 2 ∂setup.P :=
+      integral_const_mul (η ^ 2) _
+    linarith [hkey, h1, h2, h3, h4]
+  -- Step 3: Unbiasedness — ∫ ⟪wt-w*, gt⟫ = ∫ ⟪wt-w*, ∇f(wt)⟫
+  have h_unb_cross :
+      ∫ ω, ⟪wt ω - wStar, gt ω⟫_ℝ ∂setup.P =
+        ∫ ω, ⟪wt ω - wStar, setup.gradF (wt ω)⟫_ℝ ∂setup.P :=
+    expectation_inner_gradL_eq
+      hunb h_indep_t h_dist_t (fun w => w - wStar)
+      (sgdProcess_measurable setup.hξ_meas hgL t)
+      (setup.hξ_meas t) hgL (measurable_id.sub_const wStar)
+      hsmooth.continuous.measurable h_intL h_int_inner
+  -- Step 4: Convex FOC — ⟪wt-w*, ∇f(wt)⟫ ≥ f(wt) - f(w*)
+  -- (use term-mode to avoid beta-unreduced goals from integral_mono)
+  have h_foc : ∫ ω, ⟪wt ω - wStar, setup.gradF (wt ω)⟫_ℝ ∂setup.P ≥
+      ∫ ω, f (wt ω) ∂setup.P - f wStar := by
+    have h_const : ∫ _ : Ω, f wStar ∂setup.P = f wStar := by
+      simp [integral_const, probReal_univ]
+    rw [ge_iff_le, ← h_const, ← integral_sub h_int_ft (integrable_const _)]
+    exact integral_mono (h_int_ft.sub (integrable_const _)) h_int_gF_inner
+      fun ω => (convex_inner_lower_bound hconvex hgrad (wt ω) wStar).trans_eq
+                (real_inner_comm _ _)
+  -- Step 5: Bounded variance
+  have h_var : ∫ ω, ‖gt ω‖ ^ 2 ∂setup.P ≤ σ ^ 2 :=
+    expectation_norm_sq_gradL_bound
+      hvar h_indep_t h_dist_t
+      (sgdProcess_measurable setup.hξ_meas hgL t)
+      (setup.hξ_meas t) hgL h_int_sq
+  -- Combine: E[‖w_{t+1}-w*‖²] = ∫ norm_sq - 2η ∫ inner + η² ∫ sq
+  --         and inner = gradF inner by unbiasedness, sq ≤ σ², inner ≥ f-f* by FOC
+  rw [h_int_eq, h_unb_cross]
+  nlinarith [h_foc, h_var, sq_nonneg η,
+             mul_nonneg (mul_nonneg (by norm_num : (0:ℝ) ≤ 2) hη_pos.le)
+               (by linarith [h_foc] : 0 ≤ ∫ ω, ⟪wt ω - wStar, setup.gradF (wt ω)⟫_ℝ ∂setup.P
+                   - (∫ ω, f (wt ω) ∂setup.P - f wStar)),
+             mul_nonneg (sq_nonneg η) (by linarith [h_var] : (0:ℝ) ≤ σ^2 -
+                   ∫ ω, ‖gt ω‖ ^ 2 ∂setup.P)]
 
 /-- **Convex SGD Convergence Theorem**.
 With constant step size η > 0, after T steps:
@@ -463,7 +679,20 @@ theorem sgd_convergence_convex
     (hmin : IsMinimizer f wStar)
     (hη_pos : 0 < η)
     (hη : ∀ t, setup.η t = η)
-    (T : ℕ) (hT : 0 < T) :
+    (T : ℕ) (hT : 0 < T)
+    -- Measurability and per-step integrability
+    (hgL : Measurable (Function.uncurry setup.gradL))
+    (h_intL : ∀ w, Integrable (setup.gradL w) setup.sampleDist)
+    (h_int_f : ∀ t, Integrable (fun ω => f (setup.process t ω)) setup.P)
+    (h_int_sq : ∀ t, Integrable (fun ω =>
+        ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2) setup.P)
+    (h_int_norm_sq : ∀ t, Integrable (fun ω =>
+        ‖setup.process t ω - wStar‖ ^ 2) setup.P)
+    (h_int_inner : ∀ t, Integrable (fun ω =>
+        ⟪setup.process t ω - wStar, setup.gradL (setup.process t ω) (setup.ξ t ω)⟫_ℝ)
+      setup.P)
+    (h_int_gF_inner : ∀ t, Integrable (fun ω =>
+        ⟪setup.process t ω - wStar, setup.gradF (setup.process t ω)⟫_ℝ) setup.P) :
     (1 / (T : ℝ)) * ∑ t ∈ Finset.range T,
         (∫ ω, f (setup.process t ω) ∂setup.P - f wStar) ≤
       ‖setup.w₀ - wStar‖ ^ 2 / (2 * η * T) + η * σ ^ 2 / 2 := by
@@ -474,6 +703,7 @@ theorem sgd_convergence_convex
         - 2 * η * (∫ ω, f (setup.process t ω) ∂setup.P - f wStar)
         + η ^ 2 * σ ^ 2 :=
     fun t _ => one_step_progress_convex setup f wStar hgrad hsmooth hconvex hvar hunb hmin (hη t)
+      hη_pos hgL h_intL (h_int_inner t) (h_int_sq t) (h_int_norm_sq t) (h_int_f t) (h_int_gF_inner t)
   -- Step 2: sum and telescope → 2η · Σ(gap) ≤ ‖w₀−w*‖² − ‖w_T−w*‖² + T·η²σ²
   have hsum : 2 * η * ∑ t ∈ Finset.range T,
         (∫ ω, f (setup.process t ω) ∂setup.P - f wStar) ≤
@@ -544,33 +774,107 @@ lemma one_step_progress_sc
     (hunb : IsUnbiased setup.gradL setup.gradF setup.sampleDist)
     (hmin : IsMinimizer f wStar)
     (hμ_pos : 0 < μ) (hη_pos : 0 < η) (hη_L : η ≤ 1 / (L : ℝ))
-    (hη : setup.η t = η) :
+    (hη : setup.η t = η)
+    -- Measurability and integrability hypotheses
+    (hgL : Measurable (Function.uncurry setup.gradL))
+    (h_intL : ∀ w, Integrable (setup.gradL w) setup.sampleDist)
+    (h_int_inner : Integrable (fun ω =>
+        ⟪setup.process t ω - wStar, setup.gradL (setup.process t ω) (setup.ξ t ω)⟫_ℝ)
+      setup.P)
+    (h_int_sq : Integrable (fun ω =>
+        ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2) setup.P)
+    (h_int_norm_sq : Integrable (fun ω => ‖setup.process t ω - wStar‖ ^ 2) setup.P)
+    (h_int_gF_inner : Integrable (fun ω =>
+        ⟪setup.process t ω - wStar, setup.gradF (setup.process t ω)⟫_ℝ) setup.P) :
     ∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P ≤
       (1 - η * μ) * ∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P
       + η ^ 2 * σ ^ 2 := by
+  set wt := setup.process t
+  set gt := fun ω => setup.gradL (wt ω) (setup.ξ t ω)
+  haveI := setup.hP
+  -- Auxiliary: distribution of ξ t equals sampleDist
+  have h_dist_t : Measure.map (setup.ξ t) setup.P = setup.sampleDist :=
+    (setup.hξ_ident t).map_eq
+  -- Auxiliary: process t ⊥ ξ t
+  have h_indep_t : IndepFun wt (setup.ξ t) setup.P :=
+    sgdProcess_indepFun_xi setup.hξ_meas setup.hξ_indep hgL t
   -- Step 1: Pointwise norm expansion (same as convex case)
   have h_expand : ∀ ω,
       ‖setup.process (t + 1) ω - wStar‖ ^ 2 =
-        ‖setup.process t ω - wStar‖ ^ 2
-        - 2 * η * ⟪setup.process t ω - wStar, setup.gradL (setup.process t ω) (setup.ξ t ω)⟫_ℝ
-        + η ^ 2 * ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 := by
+        ‖wt ω - wStar‖ ^ 2
+        - 2 * η * ⟪wt ω - wStar, gt ω⟫_ℝ
+        + η ^ 2 * ‖gt ω‖ ^ 2 := by
     intro ω
-    have h_step : setup.process (t + 1) ω =
-        setup.process t ω - η • setup.gradL (setup.process t ω) (setup.ξ t ω) := by
-      simp [SGDSetup.process_succ, hη]
+    have h_step : setup.process (t + 1) ω = wt ω - η • gt ω := by
+      simp [SGDSetup.process_succ, hη]; rfl
     rw [h_step]
-    set w := setup.process t ω
-    set g := setup.gradL w (setup.ξ t ω)
-    show ‖w - η • g - wStar‖ ^ 2 = ‖w - wStar‖ ^ 2 - 2 * η * ⟪w - wStar, g⟫_ℝ + η ^ 2 * ‖g‖ ^ 2
-    have : w - η • g - wStar = (w - wStar) - η • g := by abel
+    have : wt ω - η • gt ω - wStar = (wt ω - wStar) - η • gt ω := by abel
     rw [this, norm_sub_sq_real]
     simp [inner_smul_right, norm_smul, mul_pow, sq_abs]; ring
-  -- Step 2: Integrate the expansion
-  -- Step 3: Unbiased cross-term: ∫ ⟪wₜ-w*, g_t⟫ = ∫ ⟪wₜ-w*, ∇f(wₜ)⟫
-  -- Step 4: Strong convex FOC: ⟪∇f(w), w-w*⟫ ≥ μ/2 ‖w-w*‖²
-  -- Step 5: Bounded variance: ∫ ‖g_t‖² ≤ σ²
-  -- Combine: E[‖w_{t+1}-w*‖²] ≤ (1-ημ) E[‖wₜ-w*‖²] + η²σ²
-  sorry
+  -- Integrability of ‖process(t+1) - w*‖²
+  have h_int_t1 : Integrable (fun ω => ‖setup.process (t + 1) ω - wStar‖ ^ 2) setup.P :=
+    ((h_int_norm_sq.sub (h_int_inner.const_mul (2 * η))).add (h_int_sq.const_mul (η ^ 2))).congr
+      (Filter.Eventually.of_forall fun ω => (h_expand ω).symm)
+  -- Step 2: Integrate the expansion (term-level linearity)
+  have h_int_eq :
+      ∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P =
+        ∫ ω, ‖wt ω - wStar‖ ^ 2 ∂setup.P
+        - 2 * η * ∫ ω, ⟪wt ω - wStar, gt ω⟫_ℝ ∂setup.P
+        + η ^ 2 * ∫ ω, ‖gt ω‖ ^ 2 ∂setup.P := by
+    have hkey : ∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P =
+        ∫ ω, (‖wt ω - wStar‖ ^ 2 - 2 * η * ⟪wt ω - wStar, gt ω⟫_ℝ
+          + η ^ 2 * ‖gt ω‖ ^ 2) ∂setup.P :=
+      integral_congr_ae (Filter.Eventually.of_forall h_expand)
+    have h1 : ∫ ω, (‖wt ω - wStar‖ ^ 2 - 2 * η * ⟪wt ω - wStar, gt ω⟫_ℝ +
+        η ^ 2 * ‖gt ω‖ ^ 2) ∂setup.P =
+        ∫ ω, (‖wt ω - wStar‖ ^ 2 - 2 * η * ⟪wt ω - wStar, gt ω⟫_ℝ) ∂setup.P +
+        ∫ ω, (η ^ 2 * ‖gt ω‖ ^ 2) ∂setup.P :=
+      integral_add (h_int_norm_sq.sub (h_int_inner.const_mul _)) (h_int_sq.const_mul _)
+    have h2 : ∫ ω, (‖wt ω - wStar‖ ^ 2 - 2 * η * ⟪wt ω - wStar, gt ω⟫_ℝ) ∂setup.P =
+        ∫ ω, ‖wt ω - wStar‖ ^ 2 ∂setup.P -
+        ∫ ω, (2 * η * ⟪wt ω - wStar, gt ω⟫_ℝ) ∂setup.P :=
+      integral_sub h_int_norm_sq (h_int_inner.const_mul _)
+    have h3 : ∫ ω, (2 * η * ⟪wt ω - wStar, gt ω⟫_ℝ) ∂setup.P =
+        2 * η * ∫ ω, ⟪wt ω - wStar, gt ω⟫_ℝ ∂setup.P :=
+      integral_const_mul (2 * η) _
+    have h4 : ∫ ω, (η ^ 2 * ‖gt ω‖ ^ 2) ∂setup.P =
+        η ^ 2 * ∫ ω, ‖gt ω‖ ^ 2 ∂setup.P :=
+      integral_const_mul (η ^ 2) _
+    linarith [hkey, h1, h2, h3, h4]
+  -- Step 3: Unbiasedness — ∫ ⟪wt-w*, gt⟫ = ∫ ⟪wt-w*, ∇f(wt)⟫
+  have h_unb_cross :
+      ∫ ω, ⟪wt ω - wStar, gt ω⟫_ℝ ∂setup.P =
+        ∫ ω, ⟪wt ω - wStar, setup.gradF (wt ω)⟫_ℝ ∂setup.P :=
+    expectation_inner_gradL_eq
+      hunb h_indep_t h_dist_t (fun w => w - wStar)
+      (sgdProcess_measurable setup.hξ_meas hgL t)
+      (setup.hξ_meas t) hgL (measurable_id.sub_const wStar)
+      hsmooth.continuous.measurable h_intL h_int_inner
+  -- Step 4: Strong convex FOC — ⟪wt-w*, ∇f(wt)⟫ ≥ μ/2 ‖wt-w*‖²
+  -- (term-mode to avoid beta-unreduced goals)
+  have h_sc_foc : ∫ ω, ⟪wt ω - wStar, setup.gradF (wt ω)⟫_ℝ ∂setup.P ≥
+      μ / 2 * ∫ ω, ‖wt ω - wStar‖ ^ 2 ∂setup.P := by
+    rw [ge_iff_le, ← integral_const_mul (μ / 2)]
+    exact integral_mono (h_int_norm_sq.const_mul _) h_int_gF_inner
+      fun ω => (strong_convex_inner_lower_bound hsc hgrad hmin (wt ω)).trans_eq
+                (real_inner_comm _ _)
+  -- Step 5: Bounded variance
+  have h_var : ∫ ω, ‖gt ω‖ ^ 2 ∂setup.P ≤ σ ^ 2 :=
+    expectation_norm_sq_gradL_bound
+      hvar h_indep_t h_dist_t
+      (sgdProcess_measurable setup.hξ_meas hgL t)
+      (setup.hξ_meas t) hgL h_int_sq
+  -- Combine: E[‖w_{t+1}-w*‖²] ≤ (1-ημ) E[‖wt-w*‖²] + η²σ²
+  have h_norm_sq_nonneg : (0 : ℝ) ≤ ∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P :=
+    integral_nonneg fun ω => sq_nonneg _
+  rw [h_int_eq, h_unb_cross]
+  nlinarith [h_sc_foc, h_var, sq_nonneg η,
+             mul_nonneg (mul_nonneg (by norm_num : (0:ℝ) ≤ 2) hη_pos.le)
+               (by linarith [h_sc_foc] : 0 ≤ ∫ ω, ⟪wt ω - wStar, setup.gradF (wt ω)⟫_ℝ ∂setup.P
+                   - μ / 2 * ∫ ω, ‖wt ω - wStar‖ ^ 2 ∂setup.P),
+             mul_nonneg (sq_nonneg η) (by linarith [h_var] : (0:ℝ) ≤ σ^2 -
+                   ∫ ω, ‖gt ω‖ ^ 2 ∂setup.P),
+             h_norm_sq_nonneg]
 
 /-- **Strongly Convex SGD Convergence Theorem**.
 With constant step size η ≤ 1/L satisfying 0 < η·μ < 1, after T steps:
@@ -594,7 +898,19 @@ theorem sgd_convergence_strongly_convex
     (hμ_pos : 0 < μ) (hη_pos : 0 < η) (hη_L : η ≤ 1 / (L : ℝ))
     (hημ : η * μ < 1)
     (hη : ∀ t, setup.η t = η)
-    (T : ℕ) :
+    (T : ℕ)
+    -- Measurability and per-step integrability
+    (hgL : Measurable (Function.uncurry setup.gradL))
+    (h_intL : ∀ w, Integrable (setup.gradL w) setup.sampleDist)
+    (h_int_sq : ∀ t, Integrable (fun ω =>
+        ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2) setup.P)
+    (h_int_norm_sq : ∀ t, Integrable (fun ω =>
+        ‖setup.process t ω - wStar‖ ^ 2) setup.P)
+    (h_int_inner : ∀ t, Integrable (fun ω =>
+        ⟪setup.process t ω - wStar, setup.gradL (setup.process t ω) (setup.ξ t ω)⟫_ℝ)
+      setup.P)
+    (h_int_gF_inner : ∀ t, Integrable (fun ω =>
+        ⟪setup.process t ω - wStar, setup.gradF (setup.process t ω)⟫_ℝ) setup.P) :
     ∫ ω, ‖setup.process T ω - wStar‖ ^ 2 ∂setup.P ≤
       (1 - η * μ) ^ T * ‖setup.w₀ - wStar‖ ^ 2 + η * σ ^ 2 / μ := by
   -- Proof by induction on T, unrolling `one_step_progress_sc` at each step.
@@ -610,6 +926,8 @@ theorem sgd_convergence_strongly_convex
     -- Apply one_step_progress_sc at step T
     have hstep := one_step_progress_sc setup f wStar hgrad hsmooth hsc hvar hunb hmin
                     hμ_pos hη_pos hη_L (hη T)
+                    hgL h_intL (h_int_inner T) (h_int_sq T)
+                    (h_int_norm_sq T) (h_int_gF_inner T)
     -- The noise accumulation reduces exactly: (1-ημ)·(ησ²/μ) + η²σ² = ησ²/μ
     have hkey : (1 - η * μ) * ((1 - η * μ) ^ T * ‖setup.w₀ - wStar‖ ^ 2 + η * σ ^ 2 / μ) +
         η ^ 2 * σ ^ 2 = (1 - η * μ) ^ (T + 1) * ‖setup.w₀ - wStar‖ ^ 2 + η * σ ^ 2 / μ := by
