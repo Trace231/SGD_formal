@@ -14,11 +14,38 @@ sequence, gap classification, and usage context for each entry.
 - `[L2: ...]` — bridges two Mathlib lemmas (composition gap)
 - `[L3: ...]` — type/form rewriting to match Mathlib
 
+**Sorry status:** **0 sorry** — all lemmas in the library are fully proved.
+
+**Design conventions:** See `docs/CONVENTIONS.md` for assumption encoding rules,
+measurability hierarchy, and type coercion pitfalls. In particular,
+`HasBoundedVariance'` now includes explicit integrability alongside the
+Bochner integral bound (Convention §1).
+
 ---
 
-## Layer 0 — Pure Math Infrastructure
+## Infrastructure Layer (Glue) — `Lib/Glue/`
 
-### `GradientFTC.lean`
+The Glue layer contains pure mathematical primitives that address Level 2/3 gaps
+between Mathlib's existing infrastructure and the forms needed in optimization proofs.
+These lemmas have no optimization or stochastic content — they are general tools that
+would be appropriate for Mathlib itself.
+
+**Module index:**
+
+| Module | Contents | Primary gap |
+|---|---|---|
+| `Calculus.lean` | Hilbert-space FTC and line-segment calculus | Level 3 (form mismatch) |
+| `Algebra.lean` | Norm-squared expansion for gradient steps | Level 3 (form mismatch) |
+| `Probability.lean` | Inner-product and variance integrability tools | Level 2 (composition) |
+| `Measurable.lean` | Measurability and composition integrability | Level 2 (composition) |
+
+---
+
+### `Lib/Glue/Calculus.lean`
+
+Provides the Hilbert-space forms of the fundamental theorem of calculus and related
+line-segment calculus tools. Mathlib has scalar FTC (`intervalIntegral.integral_eq_sub_of_hasDerivAt`)
+but not the gradient inner-product form needed for L-smooth bounds and convex FOC.
 
 ---
 
@@ -26,18 +53,19 @@ sequence, gap classification, and usage context for each entry.
 
 | Field | Value |
 |---|---|
-| File | `Lib/Layer0/GradientFTC.lean` |
-| Layer | 0 |
-| Gap | Level 3 (form mismatch — needs `InnerProductSpace.toDual_apply_apply` bridge) |
-| Triggered by | `integral_inner_gradient_segment`, `convex_first_order_condition` |
+| File | `Lib/Glue/Calculus.lean` |
+| Layer | Glue |
+| Gap | Level 3 — form mismatch |
 
-**Statement:** If `f : E → ℝ` has gradient `gradF w` at every `w`, then
-`φ(t) = f(x + t • d)` has derivative `⟪gradF(x + t•d), d⟫` at `t`.
+**Purpose:** If `f : E → ℝ` has gradient `gradF` everywhere, then `φ(t) = f(x + t•d)` has
+scalar derivative `⟪gradF(x + t•d), d⟫` at every `t`.
 
-**Proof step sequence:**
-1. `[L0: HasGradientAt → HasFDerivAt]` (unwrap gradient to Fréchet derivative)
-2. `[L0: HasFDerivAt.comp HasDerivAt (chain rule along line)]`
-3. `[L3: InnerProductSpace.toDual_apply_apply]` (convert CLM evaluation to inner product)
+**Proof steps:**
+- `[L0: hasFDerivAt]` — get Fréchet derivative from gradient
+- `[L0: hasDerivAt chain rule + const_add]` — compose with line map
+- `[L3: toDual_apply_apply]` — match dual form to inner product
+
+**Used by:** `integral_inner_gradient_segment`, `convex_first_order_condition`
 
 ---
 
@@ -45,17 +73,253 @@ sequence, gap classification, and usage context for each entry.
 
 | Field | Value |
 |---|---|
-| File | `Lib/Layer0/GradientFTC.lean` |
-| Layer | 0 |
-| Gap | Level 3 (Mathlib has scalar FTC, not Hilbert gradient form) |
-| Triggered by | `lipschitz_gradient_quadratic_bound` |
+| File | `Lib/Glue/Calculus.lean` |
+| Layer | Glue |
+| Gap | Level 3 — form mismatch |
 
-**Statement:** `f(x + d) - f(x) = ∫ t ∈ [0,1], ⟪gradF(x + t•d), d⟫ dt`
+**Purpose:** Hilbert-space FTC along a line segment:
+`∫ t in 0..1, ⟪gradF(x + t•d), d⟫ = f(x + d) − f(x)`
 
-**Proof step sequence:**
-1. `[dep: hasDerivAt_comp_lineSegment]` (get derivative of φ)
-2. `[L0: intervalIntegral.integral_eq_sub_of_hasDerivAt]` (scalar FTC applied to φ)
-3. `[L3: simp / ring to match endpoint form]`
+**Proof steps:**
+- `[dep: hasDerivAt_comp_lineSegment]` — pointwise derivative
+- `[L3: Continuous.inner + Continuous.comp]` — continuity for interval integrability
+- `[L0: intervalIntegral.integral_eq_sub_of_hasDerivAt]`
+
+**Used by:** `lipschitz_gradient_quadratic_bound`, `convex_first_order_condition`
+
+---
+
+#### `integral_inner_gradient_segment'`
+
+| Field | Value |
+|---|---|
+| File | `Lib/Glue/Calculus.lean` |
+| Layer | Glue |
+| Gap | Level 3 — form mismatch |
+
+**Purpose:** Point-to-point variant:
+`∫ t in 0..1, ⟪gradF(x + t•(y−x)), y−x⟫ = f(y) − f(x)`
+
+**Proof steps:** `[dep: integral_inner_gradient_segment]` + `[L0: congr/abel]`
+
+---
+
+#### `integral_id_zero_one`
+
+| Field | Value |
+|---|---|
+| File | `Lib/Glue/Calculus.lean` |
+| Layer | Glue |
+| Gap | Level 3 — scalar FTC applied to `t ↦ t` |
+
+**Purpose:** `∫ t in 0..1, t = 1/2`
+
+**Proof steps:** `[L0: intervalIntegral.integral_eq_sub_of_hasDerivAt]` + `norm_num`
+
+**Used by:** `lipschitz_gradient_quadratic_bound` (final integration step)
+
+---
+
+### `Lib/Glue/Algebra.lean`
+
+Provides norm-squared expansion identities for gradient descent steps.
+Mathlib has the individual components (`norm_sub_sq_real`, `inner_smul_right`, etc.)
+but no single named form for the SGD step expansion.
+
+---
+
+#### `norm_sq_sgd_step`
+
+| Field | Value |
+|---|---|
+| File | `Lib/Glue/Algebra.lean` |
+| Layer | Glue |
+| Gap | Level 3 — form mismatch |
+
+**Purpose:** `‖(w − η•g) − w*‖² = ‖w − w*‖² − 2η·⟪w−w*, g⟫ + η²·‖g‖²`
+
+**Proof steps:**
+- `[L3: abel]` — rewrite as `‖(w − w*) − η•g‖²`
+- `[L0: norm_sub_sq_real]` — expand squared norm
+- `[L3: inner_smul_right + norm_smul + mul_pow + sq_abs + ring]`
+
+**Used by:** `stochastic_descent_convex'`, `stochastic_descent_strongly_convex'`
+
+---
+
+#### `inner_neg_smul_eq`
+
+| Field | Value |
+|---|---|
+| File | `Lib/Glue/Algebra.lean` |
+| Layer | Glue |
+| Gap | Level 3 — composition of two Mathlib rewrites |
+
+**Purpose:** `⟪x, −(η•g)⟫ = −(η · ⟪x, g⟫)`
+
+**Proof steps:** `[L0: inner_neg_right]` + `[L0: inner_smul_right]` + `mul_comm`
+
+**Used by:** `descent_lemma'` (non-convex pointwise bound)
+
+---
+
+#### `norm_neg_smul_sq`
+
+| Field | Value |
+|---|---|
+| File | `Lib/Glue/Algebra.lean` |
+| Layer | Glue |
+| Gap | Level 3 — composition of three Mathlib rewrites |
+
+**Purpose:** `‖−(η•g)‖² = η² · ‖g‖²`
+
+**Proof steps:** `[L0: norm_neg]` + `[L0: norm_smul]` + `[L3: mul_pow + sq_abs]`
+
+**Used by:** `descent_lemma'` (non-convex pointwise bound)
+
+---
+
+### `Lib/Glue/Probability.lean`
+
+Provides general-purpose probability and integrability tools that bridge the gap
+between Mathlib's pointwise measure theory and the composed integrability conditions
+required by stochastic optimization proofs.
+
+---
+
+#### `integrable_inner_of_sq_integrable`
+
+| Field | Value |
+|---|---|
+| File | `Lib/Glue/Probability.lean` |
+| Layer | Glue |
+| Gap | Level 2 — AM-GM + Cauchy-Schwarz composition |
+| Status | **Proved** |
+
+**Purpose:** If `‖u‖²` and `‖v‖²` are both integrable, then `⟪u, v⟫` is integrable.
+
+**Proof steps:**
+- `[L0: abs_real_inner_le_norm]` — Cauchy-Schwarz: `|⟪u,v⟫| ≤ ‖u‖·‖v‖`
+- `[L0: nlinarith + sq_nonneg]` — AM-GM: `‖u‖·‖v‖ ≤ ‖u‖² + ‖v‖²`
+- `[L0: Integrable.mono + hu_sq.add hv_sq]` — domination
+
+**Used by:** `integrable_inner_gradL_comp` (Measurable.lean)
+
+---
+
+#### `integrable_norm_sq_of_bounded_var`
+
+| Field | Value |
+|---|---|
+| File | `Lib/Glue/Probability.lean` |
+| Layer | Glue |
+| Gap | Level 2 — Fubini + independence + change-of-variables |
+| Status | **Proved** |
+
+**Purpose:** If `E_ν[‖gradL(w,·)‖²] ≤ σ²` for all w (with pointwise integrability),
+and `wt ⊥ ξt` with `map(ξt)P = ν`, then `‖gradL(wt(ω), ξt(ω))‖²` is integrable w.r.t. P.
+
+**Proof steps:**
+1. `[L2: indepFun_iff_map_prod_eq_prod_map_map]` — factor joint distribution
+2. `[L0: integrable_map_measure]` — reduce to product measure integrability
+3. `[L0: integrable_prod_iff]` — split into inner + outer conditions
+4. Inner condition: `hvar_int w` — pointwise integrability (∀ w)
+5. Outer condition: `[L0: Integrable.mono (integrable_const σ²)]` — bounded on probability space
+
+**Key design insight:** The original definition of `HasBoundedVariance` used only
+a Bochner integral bound, which is trivially true for non-integrable functions
+(Bochner returns 0). By strengthening the definition to include explicit
+integrability (`hvar_int`), the circular dependency is broken and the proof
+goes through cleanly via `integrable_prod_iff` in the Bochner world — no
+lintegral conversion needed. See `docs/CONVENTIONS.md` §1.
+
+---
+
+### `Lib/Glue/Measurable.lean`
+
+Provides measurability and integrability tools for composing functions with random
+variables. All lemmas are fully proved.
+
+| Lemma | Status | Closes |
+|---|---|---|
+| `measurable_of_lsmooth` | **Proved** | `Measurable setup.gradF` in `sgd_to_hyps` |
+| `integrable_lsmooth_comp_measurable` | **Proved** | `h_int_ft`, `h_int_ft1` |
+| `integrable_norm_sq_gradL_comp` | **Proved** (delegates to Probability.lean) | `h_int_sq` |
+| `integrable_inner_gradL_comp` | **Proved** | `h_int_inner` |
+| `integrable_norm_sq_iterate_comp` | **Proved** | `h_int_norm_sq` |
+
+---
+
+#### `measurable_of_lsmooth`
+
+| Field | Value |
+|---|---|
+| File | `Lib/Glue/Measurable.lean` |
+| Layer | Glue |
+| Gap | Level 2 |
+| Status | **Proved** |
+
+**Proof:** `hsmooth.continuous.measurable` (one-liner chain)
+
+---
+
+#### `integrable_lsmooth_comp_measurable`
+
+| Field | Value |
+|---|---|
+| File | `Lib/Glue/Measurable.lean` |
+| Layer | Glue |
+| Gap | Level 2 |
+| Status | **Proved** |
+
+**Purpose:** Lipschitz function composed with integrable random variable is integrable.
+
+**Proof steps:**
+- `[L0: hlip.dist_le_mul]` — linear growth `|f(x) − f(0)| ≤ K·‖x‖`
+- `[L0: norm_add_le]` — triangle inequality `‖f(wt)‖ ≤ ‖f(wt)−f(0)‖ + ‖f(0)‖`
+- `[L0: Integrable.mono]` — domination by `‖f(0)‖ + K·‖wt‖`
+
+---
+
+#### `integrable_inner_gradL_comp`
+
+| Field | Value |
+|---|---|
+| File | `Lib/Glue/Measurable.lean` |
+| Layer | Glue |
+| Gap | Level 2 |
+| Status | **Proved** |
+
+**Proof:** Delegates to `integrable_inner_of_sq_integrable` from Probability.lean.
+
+---
+
+#### `integrable_norm_sq_iterate_comp`
+
+| Field | Value |
+|---|---|
+| File | `Lib/Glue/Measurable.lean` |
+| Layer | Glue |
+| Gap | Level 2 |
+| Status | **Proved** |
+
+**Purpose:** `‖wt − c‖²` is integrable if `‖wt‖²` is integrable (on finite measure spaces).
+
+**Proof steps:**
+- `[L0: norm_sub_le + sq_le_sq']` — `‖wt−c‖² ≤ (‖wt‖+‖c‖)²`
+- `[L0: nlinarith + sq_nonneg]` — AM-GM: `(a+b)² ≤ 2a² + 2b²`
+- `[L0: Integrable.mono]` — domination by `2·‖wt‖² + 2·‖c‖²`
+
+---
+
+## Layer 0 — Pure Math Infrastructure
+
+### `GradientFTC.lean`
+
+> Note: The FTC primitives (`hasDerivAt_comp_lineSegment`, `integral_inner_gradient_segment`,
+> `integral_inner_gradient_segment'`, `integral_id_zero_one`) have been moved to
+> `Lib/Glue/Calculus.lean` and are documented in the Glue section above.
+> `GradientFTC.lean` now imports `Lib.Glue.Calculus` and contains only the L-smooth bound.
 
 ---
 
@@ -293,3 +557,154 @@ would give measurability of `ω ↦ wt(ω) − w*`, not the pure `w ↦ w − w*
 4. `[dep: strong_convex_inner_lower_bound + integral_mono]` — ∫⟪wt−w*, ∇f⟫ ≥ μ/2·E[‖wt−w*‖²]
 5. `[dep: expectation_norm_sq_gradL_bound]`
 6. `[L0: nlinarith]` (contraction factor (1−ημ) emerges from combining steps 4+5)
+
+---
+
+## Algorithm Layer (Layer 2) — `Algorithms/SGD.lean`
+
+This file instantiates the Layer 1 meta-theorems for the concrete SGD algorithm.
+It is the only file that imports both `Main` (for `SGDSetup`) and `Lib.Layer1.StochasticDescent`.
+
+---
+
+### `StochasticDescentHyps` — 15-field Protocol
+
+| Field | Type | Source in `SGDSetup` | Role |
+|---|---|---|---|
+| `P` | `Measure Ω` | `setup.P` | probability measure |
+| `hP` | `IsProbabilityMeasure P` | `setup.hP` | enables `integral_const`, `probReal_univ` |
+| `ν` | `Measure S` | `setup.sampleDist` | sampling distribution |
+| `wt` | `Ω → E` | `setup.process t` | current iterate (random variable) |
+| `ξt` | `Ω → S` | `setup.ξ t` | current sample |
+| `gradL` | `E → S → E` | `setup.gradL` | stochastic gradient oracle |
+| `gradF` | `E → E` | `setup.gradF` | true gradient |
+| `η` | `ℝ` | `setup.η t` | step size at step `t` |
+| `h_indep` | `IndepFun wt ξt P` | `sgdProcess_indepFun_xi` | **non-trivial** (iterate ⊥ sample) |
+| `h_dist` | `Measure.map ξt P = ν` | `(hξ_ident t).map_eq` | **non-trivial** (IID ident. distrib.) |
+| `h_wt_meas` | `Measurable wt` | `sgdProcess_measurable` | iterate measurability |
+| `h_ξt_meas` | `Measurable ξt` | `setup.hξ_meas t` | sample measurability |
+| `hgL` | `Measurable (uncurry gradL)` | passed through | oracle measurability |
+| `hgF_meas` | `Measurable gradF` | `hsmooth.continuous.measurable` | true gradient measurability |
+| `hunb` | `IsUnbiased' gradL gradF ν` | `setup.hunb` (def. equal) | unbiasedness condition |
+
+All primed predicates (`IsGradientOf'`, `IsLSmooth'`, `HasBoundedVariance'`, `IsUnbiased'`,
+`IsMinimizer'`) are definitionally equal to their unprimed counterparts in `Main.lean`,
+so no explicit coercion is needed at call sites.
+
+---
+
+### `sgd_to_hyps`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/SGD.lean` |
+| Kind | `noncomputable def` |
+| Layer | 2 |
+
+**Purpose:** Convert `(setup : SGDSetup E S Ω)` at step `t` into `StochasticDescentHyps E S Ω`.
+
+**Non-trivial discharges:**
+- `h_indep := sgdProcess_indepFun_xi setup.hξ_meas setup.hξ_indep hgL t`
+  — process `t` only depends on `ξ₀,…,ξ_{t-1}` (σ-algebra monotonicity + `iIndepFun`)
+- `h_dist := (setup.hξ_ident t).map_eq`
+  — `IdentDistrib (ξ t) (ξ 0) P P` gives `map(ξ t)P = sampleDist`
+
+All other fields are direct record projections from `SGDSetup`.
+
+---
+
+### `sgd_step_eq`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/SGD.lean` |
+| Kind | `lemma` |
+| Layer | 2 |
+
+**Purpose:** Connect the Layer 1 meta-theorem output form to the concrete `SGDSetup` iterate.
+
+**Statement:** `hyps.wt ω - hyps.η • hyps.gradL (hyps.wt ω) (hyps.ξt ω) = setup.process (t+1) ω`
+
+**Why `rfl` works:** `SGDSetup.process_succ` is proved by `rfl` (pattern-match on the recursive
+`sgdProcess` definition = iota reduction). Therefore `setup.process (t+1) ω` and
+`setup.process t ω - setup.η t • gradL(process t ω)(ξ t ω)` are **definitionally equal**.
+The integral equality `∫ ‖process(t+1) − w*‖² = ∫ ‖(wt − η•gt) − w*‖²` also holds by
+`integral_congr_ae` + `Filter.Eventually.of_forall (fun _ => rfl)`.
+
+---
+
+### `sgd_convergence_nonconvex_v2`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/SGD.lean` |
+| Layer | 2 |
+| Conclusion | `(1/T) · Σ_{t<T} E[‖∇f(wt)‖²] ≤ 2(f(w₀)−f*) / (η·T) + η·L·σ²` |
+
+**Call chain:**
+```
+sgd_to_hyps setup t hgL (hsmooth.continuous.measurable) hunb
+  → stochastic_descent_nonconvex' hyps f hgrad hsmooth hvar h_intL
+      (h_int_f t) (h_int_f (t+1)) (h_int_inner t) (h_int_sq t)
+  → rfl  [process_succ definitional]
+  → rw [hη t]
+  → hstep (for each t < T)
+  → Finset.sum_le_sum + Finset.sum_range_sub  [telescoping]
+  → integral_nonneg + hlower  [lower bound f ≥ f*]
+  → field_simp  [divide by η·T]
+```
+
+**Sorry status:** All sorry's eliminated. Measurability closed by `hsmooth.continuous.measurable`;
+integrability conditions forwarded from theorem hypotheses. Vestigial `h_int_gF_sq` removed.
+
+---
+
+### `sgd_convergence_convex_v2`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/SGD.lean` |
+| Layer | 2 |
+| Conclusion | `(1/T) · Σ_{t<T} (E[f(wt)] − f(w*)) ≤ ‖w₀−w*‖² / (2ηT) + η·σ²/2` |
+
+**Call chain:**
+```
+sgd_to_hyps setup t hgL (hsmooth.continuous.measurable) hunb
+  → stochastic_descent_convex' hyps f wStar hgrad hconvex hvar (0<η_t) h_intL
+      (h_int_inner t) (h_int_sq t) (h_int_norm_sq t) (h_int_f t) (h_int_gF_inner t)
+  → rfl  [process_succ]
+  → rw [hη t]
+  → hstep (∀ t < T: norm-sq descent)
+  → Finset.sum_range_sub  [telescoping on ‖wt−w*‖²]
+  → drop ‖w_T−w*‖² ≥ 0
+  → field_simp  [divide by 2η·T]
+```
+
+**Sorry status:** All sorry's eliminated.
+
+---
+
+### `sgd_convergence_strongly_convex_v2`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/SGD.lean` |
+| Layer | 2 |
+| Conclusion | `E[‖w_T−w*‖²] ≤ (1−ημ)^T · ‖w₀−w*‖² + η·σ²/μ` |
+
+**Call chain (induction on T):**
+```
+base T=0:  simp [process_zero] → integral_const → linarith [η·σ²/μ ≥ 0]
+
+step T+1:
+  sgd_to_hyps setup T hgL (hsmooth.continuous.measurable) hunb
+    → stochastic_descent_strongly_convex' hyps f wStar hgrad hsc hvar hmin hμ_pos (0<η_T) h_intL
+        (h_int_inner T) (h_int_sq T) (h_int_norm_sq T) (h_int_gF_inner T)
+    → rfl  [process_succ]
+    → rw [hη T]
+    → hstep: E[‖w_{T+1}−w*‖²] ≤ (1−ημ)·E[‖w_T−w*‖²] + η²σ²
+    → gcongr ih  [induction hypothesis]
+    → hkey: (1−ημ)·(ησ²/μ) + η²σ² = ησ²/μ  [field_simp; ring]
+```
+
+**Sorry status:** All sorry's eliminated.

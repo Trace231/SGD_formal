@@ -39,6 +39,7 @@ variable {Ω : Type*} [MeasurableSpace Ω]
 -- Part 1: Bounded variance transfer
 -- ============================================================================
 
+omit [InnerProductSpace ℝ E] [CompleteSpace E] [SecondCountableTopology E] in
 /-- Bounded variance transfer from sample distribution ν to probability space P.
 
 Layer: 0 | Gap: Level 2 (composition missing)
