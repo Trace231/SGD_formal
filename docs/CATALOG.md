@@ -718,33 +718,177 @@ step T+1:
 
 ---
 
+## Algorithm Layer (Layer 2) — `Algorithms/WeightDecaySGD.lean`
+
+This file instantiates the Archetype A pattern for regularized SGD by reframing
+weight decay as plain SGD on an effective oracle:
+`effGradL(w,s) = gradL(w,s) + decay • w`, `effGradF(w) = gradF(w) + decay • w`.
+The Layer 2 convergence wrappers then discharge by direct `simpa` into the
+existing SGD Layer 2 theorems.
+
+---
+
+### `WeightDecaySGDSetup`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/WeightDecaySGD.lean` |
+| Kind | `structure` |
+| Layer | 2 |
+
+**Purpose:** Extend `SGDSetup` with a decay scalar `decay : ℝ` while keeping
+the same stochastic-process and sampling infrastructure.
+
+---
+
+### `effectiveSGDSetup`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/WeightDecaySGD.lean` |
+| Kind | `noncomputable def` |
+| Layer | 2 |
+
+**Purpose:** Reframe weight-decay SGD as ordinary SGD by replacing
+`gradL/gradF` with effective gradients and reusing all other `SGDSetup` fields.
+
+**Design trick:** This one definition is the reduction point that lets all WD
+convergence theorems call the existing SGD theorem stack unchanged.
+
+---
+
+### Bridge lemmas
+
+#### `measurable_effGradL`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/WeightDecaySGD.lean` |
+| Kind | `lemma` |
+| Layer | 2 |
+
+**Purpose:** Transfer measurability from base stochastic oracle to
+`effGradL`.
+
+#### `unbiased_effGrad_of_unbiased`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/WeightDecaySGD.lean` |
+| Kind | `lemma` |
+| Layer | 2 |
+
+**Purpose:** Transfer unbiasedness from base oracle `(gradL, gradF)` to
+effective oracle `(effGradL, effGradF)`.
+
+---
+
+### `weight_decay_convergence_nonconvex_v2`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/WeightDecaySGD.lean` |
+| Layer | 2 |
+| Conclusion | `(1/T) · Σ_{t<T} E[‖∇f_eff(wt)‖²] ≤ 2(f(w₀)−f*) / (η·T) + η·L·σ²` |
+
+**Call chain:**
+```
+weight_decay_convergence_nonconvex_v2
+  → simpa
+  → sgd_convergence_nonconvex_v2
+  → sgd_to_hyps
+  → stochastic_descent_nonconvex'
+```
+
+---
+
+### `weight_decay_convergence_convex_v2`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/WeightDecaySGD.lean` |
+| Layer | 2 |
+| Conclusion | `(1/T) · Σ_{t<T} (E[f(wt)] − f(w*)) ≤ ‖w₀−w*‖² / (2ηT) + η·σ²/2` |
+
+**Call chain:**
+```
+weight_decay_convergence_convex_v2
+  → simpa
+  → sgd_convergence_convex_v2
+  → sgd_to_hyps
+  → stochastic_descent_convex'
+```
+
+---
+
+### `weight_decay_convergence_strongly_convex_v2`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/WeightDecaySGD.lean` |
+| Layer | 2 |
+| Conclusion | `E[‖w_T−w*‖²] ≤ (1−ημ)^T · ‖w₀−w*‖² + η·σ²/μ` |
+
+**Call chain:**
+```
+weight_decay_convergence_strongly_convex_v2
+  → simpa
+  → sgd_convergence_strongly_convex_v2
+  → sgd_to_hyps
+  → stochastic_descent_strongly_convex'
+```
+
+### Hit Report — Glue Usage Count
+
+**Hit Report: Library Components Used**
+
+| Component | File | Used by |
+|---|---|---|
+| `effectiveSGDSetup` reframe | `Algorithms/WeightDecaySGD.lean` | all 3 convergence theorems |
+| `sgd_convergence_nonconvex_v2` | `Algorithms/SGD.lean` | `weight_decay_convergence_nonconvex_v2` |
+| `sgd_convergence_convex_v2` | `Algorithms/SGD.lean` | `weight_decay_convergence_convex_v2` |
+| `sgd_convergence_strongly_convex_v2` | `Algorithms/SGD.lean` | `weight_decay_convergence_strongly_convex_v2` |
+| `sgd_to_hyps` | `Algorithms/SGD.lean` | all 3 WD wrappers (via `wd_sgd_to_hyps`) |
+| `stochastic_descent_nonconvex'` | `Lib/Layer1/StochasticDescent.lean` | inherited through `sgd_convergence_nonconvex_v2` |
+| `stochastic_descent_convex'` | `Lib/Layer1/StochasticDescent.lean` | inherited through `sgd_convergence_convex_v2` |
+| `stochastic_descent_strongly_convex'` | `Lib/Layer1/StochasticDescent.lean` | inherited through `sgd_convergence_strongly_convex_v2` |
+| `measurable_effGradL` | `Algorithms/WeightDecaySGD.lean` | WD bridge layer (effective oracle measurability) |
+| `unbiased_effGrad_of_unbiased` | `Algorithms/WeightDecaySGD.lean` | WD bridge layer (effective oracle unbiasedness) |
+
+**Leverage score (Archetype A):** reused existing lemmas/theorems = 7;
+new WD bridge lemmas written = 2; reuse ratio = `7 / (7 + 2) = 77.8%` (raw `7:2`).
+
+---
+
 ## Roadmap & Dependency Tree
 
 This section provides a reverse index: given an algorithm and proof step,
 which catalog lemmas does it depend on? Use this to assess what is reusable
 when adding a new algorithm.
 
-### SGD Dependency Table
+### SGD + Weight Decay Dependency Table
 
 Each cell shows the proof step number in the convergence theorem where the
 lemma is invoked. "h_int" cells indicate the lemma is used to discharge an
-integrability hypothesis rather than a direct proof step.
+integrability hypothesis rather than a direct proof step. Weight Decay SGD
+entries match SGD because the wrappers reduce to plain SGD through
+`effectiveSGDSetup` and `simpa`.
 
-| Lemma | File | SGD non-convex | SGD convex | SGD strongly convex | Reusable for |
-|-------|------|:--------------:|:----------:|:-------------------:|--------------|
-| `lipschitz_gradient_quadratic_bound` | `Lib/Layer0/GradientFTC.lean` | Step 1 | — | — | Any L-smooth algorithm |
-| `convex_first_order_condition` | `Lib/Layer0/ConvexFOC.lean` | — | (via Step 4) | — | Any convex algorithm |
-| `convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean` | — | Step 4 | — | Any convex algorithm |
-| `strong_convex_first_order_condition` | `Lib/Layer0/ConvexFOC.lean` | — | — | (via Step 4) | Any strongly convex algorithm |
-| `strong_convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean` | — | — | Step 4 | Any strongly convex algorithm |
-| `expectation_inner_gradL_eq` | `Lib/Layer0/IndepExpect.lean` | Step 4 | Step 4 | Step 4 | **Universal** — any IID stochastic gradient algorithm |
-| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 5 | Step 5 | Step 5 | **Universal** — any IID stochastic gradient algorithm |
-| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | — | Step 1 | Step 1 | Any algorithm with $\|w_{t+1}-w^*\|^2$ recursion |
-| `integrable_norm_sq_of_bounded_var` | `Lib/Glue/Probability.lean` | h_int_sq | h_int_sq | h_int_sq | **Universal** — provides `h_int_sq` for any bounded-variance algorithm |
-| `integrable_inner_of_sq_integrable` | `Lib/Glue/Probability.lean` | h_int_inner | h_int_inner | h_int_inner | **Universal** — provides `h_int_inner` for any L²-bounded gradient |
-| `integrable_lsmooth_comp_measurable` | `Lib/Glue/Measurable.lean` | h_int_ft | h_int_ft | — | Any algorithm applying a Lipschitz function to an integrable iterate |
-| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | — | h_int_norm_sq | h_int_norm_sq | Any algorithm with distance-to-optimum recursion |
-| `integrable_inner_gradL_comp` | `Lib/Glue/Measurable.lean` | h_int_inner | h_int_inner | h_int_inner | Any IID algorithm needing inner-product integrability |
+| Lemma | File | SGD non-convex | SGD convex | SGD strongly convex | WD non-convex | WD convex | WD strongly convex | Reusable for |
+|-------|------|:--------------:|:----------:|:-------------------:|:-------------:|:---------:|:------------------:|--------------|
+| `lipschitz_gradient_quadratic_bound` | `Lib/Layer0/GradientFTC.lean` | Step 1 | — | — | Step 1 | — | — | Any L-smooth algorithm |
+| `convex_first_order_condition` | `Lib/Layer0/ConvexFOC.lean` | — | (via Step 4) | — | — | (via Step 4) | — | Any convex algorithm |
+| `convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean` | — | Step 4 | — | — | Step 4 | — | Any convex algorithm |
+| `strong_convex_first_order_condition` | `Lib/Layer0/ConvexFOC.lean` | — | — | (via Step 4) | — | — | (via Step 4) | Any strongly convex algorithm |
+| `strong_convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean` | — | — | Step 4 | — | — | Step 4 | Any strongly convex algorithm |
+| `expectation_inner_gradL_eq` | `Lib/Layer0/IndepExpect.lean` | Step 4 | Step 4 | Step 4 | Step 4 | Step 4 | Step 4 | **Universal** — any IID stochastic gradient algorithm |
+| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | **Universal** — any IID stochastic gradient algorithm |
+| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | — | Step 1 | Step 1 | — | Step 1 | Step 1 | Any algorithm with $\|w_{t+1}-w^*\|^2$ recursion |
+| `integrable_norm_sq_of_bounded_var` | `Lib/Glue/Probability.lean` | h_int_sq | h_int_sq | h_int_sq | h_int_sq | h_int_sq | h_int_sq | **Universal** — provides `h_int_sq` for any bounded-variance algorithm |
+| `integrable_inner_of_sq_integrable` | `Lib/Glue/Probability.lean` | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | **Universal** — provides `h_int_inner` for any L²-bounded gradient |
+| `integrable_lsmooth_comp_measurable` | `Lib/Glue/Measurable.lean` | h_int_ft | h_int_ft | — | h_int_ft | h_int_ft | — | Any algorithm applying a Lipschitz function to an integrable iterate |
+| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | — | h_int_norm_sq | h_int_norm_sq | — | h_int_norm_sq | h_int_norm_sq | Any algorithm with distance-to-optimum recursion |
+| `integrable_inner_gradL_comp` | `Lib/Glue/Measurable.lean` | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | Any IID algorithm needing inner-product integrability |
 
 ### Universally reusable glue lemmas
 

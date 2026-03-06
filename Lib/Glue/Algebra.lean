@@ -65,3 +65,20 @@ Used in: `descent_lemma'` (non-convex pointwise bound in `StochasticDescent.lean
 theorem norm_neg_smul_sq (g : E) (η : ℝ) :
     ‖-(η • g)‖ ^ 2 = η ^ 2 * ‖g‖ ^ 2 := by
   rw [norm_neg, norm_smul, mul_pow, Real.norm_eq_abs, sq_abs]
+
+/-- Squared-distance contraction under a non-expansive projection with fixed point.
+
+Layer: Glue | Gap: Level 2 (non-expansive norm bound lifted to squared norm form)
+Used in: `Projected GD convex convergence` (Algorithms/ProjectedGD.lean, Step 1 — projection bound)
+
+If `proj` is non-expansive and `wStar` is a fixed point of `proj`, then
+`‖proj x - wStar‖² ≤ ‖x - wStar‖²`. -/
+theorem proj_nonexp_sq (proj : E → E)
+    (h : ∀ x y, ‖proj x - proj y‖ ≤ ‖x - y‖)
+    (x wStar : E) (hproj_wStar : proj wStar = wStar) :
+    ‖proj x - wStar‖ ^ 2 ≤ ‖x - wStar‖ ^ 2 := by
+  have hw : wStar = proj wStar := hproj_wStar.symm
+  calc
+    ‖proj x - wStar‖ ^ 2 = ‖proj x - proj wStar‖ ^ 2 := by
+      exact congrArg (fun z => ‖proj x - z‖ ^ 2) hw
+    _ ≤ ‖x - wStar‖ ^ 2 := pow_le_pow_left₀ (norm_nonneg _) (h x wStar) 2

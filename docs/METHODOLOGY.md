@@ -200,6 +200,18 @@ A lemma is a candidate for a Mathlib PR if **all** of the following hold:
 
 **Glue lemmas added:** 9 lemmas across 4 Glue modules + 2 Layer 0 modules + 1 Layer 1 module.
 
+### Phase 0b — Weight Decay SGD (complete)
+
+**Output:** reduction-complete Layer 2 wrappers on top of SGD:
+- `weight_decay_convergence_nonconvex_v2`
+- `weight_decay_convergence_convex_v2`
+- `weight_decay_convergence_strongly_convex_v2`
+
+**Method:** define effective oracle
+`effGradL(w,s) = gradL(w,s) + decay • w`, `effGradF(w) = gradF(w) + decay • w`,
+build `effectiveSGDSetup`, then discharge all three WD rates by
+`simpa` into existing `sgd_convergence_*_v2` call chains.
+
 ### Phase 1 — Projected Gradient Descent (next)
 
 **Predicted Stub Checklist:**

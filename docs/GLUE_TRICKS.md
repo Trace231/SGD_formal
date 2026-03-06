@@ -246,6 +246,35 @@ have h : ‖u + v‖ ^ 2 ≤ 2 * ‖u‖ ^ 2 + 2 * ‖v‖ ^ 2 := by
 
 ---
 
+### Pattern G: Lifting Non-Expansive Bound to Squared Norm
+
+**Problem**: You have a non-expansive map `proj` and a fixed point `wStar`:
+`‖proj x - proj y‖ ≤ ‖x - y‖` and `proj wStar = wStar`. You need
+`‖proj x - wStar‖^2 ≤ ‖x - wStar‖^2`.
+
+**Mathlib lemma**: `pow_le_pow_left₀`
+
+```lean
+-- Template
+have h_nonexp : ∀ x y, ‖proj x - proj y‖ ≤ ‖x - y‖ := ...
+have hproj_wStar : proj wStar = wStar := ...
+
+have h_sq : ‖proj x - wStar‖ ^ 2 ≤ ‖x - wStar‖ ^ 2 := by
+  calc
+    ‖proj x - wStar‖ ^ 2 = ‖proj x - proj wStar‖ ^ 2 := by
+      exact congrArg (fun z => ‖proj x - z‖ ^ 2) hproj_wStar.symm
+    _ ≤ ‖x - wStar‖ ^ 2 :=
+      pow_le_pow_left₀ (norm_nonneg _) (h_nonexp x wStar) 2
+```
+
+**CAUTION**: do **not** use `sq_le_sq'` for this goal. The robust route for norm
+goals of this form is `pow_le_pow_left₀` with `norm_nonneg`.
+
+**When to use**: projection, truncation, clipping, or any post-update map
+`op` that is non-expansive and has the reference point as a fixed point.
+
+---
+
 ## Section 4 — The Effective Oracle Reframe Technique
 
 **Situation**: An algorithm's update looks like:
@@ -283,6 +312,60 @@ noncomputable def fooGradF (setup : FooSetup E S Ω) : E → E :=
 | Unbiasedness | Need new proof | Use `integral_add` + original unbiasedness |
 | L-smoothness | Need new proof | Use `LipschitzWith.add` (Pattern A) |
 | Variance bound | **Caution** — see Section 5 | |
+
+---
+
+## Section 4b — Archetype B Virtual-Step Integrability
+
+**Situation**: The algorithm update has the form
+$$\text{process}(t+1) = \text{op}(\text{virtualStep}(t))$$
+where `op` is not the identity (e.g. projection, truncation, clipping).
+
+In this setting, the actual iterate and the virtual step are different random
+variables, so a single integrability assumption is not enough for the
+`integral_mono` bridge.
+
+### Archetype distinction
+
+| Archetype | Update form | Integrability pattern |
+|---|---|---|
+| A | `process(t+1) = virtualStep(t)` | one path often suffices |
+| B | `process(t+1) = op(virtualStep(t))` | require both actual and virtual integrability |
+
+### Required dual hypotheses (Archetype B)
+
+```lean
+-- Actual (post-op) distance term
+h_int_norm_sq : ∀ t, Integrable (fun ω => ‖process (t+1) ω - wStar‖ ^ 2) P
+
+-- Virtual (pre-op) distance term
+h_int_virtual : ∀ t, Integrable (fun ω =>
+  ‖virtualStep t ω - wStar‖ ^ 2) P
+```
+
+### `integral_mono` template
+
+```lean
+-- Pointwise operator bound from non-expansiveness/fixed-point structure
+have h_pointwise : ∀ ω, ‖process (t+1) ω - wStar‖ ^ 2 ≤ ‖virtualStep t ω - wStar‖ ^ 2 := by
+  intro ω
+  -- e.g. op_nonexp_sq ...
+  sorry
+
+-- Lift pointwise bound to expectation bound
+have h_op_bound :
+    ∫ ω, ‖process (t+1) ω - wStar‖ ^ 2 ∂P ≤
+      ∫ ω, ‖virtualStep t ω - wStar‖ ^ 2 ∂P := by
+  exact integral_mono (h_int_norm_sq t) (h_int_virtual t) h_pointwise
+```
+
+### Rule of thumb
+
+If your update is `process(t+1) = op(virtualStep(t))`, always include
+`h_int_virtual` as a separate theorem hypothesis alongside `h_int_norm_sq`.
+
+**Confirmed**: Projected GD.  
+**Likely same pattern**: truncated GD, clipped SGD, and related post-step operators.
 
 ---
 
