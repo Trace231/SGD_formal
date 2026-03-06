@@ -443,6 +443,13 @@ variables. All lemmas are fully proved.
 5. `[L2: integral_mono + hvar pointwise]`
 6. `[L3: integral_const + probReal_univ → σ²]`
 
+**Caller note:** The `hvar` parameter has type `∀ w, ∫ s, ‖gradL w s‖² ∂ν ≤ σ²` — a
+plain Bochner bound. When calling from Layer 1 theorems that hold
+`HasBoundedVariance' gradL ν σ` (which is now a conjunction
+`integrability ∧ bound`), pass `(fun w => (hvar w).2)` to extract the bound
+component. The integrability component `(hvar w).1` is used separately by
+`integrable_norm_sq_of_bounded_var`.
+
 ---
 
 #### `expectation_inner_gradL_eq`
@@ -505,7 +512,7 @@ All three meta-theorems below share the 5-step proof skeleton:
 2. `[L0: integral_mono]`
 3. `[L0: integral_add/sub/const_mul]`
 4. `[dep: expectation_inner_gradL_eq with h = gradF]` — ∫⟪∇f, gt⟫ → ∫‖∇f‖²
-5. `[dep: expectation_norm_sq_gradL_bound]` — ∫‖gt‖² ≤ σ²
+5. `[dep: expectation_norm_sq_gradL_bound with hvar = fun w => (hvar w).2]` — bound component of `HasBoundedVariance'`; ∫‖gt‖² ≤ σ²
 6. `[L0: linarith]`
 
 ---
@@ -528,7 +535,7 @@ All three meta-theorems below share the 5-step proof skeleton:
 2. `[L0: integral_congr_ae + integral_add/sub/const_mul]`
 3. `[dep: expectation_inner_gradL_eq with h = (· − w*)]` — ∫⟪wt−w*, gt⟫ → ∫⟪wt−w*, ∇f⟫
 4. `[dep: convex_inner_lower_bound + integral_mono]` — ∫⟪wt−w*, ∇f⟫ ≥ E[f(wt)] − f(w*)
-5. `[dep: expectation_norm_sq_gradL_bound]` — ∫‖gt‖² ≤ σ²
+5. `[dep: expectation_norm_sq_gradL_bound with hvar = fun w => (hvar w).2]` — bound component of `HasBoundedVariance'`; ∫‖gt‖² ≤ σ²
 6. `[L0: nlinarith]`
 
 **Design note:** The `h = (· − w*)` in `expectation_inner_gradL_eq` requires
@@ -555,7 +562,7 @@ would give measurability of `ω ↦ wt(ω) − w*`, not the pure `w ↦ w − w*
 2. `[L0: integral_congr_ae + integral_add/sub/const_mul]`
 3. `[dep: expectation_inner_gradL_eq with h = (· − w*)]`
 4. `[dep: strong_convex_inner_lower_bound + integral_mono]` — ∫⟪wt−w*, ∇f⟫ ≥ μ/2·E[‖wt−w*‖²]
-5. `[dep: expectation_norm_sq_gradL_bound]`
+5. `[dep: expectation_norm_sq_gradL_bound with hvar = fun w => (hvar w).2]` — bound component of `HasBoundedVariance'`; ∫‖gt‖² ≤ σ²
 6. `[L0: nlinarith]` (contraction factor (1−ημ) emerges from combining steps 4+5)
 
 ---
@@ -708,3 +715,58 @@ step T+1:
 ```
 
 **Sorry status:** All sorry's eliminated.
+
+---
+
+## Roadmap & Dependency Tree
+
+This section provides a reverse index: given an algorithm and proof step,
+which catalog lemmas does it depend on? Use this to assess what is reusable
+when adding a new algorithm.
+
+### SGD Dependency Table
+
+Each cell shows the proof step number in the convergence theorem where the
+lemma is invoked. "h_int" cells indicate the lemma is used to discharge an
+integrability hypothesis rather than a direct proof step.
+
+| Lemma | File | SGD non-convex | SGD convex | SGD strongly convex | Reusable for |
+|-------|------|:--------------:|:----------:|:-------------------:|--------------|
+| `lipschitz_gradient_quadratic_bound` | `Lib/Layer0/GradientFTC.lean` | Step 1 | — | — | Any L-smooth algorithm |
+| `convex_first_order_condition` | `Lib/Layer0/ConvexFOC.lean` | — | (via Step 4) | — | Any convex algorithm |
+| `convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean` | — | Step 4 | — | Any convex algorithm |
+| `strong_convex_first_order_condition` | `Lib/Layer0/ConvexFOC.lean` | — | — | (via Step 4) | Any strongly convex algorithm |
+| `strong_convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean` | — | — | Step 4 | Any strongly convex algorithm |
+| `expectation_inner_gradL_eq` | `Lib/Layer0/IndepExpect.lean` | Step 4 | Step 4 | Step 4 | **Universal** — any IID stochastic gradient algorithm |
+| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 5 | Step 5 | Step 5 | **Universal** — any IID stochastic gradient algorithm |
+| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | — | Step 1 | Step 1 | Any algorithm with $\|w_{t+1}-w^*\|^2$ recursion |
+| `integrable_norm_sq_of_bounded_var` | `Lib/Glue/Probability.lean` | h_int_sq | h_int_sq | h_int_sq | **Universal** — provides `h_int_sq` for any bounded-variance algorithm |
+| `integrable_inner_of_sq_integrable` | `Lib/Glue/Probability.lean` | h_int_inner | h_int_inner | h_int_inner | **Universal** — provides `h_int_inner` for any L²-bounded gradient |
+| `integrable_lsmooth_comp_measurable` | `Lib/Glue/Measurable.lean` | h_int_ft | h_int_ft | — | Any algorithm applying a Lipschitz function to an integrable iterate |
+| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | — | h_int_norm_sq | h_int_norm_sq | Any algorithm with distance-to-optimum recursion |
+| `integrable_inner_gradL_comp` | `Lib/Glue/Measurable.lean` | h_int_inner | h_int_inner | h_int_inner | Any IID algorithm needing inner-product integrability |
+
+### Universally reusable glue lemmas
+
+The following lemmas have no SGD-specific content and are expected to apply
+directly to any future algorithm that uses IID stochastic gradients:
+
+| Lemma | Why universal |
+|-------|--------------|
+| `expectation_inner_gradL_eq` | Only requires `IndepFun wt ξt` and `IsUnbiased' gradL gradF ν`; works for any measurable `h : E → E` |
+| `expectation_norm_sq_gradL_bound` | Only requires `IndepFun wt ξt` and the bound component of `HasBoundedVariance'` |
+| `integrable_norm_sq_of_bounded_var` | Only requires independence, distribution, and `HasBoundedVariance'` integrability component |
+| `integrable_inner_of_sq_integrable` | Pure functional analysis — no stochastic content |
+| `norm_sq_sgd_step` | Pure inner product algebra — applies to any gradient step of the form $w - \eta g$ |
+
+### Lemmas specific to SGD's update structure
+
+These lemmas encode the particular form $w_{t+1} = w_t - \eta \cdot \text{gradL}(w_t, \xi_t)$.
+Algorithms with different update structures (e.g. Adam's momentum, SVRG's control variate)
+will need new glue at these points:
+
+| Lemma | SGD-specific aspect |
+|-------|---------------------|
+| `sgd_to_hyps` (`Algorithms/SGD.lean`) | Bridges `SGDSetup` to `StochasticDescentHyps`; Adam would need `adam_to_hyps` |
+| `sgd_step_eq` (`Algorithms/SGD.lean`) | Connects `process (t+1)` to the explicit update form; specific to SGD's `sgdProcess` definition |
+| `sgdProcess_indepFun_xi` (`Main.lean`) | Derives independence from `iIndepFun ξ P`; any IID algorithm can reuse this pattern verbatim |

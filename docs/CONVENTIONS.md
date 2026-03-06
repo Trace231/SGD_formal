@@ -141,3 +141,91 @@ ENNReal.ofReal (∫ f ∂μ) = ∫⁻ x, ENNReal.ofReal (f x) ∂μ
 
 Prefer the coercion `(L : ℝ)` over `L.toReal` for cleaner notation.
 Both are definitionally equal but the coercion integrates better with `simp`.
+
+---
+
+## Convention 4: Every Lemma Must Carry a `Used in:` Tag
+
+**Severity:** Medium — enables automated reverse-index maintenance in `docs/CATALOG.md`
+
+### Rule
+
+Every lemma added to `Lib/` or `Algorithms/` must include at least one
+`Used in:` line in its Lean docstring, listing the algorithm name, file,
+and proof step.
+
+### Format
+
+```lean
+Used in: `[Algorithm variant]` ([File], Step N — [brief description])
+```
+
+Multiple algorithms should each have their own line.
+
+### Examples
+
+```lean
+/-- Bounded variance transfer from sample distribution ν to probability space P.
+...
+Used in: `SGD non-convex convergence` (Algorithms/SGD.lean, Step 5 — variance bound)
+Used in: `SGD convex convergence` (Algorithms/SGD.lean, Step 5 — variance bound)
+Used in: `SGD strongly convex convergence` (Algorithms/SGD.lean, Step 5 — variance bound) -/
+theorem expectation_norm_sq_gradL_bound ...
+```
+
+```lean
+/-- If ‖u‖² and ‖v‖² are both integrable, then ⟪u, v⟫ is integrable.
+...
+Used in: `SGD non-convex convergence` (Algorithms/SGD.lean, h_int_inner — integrability)
+Used in: `SGD convex convergence` (Algorithms/SGD.lean, h_int_inner — integrability)
+Used in: `SGD strongly convex convergence` (Algorithms/SGD.lean, h_int_inner — integrability) -/
+theorem integrable_inner_of_sq_integrable ...
+```
+
+### Why
+
+The `Roadmap & Dependency Tree` section of `docs/CATALOG.md` is manually
+maintained. Having explicit `Used in:` tags in every docstring means the
+catalog can be verified (and eventually auto-generated) by scanning the
+source files, rather than relying on human memory.
+
+### Exception
+
+Lemmas in `Lib/Glue/` that are genuinely free of optimization content
+(e.g. `integral_inner_gradient_segment`) may use:
+
+```lean
+Used in: general Hilbert-space calculus (no algorithm-specific usage)
+```
+
+until a concrete algorithm proof imports them.
+
+---
+
+## Convention 5: Iterate-Dependent Oracle Terms
+
+**Severity:** High — causes `HasBoundedVariance'` to be unprovable or vacuous
+
+### Rule
+
+If an algorithm's stochastic oracle contains a deterministic term that depends
+on the current iterate (e.g. `gradL_eff(w, s) = gradL(w, s) + h(w)`), then
+`E_ν[‖gradL_eff(w, ·)‖²]` depends on `w` and is NOT a uniform constant.
+`HasBoundedVariance'` requires a uniform bound — do NOT assume it holds
+without checking which resolution applies.
+
+### Two resolutions
+
+**Resolution A (preferred)**: If `h(w) = ∇r(w)` for a known regularizer `r`,
+absorb `h(w)` into `gradF` rather than into the variance term. The regularizer
+strengthens strong convexity and the extra term cancels in the descent inequality.
+The `HasBoundedVariance'` hypothesis then applies to the BASE oracle only.
+
+**Resolution B (fallback)**: If `h(w)` is bounded on the domain (`‖h(w)‖ ≤ K·R`),
+add a bounded-domain hypothesis and use Young's inequality to derive a uniform
+effective variance `σ_eff² = 2σ² + 2K²R²`.
+
+### Reference
+
+See [`docs/GLUE_TRICKS.md`](GLUE_TRICKS.md) Section 5 for the full derivation,
+Lean code templates, and the algorithm impact table.
