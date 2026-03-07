@@ -44,18 +44,18 @@ PROVIDER_URLS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 AGENT_CONFIGS: dict[str, dict] = {
-    "orchestrator":  {"provider": "qwen",     "model": "qwen3.5-max-thinking", "max_tokens": 16384},
-    "planner":       {"provider": "qwen",     "model": "qwen3.5-max-thinking", "max_tokens": 32768},
-    "sorry_closer":  {"provider": "deepseek", "model": "deepseek-math-v2",     "max_tokens": 32768},
-    "persister":     {"provider": "qwen",     "model": "qwen3.5-max-thinking", "max_tokens": 16384},
-    "diagnostician": {"provider": "qwen",     "model": "qwen3.5-max-thinking", "max_tokens": 16384},
+    "orchestrator":  {"provider": "qwen",     "model": "qwen3-max",          "max_tokens": 32768},
+    "planner":       {"provider": "qwen",     "model": "qwen3-max",          "max_tokens": 32768},
+    "sorry_closer":  {"provider": "deepseek", "model": "deepseek-reasoner",  "max_tokens": 32768},
+    "persister":     {"provider": "qwen",     "model": "qwen3-max",          "max_tokens": 32768},
+    "diagnostician": {"provider": "qwen",     "model": "qwen3-max",          "max_tokens": 16384},
 }
 
 # ---------------------------------------------------------------------------
 # Orchestration parameters
 # ---------------------------------------------------------------------------
 
-MAX_APPROVAL_ROUNDS = 5
-MAX_PROVE_RETRIES = 5
+MAX_APPROVAL_ROUNDS = 10
+MAX_PROVE_RETRIES = 10
 LEVERAGE_THRESHOLD = 0.5
-MAX_TOKENS = 8192
+MAX_TOKENS = 32768

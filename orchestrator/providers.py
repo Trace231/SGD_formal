@@ -86,17 +86,25 @@ def call_llm(
     full_messages = [{"role": "system", "content": system}, *messages]
 
     if provider == "qwen":
-        extra_body = {"enable_thinking": True}
-    elif provider == "deepseek":
-        extra_body = {"thinking": {"type": "enabled"}}
+        # enable_thinking requires stream=True on Dashscope
+        stream = client.chat.completions.create(
+            model=model,
+            messages=full_messages,
+            max_tokens=max_tokens,
+            extra_body={"enable_thinking": True},
+            stream=True,
+        )
+        text = ""
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            if hasattr(delta, "content") and delta.content:
+                text += delta.content
     else:
-        extra_body = {}
-
-    resp = client.chat.completions.create(
-        model=model,
-        messages=full_messages,
-        max_tokens=max_tokens,
-        extra_body=extra_body,
-    )
-    text: str = resp.choices[0].message.content or ""
+        # deepseek-reasoner has thinking built-in; other providers need no extra_body
+        resp = client.chat.completions.create(
+            model=model,
+            messages=full_messages,
+            max_tokens=max_tokens,
+        )
+        text = resp.choices[0].message.content or ""
     return strip_think_tags(text)

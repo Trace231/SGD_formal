@@ -13,6 +13,7 @@ from orchestrator.config import (
     AGENT_CONFIGS,
     MAX_APPROVAL_ROUNDS,
     MAX_PROVE_RETRIES,
+    MAX_TOKENS,
 )
 from orchestrator.file_io import load_files, write_lean_file, extract_full_file
 from orchestrator.prompts import AGENT_FILES, SYSTEM_PROMPTS
