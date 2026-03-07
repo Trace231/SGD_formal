@@ -9,13 +9,21 @@ from typing import Callable
 from rich.console import Console
 from rich.panel import Panel
 
+from pathlib import Path as _Path
+
 from orchestrator.config import (
     AGENT_CONFIGS,
     MAX_APPROVAL_ROUNDS,
     MAX_PROVE_RETRIES,
     MAX_TOKENS,
+    PROJECT_ROOT,
 )
-from orchestrator.file_io import load_files, write_lean_file, extract_full_file
+from orchestrator.file_io import (
+    extract_full_file,
+    load_files,
+    parse_code_blocks,
+    write_lean_file,
+)
 from orchestrator.prompts import AGENT_FILES, SYSTEM_PROMPTS
 from orchestrator.providers import call_llm
 from orchestrator.verify import verify_lean
@@ -171,9 +179,33 @@ def proving_loop(
             f"Fill the sorry placeholders following this guidance:\n\n{guidance}"
         )
 
-        new_code = extract_full_file(code_reply, target_file)
-        if new_code:
-            write_lean_file(target_file, new_code)
+        # Write every tagged block that Agent3 returned (Archetype B may
+        # produce multiple files: algorithm + Layer1 + Glue).
+        blocks = parse_code_blocks(code_reply)
+        wrote_target = False
+        for block in blocks:
+            block_path = block.get("path")
+            block_code = block["code"]
+            if block_path:
+                write_lean_file(block_path, block_code)
+                abs_block = _Path(PROJECT_ROOT / block_path).resolve()
+                abs_target = _Path(target_file)
+                if not abs_target.is_absolute():
+                    abs_target = _Path(PROJECT_ROOT / target_file).resolve()
+                else:
+                    abs_target = abs_target.resolve()
+                if abs_block == abs_target:
+                    wrote_target = True
+            else:
+                # Tagless block — assume it replaces the target file
+                write_lean_file(target_file, block_code)
+                wrote_target = True
+
+        if not wrote_target:
+            # Last-resort fallback: single-block extraction
+            new_code = extract_full_file(code_reply, target_file)
+            if new_code:
+                write_lean_file(target_file, new_code)
 
         build_ok, errors, sorry_count = verify_lean(target_file)
 

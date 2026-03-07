@@ -31,7 +31,13 @@ from orchestrator.agents import (
     proving_loop,
 )
 from orchestrator.config import MAX_PROVE_RETRIES, PROJECT_ROOT
-from orchestrator.file_io import load_file, snapshot_file
+from orchestrator.file_io import (
+    load_file,
+    parse_code_blocks,
+    snapshot_file,
+    write_lean_file,
+    write_text_file,
+)
 from orchestrator.metrics import MetricsStore, count_glue_tricks_sections
 from orchestrator.prompts import (
     build_algorithm_card,
@@ -45,6 +51,10 @@ from orchestrator.verify import (
 )
 
 console = Console()
+
+_GLUE_TRICKS_PATH = "docs/GLUE_TRICKS.md"
+_CATALOG_PATH = "docs/CATALOG.md"
+_METHODOLOGY_PATH = "docs/METHODOLOGY.md"
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +244,30 @@ def phase4_persist(
         f"[green]\\[Agent4] Persistence output generated "
         f"({len(persistence_output)} chars)."
     )
+
+    # Write every file block Agent4 produced to disk.
+    blocks = parse_code_blocks(persistence_output)
+    for block in blocks:
+        block_path = block.get("path")
+        block_content = block["code"]
+        if not block_path:
+            continue  # skip untagged blocks
+        block_path_lower = block_path.lower()
+        if block_path.endswith(".lean"):
+            write_lean_file(block_path, block_content)
+            console.print(f"[green]\\[Agent4] Wrote Lean file: {block_path}")
+        elif _GLUE_TRICKS_PATH in block_path_lower or block_path.endswith("GLUE_TRICKS.md"):
+            write_text_file(_GLUE_TRICKS_PATH, block_content, append=True)
+            console.print("[green]\\[Agent4] Appended to GLUE_TRICKS.md")
+        elif _CATALOG_PATH in block_path_lower or block_path.endswith("CATALOG.md"):
+            write_text_file(_CATALOG_PATH, block_content, append=True)
+            console.print("[green]\\[Agent4] Appended to CATALOG.md")
+        elif _METHODOLOGY_PATH in block_path_lower or block_path.endswith("METHODOLOGY.md"):
+            write_text_file(_METHODOLOGY_PATH, block_content, append=False)
+            console.print("[green]\\[Agent4] Replaced METHODOLOGY.md")
+        else:
+            write_text_file(block_path, block_content, append=False)
+            console.print(f"[green]\\[Agent4] Wrote file: {block_path}")
 
     tricks_after = snapshot_file("docs/GLUE_TRICKS.md")
     tricks_sections_after = count_glue_tricks_sections()

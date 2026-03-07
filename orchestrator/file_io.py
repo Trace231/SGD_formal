@@ -44,7 +44,7 @@ def load_files(paths: list[str | Path]) -> str:
 # ---------------------------------------------------------------------------
 
 _CODE_BLOCK_RE = re.compile(
-    r"```(?:lean|lean4)?\s*\n(.*?)```",
+    r"```\w*\s*\n(.*?)```",
     re.DOTALL,
 )
 
@@ -106,6 +106,44 @@ def write_lean_file(path: str | Path, content: str) -> Path:
         os.replace(tmp, p)
     except BaseException:
         os.close(fd) if not os.get_inheritable(fd) else None  # noqa: B018
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Writing text / markdown files (atomic)
+# ---------------------------------------------------------------------------
+
+def write_text_file(path: str | Path, content: str, *, append: bool = False) -> Path:
+    """Write *content* to *path* atomically (write-to-temp then rename).
+
+    When *append* is ``True`` the existing file content is prepended to
+    *content* before writing, so the result is the original file followed by
+    the new content.
+
+    Returns the resolved ``Path`` that was written.
+    """
+    p = Path(path)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    if append and p.exists():
+        existing = p.read_text(encoding="utf-8")
+        content = existing + "\n" + content
+
+    fd, tmp = tempfile.mkstemp(dir=p.parent, suffix=".txt.tmp")
+    try:
+        os.write(fd, content.encode("utf-8"))
+        os.close(fd)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise

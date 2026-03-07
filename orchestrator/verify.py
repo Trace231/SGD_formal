@@ -101,6 +101,12 @@ def get_build_errors(target: str | None = None) -> str:
 
 def verify_lean(target_file: str) -> tuple[bool, str, int]:
     """Convenience: build + sorry count, return (ok, errors, sorry_count)."""
+    p = Path(target_file)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    if not p.exists():
+        return False, f"Target file does not exist: {target_file}", 0
+
     result = lake_build()
     sorry_count = count_sorrys(target_file)
     ok = result.returncode == 0 and sorry_count == 0
@@ -209,9 +215,31 @@ def _get_docstring_for_lemma(content: str, lemma_name: str) -> str:
     return m.group(1) if m else ""
 
 
+def _is_simp_lemma(content: str, lemma_name: str) -> bool:
+    """Return True if the declaration is preceded by ``@[simp]`` within ~200 chars.
+
+    ``@[simp]`` declarations are called implicitly by the simp tactic and are
+    exempt from the Convention 4 ``Used in:`` requirement.
+    """
+    decl_pat = re.compile(
+        r"^(?:theorem|lemma|noncomputable\s+def|def)\s+" + re.escape(lemma_name),
+        re.MULTILINE,
+    )
+    m = decl_pat.search(content)
+    if not m:
+        return False
+    snippet = content[:m.start()][-200:]
+    return "@[simp" in snippet
+
+
 def check_used_in_tags(modified_files: list[str | Path]) -> list[str]:
     """Return a list of ``file:lemma`` strings that are missing ``Used in:``
-    tags.  Empty list means all checks passed."""
+    tags.  Empty list means all checks passed.
+
+    Declarations tagged with ``@[simp]`` are exempt — they are invoked
+    implicitly by the simp tactic and do not require explicit callsite
+    documentation (Convention 4 exception).
+    """
     missing: list[str] = []
     for f in modified_files:
         p = Path(f)
@@ -221,6 +249,8 @@ def check_used_in_tags(modified_files: list[str | Path]) -> list[str]:
             continue
         content = p.read_text(encoding="utf-8")
         for lemma in _LEMMA_DEF_RE.findall(content):
+            if _is_simp_lemma(content, lemma):
+                continue  # @[simp] declarations are exempt from Used-in requirement
             doc = _get_docstring_for_lemma(content, lemma)
             if "Used in:" not in doc:
                 missing.append(f"{p.relative_to(PROJECT_ROOT)}:{lemma}")

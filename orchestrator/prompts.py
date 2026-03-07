@@ -173,9 +173,37 @@ the Planner (Agent2).  You receive:
 - §4b: Archetype B needs h_int_virtual separate from h_int_norm_sq.
 
 ## Output format
-Return the COMPLETE modified .lean file inside a single fenced code block.
-Include a -- File: <path> comment on the first line.
-Do NOT output partial patches — always return the full file.
+You may output ONE OR MORE fenced code blocks.
+Each block MUST begin with a ``-- File: <relative/path>`` comment on the
+very first line so the pipeline knows where to write it.
+
+**Archetype A** (oracle variant): typically one block — the algorithm file.
+
+**Archetype B** (novel update structure): output MULTIPLE blocks when needed:
+- One block for the main ``Algorithms/<Name>.lean`` file.
+- One block for any new ``Lib/Layer1/<Module>.lean`` meta-theorems you add.
+- One block for any new ``Lib/Glue/<Module>.lean`` lemmas you add.
+
+Do NOT output partial patches — always return the COMPLETE file for each block.
+Do NOT omit the ``-- File:`` header comment.
+
+**Convention 4 (Used-in tags):** EVERY ``theorem``, ``lemma``, and
+``noncomputable def`` you write MUST have a Lean docstring (``/-- ... -/``)
+containing at least one ``Used in: ...`` line — EXCEPT declarations tagged
+with ``@[simp]``, which are called implicitly by the simp tactic and are exempt.
+
+Good example (non-simp, tag required):
+```lean
+/-- Bounded variance transfer from ν to P.
+Used in: `subgradient_convergence_convex_v2` (Algorithms/SubgradientMethod.lean, Step 2) -/
+theorem expectation_norm_sq_bound ...
+```
+
+Simp lemma (exempt — no Used-in tag required):
+```lean
+@[simp]
+theorem process_zero : setup.process 0 = fun _ => setup.w₀ := rfl
+```
 """
 
 # -------------------------------------------------------------------
