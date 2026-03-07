@@ -1,0 +1,82 @@
+{
+  "runs": [
+    {
+      "algorithm": "Subgradient Method",
+      "timestamp": "2026-03-07T10:39:23+00:00",
+      "glue_hit_rate": 0.0,
+      "total_glue_lemmas": 16,
+      "total_layer1_lemmas": 9,
+      "new_layer1_lemmas": 0,
+      "layer1_fields_added": 0,
+      "new_glue_lemmas": 0,
+      "new_tricks_added": 0,
+      "sorry_close_attempts": 1,
+      "final_sorry_count": 0
+    },
+    {
+      "algorithm": "Subgradient Method",
+      "timestamp": "2026-03-07T11:27:46+00:00",
+      "glue_hit_rate": 0.631578947368421,
+      "total_glue_lemmas": 16,
+      "total_layer1_lemmas": 9,
+      "new_layer1_lemmas": 0,
+      "layer1_fields_added": 0,
+      "new_glue_lemmas": 0,
+      "new_tricks_added": 0,
+      "sorry_close_attempts": 1,
+      "final_sorry_count": 0
+    },
+    {
+      "algorithm": "Subgradient Method",
+      "timestamp": "2026-03-07T12:05:42+00:00",
+      "glue_hit_rate": 0.0,
+      "total_glue_lemmas": 16,
+      "total_layer1_lemmas": 9,
+      "new_layer1_lemmas": 0,
+      "layer1_fields_added": 0,
+      "new_glue_lemmas": 0,
+      "new_tricks_added": -7,
+      "sorry_close_attempts": 1,
+      "final_sorry_count": 0
+    },
+    {
+      "algorithm": "Subgradient Method",
+      "timestamp": "2026-03-07T12:53:22+00:00",
+      "glue_hit_rate": 0.6,
+      "total_glue_lemmas": 16,
+      "total_layer1_lemmas": 9,
+      "new_layer1_lemmas": 0,
+      "layer1_fields_added": 0,
+      "new_glue_lemmas": 0,
+      "new_tricks_added": 0,
+      "sorry_close_attempts": 2,
+      "final_sorry_count": 0
+    },
+    {
+      "algorithm": "AveragedSGD",
+      "timestamp": "2026-03-07T15:01:53+00:00",
+      "glue_hit_rate": 0.8333333333333334,
+      "total_glue_lemmas": 16,
+      "total_layer1_lemmas": 10,
+      "new_layer1_lemmas": 0,
+      "layer1_fields_added": 0,
+      "new_glue_lemmas": 0,
+      "new_tricks_added": 0,
+      "sorry_close_attempts": 4,
+      "final_sorry_count": 0
+    },
+    {
+      "algorithm": "AveragedSGD",
+      "timestamp": "2026-03-07T16:46:22+00:00",
+      "glue_hit_rate": 0.7058823529411765,
+      "total_glue_lemmas": 16,
+      "total_layer1_lemmas": 9,
+      "new_layer1_lemmas": 0,
+      "layer1_fields_added": 0,
+      "new_glue_lemmas": 0,
+      "new_tricks_added": 0,
+      "sorry_close_attempts": 1,
+      "final_sorry_count": 0
+    }
+  ]
+}
