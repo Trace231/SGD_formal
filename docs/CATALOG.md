@@ -179,6 +179,26 @@ but no single named form for the SGD step expansion.
 
 ---
 
+#### `proj_nonexp_sq`
+
+| Field | Value |
+|---|---|
+| File | `Lib/Glue/Algebra.lean` |
+| Layer | Glue |
+| Gap | Level 2 — non-expansive norm bound lifted to squared norm form |
+| Status | **Proved** |
+
+**Purpose:** If `proj` is non-expansive and `wStar` is a fixed point of `proj`, then
+`‖proj x − wStar‖² ≤ ‖x − wStar‖²`.
+
+**Proof steps:**
+- `[L3: congrArg — rewrite wStar as proj wStar via hproj_wStar.symm]`
+- `[L0: pow_le_pow_left₀ (norm_nonneg _) (h x wStar) 2]` — square the non-expansiveness bound
+
+**Used by:** `pgd_convergence_convex_v2` (Step 1 — projection bound via `integral_mono`)
+
+---
+
 ### `Lib/Glue/Probability.lean`
 
 Provides general-purpose probability and integrability tools that bridge the gap
@@ -232,6 +252,25 @@ a Bochner integral bound, which is trivially true for non-integrable functions
 integrability (`hvar_int`), the circular dependency is broken and the proof
 goes through cleanly via `integrable_prod_iff` in the Bochner world — no
 lintegral conversion needed. See `docs/CONVENTIONS.md` §1.
+
+---
+
+#### `svrg_variance_reduction`
+
+| Field | Value |
+|---|---|
+| File | `Lib/Glue/Probability.lean` |
+| Layer | Glue |
+| Gap | Level 1 — variance-reduction inequality for control-variate oracle |
+| Status | **Statement placed, proof sorry'd** (`sorry: 1 (pending)`) |
+
+**Purpose:** Bound the SVRG control-variate second moment at fixed snapshot:
+$$
+\mathbb{E}_s\!\left[\|\nabla \ell(w,s)-\nabla \ell(\widetilde w,s)+\nabla F(\widetilde w)\|^2\right]
+\le 4L\,(f(w)-f^*) + 2\|\nabla F(\widetilde w)-\nabla F(w^*)\|^2.
+$$
+
+**Used by:** `svrg_convergence_inner_strongly_convex` (`Algorithms/SVRG.lean`, future integration pass, Step 1 variance control).
 
 ---
 
@@ -860,35 +899,276 @@ new WD bridge lemmas written = 2; reuse ratio = `7 / (7 + 2) = 77.8%` (raw `7:2`
 
 ---
 
+## Algorithm Layer (Layer 2) — `Algorithms/ProjectedGD.lean`
+
+This file formalizes stochastic projected gradient descent (Archetype B). Unlike Weight Decay
+SGD, PGD cannot be reduced to plain SGD via `simpa` because the projection operator creates a
+novel update structure. The convergence proof uses a two-step one-step bound: first bound the
+actual projected step by the virtual SGD step via non-expansiveness, then apply
+`stochastic_descent_convex'` to the virtual step.
+
+---
+
+### `ProjectedGDSetup`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/ProjectedGD.lean` |
+| Kind | `structure` |
+| Layer | 2 |
+
+**Fields:**
+- `toSGDSetup : SGDSetup E S Ω` — base SGD data (oracle, samples, step sizes)
+- `proj : E → E` — projection operator
+- `hproj_nonexp : ∀ x y, ‖proj x − proj y‖ ≤ ‖x − y‖` — non-expansiveness
+- `hproj_meas : Measurable proj` — measurability (stored as field, not theorem parameter)
+
+**Design note:** `hproj_wStar : proj wStar = wStar` is a **per-theorem hypothesis**, not
+a structure field, since the fixed point depends on the specific minimizer `wStar`.
+
+---
+
+### `pgdProcess`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/ProjectedGD.lean` |
+| Kind | `noncomputable def` |
+| Layer | 2 |
+
+**Definition:** `pgdProcess w₀ η gradL proj ξ t ω`:
+- `t = 0`: returns `w₀`
+- `t + 1`: `proj (pgdProcess t ω − η t • gradL (pgdProcess t ω) (ξ t ω))`
+
+**Measurability/independence lemmas:**
+- `pgdProcess_measurable` — induction; step uses `hproj_meas.comp`
+- `pgdProcess_adapted` — reuses `sgdFiltration` from `Main.lean` directly
+- `pgdProcess_indepFun_xi` — same filtration argument as `sgdProcess_indepFun_xi`
+
+---
+
+### `pgd_to_hyps`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/ProjectedGD.lean` |
+| Kind | `noncomputable def` |
+| Layer | 2 |
+
+**Purpose:** Bridge `ProjectedGDSetup` at step `t` to `StochasticDescentHyps` for the
+**virtual step** `w_t − η_t • gradL(w_t, ξ_t)` (before projection).
+
+**Key difference from `sgd_to_hyps`:** `gradL` and `gradF` come from `toSGDSetup` unchanged —
+the projection does not affect the oracle or the true gradient.
+
+---
+
+### `pgd_convergence_convex_v2`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/ProjectedGD.lean` |
+| Layer | 2 |
+| Conclusion | `(1/T) · Σ_{t<T} (E[f(w_t)] − f(w*)) ≤ ‖w₀ − w*‖² / (2ηT) + ησ²/2` |
+
+**Archetype:** B — no `simpa` reduction to `sgd_convergence_convex_v2`.
+
+**Call chain:**
+```
+pgd_convergence_convex_v2
+  → proj_nonexp_sq + integral_mono
+      [actual step: E[‖w_{t+1}−w*‖²] ≤ E[‖virtual_t − w*‖²]]
+  → stochastic_descent_convex' (pgd_to_hyps setup t ...)
+      [virtual step: E[‖virtual_t − w*‖²] ≤ E[‖w_t−w*‖²] − 2η·gap + η²σ²]
+  → same Layer 0/Glue chain as SGD convex
+      (expectation_inner_gradL_eq, convex_inner_lower_bound,
+       expectation_norm_sq_gradL_bound)
+  → Finset.sum_range_sub  [telescope over t < T]
+```
+
+**Key integrability distinction (Archetype B pattern):**
+- `h_int_norm_sq` — integrability of `‖w_{t+1} − w*‖²` (actual projected step)
+- `h_int_virtual` — integrability of `‖(w_t − η•g_t) − w*‖²` (virtual step, before projection)
+These are SEPARATE hypotheses; both are needed for `integral_mono`.
+
+---
+
+### Hit Report — Glue Usage Count (PGD)
+
+| Component | File | Used by |
+|---|---|---|
+| `stochastic_descent_convex'` | `Lib/Layer1/StochasticDescent.lean` | `pgd_convergence_convex_v2` (virtual step) |
+| `expectation_inner_gradL_eq` | `Lib/Layer0/IndepExpect.lean` | Step 4 (unbiasedness) |
+| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 5 (variance bound) |
+| `convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean` | Step 4 (convex FOC) |
+| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | Step 1 of virtual step |
+| `integrable_norm_sq_of_bounded_var` | `Lib/Glue/Probability.lean` | `h_int_sq` |
+| `integrable_inner_of_sq_integrable` | `Lib/Glue/Probability.lean` | `h_int_inner` |
+| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | `h_int_norm_sq`, `h_int_virtual` |
+| `sgdFiltration` | `Main.lean` | `pgdProcess_adapted`, `pgdProcess_indepFun_xi` |
+| `proj_nonexp_sq` | `Lib/Glue/Algebra.lean` | Step 1 (projection bound) — **new** |
+| `pgd_to_hyps` | `Algorithms/ProjectedGD.lean` | bridge — **new** |
+
+**Leverage score (Archetype B):** reused existing components = 9; new PGD-specific items = 2;
+reuse ratio = `9 / (9 + 2) = 81.8%` (raw `9:2`).
+
+---
+
+## Algorithm Layer (Layer 2) — `Algorithms/SVRG.lean`
+
+This file formalizes fixed-snapshot SVRG as a Layer 2 reduction to the existing
+SGD strongly-convex stack. The key reduction is to freeze snapshot terms
+`(wTilde, gradLTilde)` as parameters and package the inner epoch as a plain
+`SGDSetup` through `effectiveSGDSetup`.
+
+---
+
+### `SVRGSetup`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/SVRG.lean` |
+| Kind | `structure` |
+| Layer | 2 |
+
+**Purpose:** Extend `SGDSetup` with `sampleDist` and fixed-snapshot inner-loop
+machinery while retaining IID sampling and filtration interface from the base setup.
+
+---
+
+### `svrgOracle`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/SVRG.lean` |
+| Kind | `def` |
+| Layer | 2 |
+
+**Definition:** `svrgOracle wTilde gradLTilde w s = gradL(w,s) - gradL(wTilde,s) + gradLTilde`.
+
+**Role:** Standard control-variate oracle used during one fixed-snapshot epoch.
+
+---
+
+### `svrgProcess`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/SVRG.lean` |
+| Kind | `noncomputable def` |
+| Layer | 2 |
+
+**Purpose:** Inner-loop iterate recursion under fixed snapshot and fixed
+`gradLTilde`, with update form matching SGD recursion shape.
+
+---
+
+### `effectiveSGDSetup`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/SVRG.lean` |
+| Kind | `noncomputable def` |
+| Layer | 2 |
+
+**Purpose:** Package fixed-snapshot SVRG epoch as ordinary SGD by replacing only
+`gradL` with `svrgOracle` and reusing all stochastic infrastructure fields.
+
+---
+
+### `svrg_to_hyps`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/SVRG.lean` |
+| Kind | `noncomputable def` |
+| Layer | 2 |
+
+**Purpose:** Bridge the fixed-snapshot SVRG inner-loop state to
+`StochasticDescentHyps` via the packaged effective setup.
+
+---
+
+### `svrg_convergence_inner_strongly_convex`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/SVRG.lean` |
+| Layer | 2 |
+| Conclusion | `E[‖w_T−w*‖²] ≤ (1−ημ)^T · ‖w₀−w*‖² + η·σeff²/μ` |
+| Sorry status | **No sorry** |
+
+**Call chain:**
+```
+svrg_convergence_inner_strongly_convex
+  → effectiveSGDSetup (svrgOracle packaged as plain SGDSetup)
+  → sgd_convergence_strongly_convex_v2 (via simpa)
+      → sgd_to_hyps
+      → stochastic_descent_strongly_convex'
+```
+
+---
+
+### `svrg_convergence_outer_stub`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/SVRG.lean` |
+| Layer | 2 |
+| Scope | Outer-loop snapshot update every `m` steps |
+| Sorry status | **sorry (out of scope)** |
+
+**Purpose:** Placeholder theorem for macro-level SVRG (snapshot refresh schedule).
+
+### Hit Report — Glue Usage Count
+
+**Hit Report: Library Components Used**
+
+| Component | File | Used by |
+|---|---|---|
+| `effectiveSGDSetup` packaging | `Algorithms/SVRG.lean` | `svrg_convergence_inner_strongly_convex` |
+| `sgd_convergence_strongly_convex_v2` | `Algorithms/SGD.lean` | `svrg_convergence_inner_strongly_convex` |
+| `sgd_to_hyps` | `Algorithms/SGD.lean` | inherited via `sgd_convergence_strongly_convex_v2` |
+| `stochastic_descent_strongly_convex'` | `Lib/Layer1/StochasticDescent.lean` | inherited via `sgd_convergence_strongly_convex_v2` |
+| `svrg_variance_reduction` | `Lib/Glue/Probability.lean` | planned Step 1 integration (currently pending proof) |
+
+**Leverage score (Snapshot Freeze / Archetype A):** reused existing stack elements = 3;
+new SVRG bridge components documented = 6; reuse ratio = `3 / (3 + 6) = 33.3%` (raw `3:6`).
+
+---
+
 ## Roadmap & Dependency Tree
 
 This section provides a reverse index: given an algorithm and proof step,
 which catalog lemmas does it depend on? Use this to assess what is reusable
 when adding a new algorithm.
 
-### SGD + Weight Decay Dependency Table
+### SGD + Weight Decay + SVRG Dependency Table
 
 Each cell shows the proof step number in the convergence theorem where the
 lemma is invoked. "h_int" cells indicate the lemma is used to discharge an
-integrability hypothesis rather than a direct proof step. Weight Decay SGD
-entries match SGD because the wrappers reduce to plain SGD through
-`effectiveSGDSetup` and `simpa`.
+integrability hypothesis rather than a direct proof step. Weight Decay entries
+match SGD because wrappers reduce to plain SGD through `effectiveSGDSetup` and
+`simpa`. SVRG inner-loop entries align with the strongly-convex SGD path because
+fixed-snapshot packaging uses `effectiveSGDSetup` + `simpa` to the same theorem stack.
 
-| Lemma | File | SGD non-convex | SGD convex | SGD strongly convex | WD non-convex | WD convex | WD strongly convex | Reusable for |
-|-------|------|:--------------:|:----------:|:-------------------:|:-------------:|:---------:|:------------------:|--------------|
-| `lipschitz_gradient_quadratic_bound` | `Lib/Layer0/GradientFTC.lean` | Step 1 | — | — | Step 1 | — | — | Any L-smooth algorithm |
-| `convex_first_order_condition` | `Lib/Layer0/ConvexFOC.lean` | — | (via Step 4) | — | — | (via Step 4) | — | Any convex algorithm |
-| `convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean` | — | Step 4 | — | — | Step 4 | — | Any convex algorithm |
-| `strong_convex_first_order_condition` | `Lib/Layer0/ConvexFOC.lean` | — | — | (via Step 4) | — | — | (via Step 4) | Any strongly convex algorithm |
-| `strong_convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean` | — | — | Step 4 | — | — | Step 4 | Any strongly convex algorithm |
-| `expectation_inner_gradL_eq` | `Lib/Layer0/IndepExpect.lean` | Step 4 | Step 4 | Step 4 | Step 4 | Step 4 | Step 4 | **Universal** — any IID stochastic gradient algorithm |
-| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | **Universal** — any IID stochastic gradient algorithm |
-| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | — | Step 1 | Step 1 | — | Step 1 | Step 1 | Any algorithm with $\|w_{t+1}-w^*\|^2$ recursion |
-| `integrable_norm_sq_of_bounded_var` | `Lib/Glue/Probability.lean` | h_int_sq | h_int_sq | h_int_sq | h_int_sq | h_int_sq | h_int_sq | **Universal** — provides `h_int_sq` for any bounded-variance algorithm |
-| `integrable_inner_of_sq_integrable` | `Lib/Glue/Probability.lean` | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | **Universal** — provides `h_int_inner` for any L²-bounded gradient |
-| `integrable_lsmooth_comp_measurable` | `Lib/Glue/Measurable.lean` | h_int_ft | h_int_ft | — | h_int_ft | h_int_ft | — | Any algorithm applying a Lipschitz function to an integrable iterate |
-| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | — | h_int_norm_sq | h_int_norm_sq | — | h_int_norm_sq | h_int_norm_sq | Any algorithm with distance-to-optimum recursion |
-| `integrable_inner_gradL_comp` | `Lib/Glue/Measurable.lean` | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | Any IID algorithm needing inner-product integrability |
+| Lemma | File | SGD non-convex | SGD convex | SGD strongly convex | WD non-convex | WD convex | WD strongly convex | PGD convex | SVRG inner strongly convex | SVRG outer stub | Reusable for |
+|-------|------|:--------------:|:----------:|:-------------------:|:-------------:|:---------:|:------------------:|:----------:|:--------------------------:|:---------------:|--------------|
+| `lipschitz_gradient_quadratic_bound` | `Lib/Layer0/GradientFTC.lean` | Step 1 | — | — | Step 1 | — | — | — | — | — | Any L-smooth algorithm |
+| `convex_first_order_condition` | `Lib/Layer0/ConvexFOC.lean` | — | (via Step 4) | — | — | (via Step 4) | — | (via Step 4) | — | — | Any convex algorithm |
+| `convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean` | — | Step 4 | — | — | Step 4 | — | Step 4 (virtual) | — | — | Any convex algorithm |
+| `strong_convex_first_order_condition` | `Lib/Layer0/ConvexFOC.lean` | — | — | (via Step 4) | — | — | (via Step 4) | — | (via Step 4) | — | Any strongly convex algorithm |
+| `strong_convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean` | — | — | Step 4 | — | — | Step 4 | — | Step 4 | — | Any strongly convex algorithm |
+| `expectation_inner_gradL_eq` | `Lib/Layer0/IndepExpect.lean` | Step 4 | Step 4 | Step 4 | Step 4 | Step 4 | Step 4 | Step 4 | Step 4 | — | **Universal** — any IID stochastic gradient algorithm |
+| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | — | **Universal** — any IID stochastic gradient algorithm |
+| `proj_nonexp_sq` | `Lib/Glue/Algebra.lean` | — | — | — | — | — | — | Step 1 | — | — | Any algorithm with a non-expansive post-update map |
+| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | — | Step 1 | Step 1 | — | Step 1 | Step 1 | Step 1 (virtual) | Step 1 | — | Any algorithm with $\|w_{t+1}-w^*\|^2$ recursion |
+| `integrable_norm_sq_of_bounded_var` | `Lib/Glue/Probability.lean` | h_int_sq | h_int_sq | h_int_sq | h_int_sq | h_int_sq | h_int_sq | h_int_sq | h_int_sq | — | **Universal** — provides `h_int_sq` for any bounded-variance algorithm |
+| `integrable_inner_of_sq_integrable` | `Lib/Glue/Probability.lean` | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | — | **Universal** — provides `h_int_inner` for any L²-bounded gradient |
+| `svrg_variance_reduction` | `Lib/Glue/Probability.lean` | — | — | — | — | — | — | — | pending (Step 1 plan) | — | Control-variate algorithms (SARAH, SPIDER, SCSG) |
+| `integrable_lsmooth_comp_measurable` | `Lib/Glue/Measurable.lean` | h_int_ft | h_int_ft | — | h_int_ft | h_int_ft | — | h_int_ft | — | — | Any algorithm applying a Lipschitz function to an integrable iterate |
+| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | — | h_int_norm_sq | h_int_norm_sq | — | h_int_norm_sq | h_int_norm_sq | h_int_norm_sq, h_int_virtual | h_int_norm_sq | — | Any algorithm with distance-to-optimum recursion |
+| `integrable_inner_gradL_comp` | `Lib/Glue/Measurable.lean` | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | — | Any IID algorithm needing inner-product integrability |
 
 ### Universally reusable glue lemmas
 

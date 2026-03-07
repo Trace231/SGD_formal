@@ -224,7 +224,15 @@ build `effectiveSGDSetup`, then discharge all three WD rates by
 | 4 | Distance recursion | No gap — reuse `norm_sq_sgd_step` pattern |
 | 5 | Take expectation | No gap — reuse `IndepExpect.lean` entirely |
 
-### Phase 2 — Extract cross-algorithm patterns (after ≥ 2 probes)
+### Phase 2 — SVRG (inner loop complete)
+
+**Output:** fixed-snapshot inner-loop reduction completed with
+`svrg_convergence_inner_strongly_convex`; macro outer-loop theorem remains stubbed.
+
+**Method:** Inner loop reduced to Archetype A via snapshot freeze + `effectiveSGDSetup`.
+Outer loop (snapshot update every `m` steps) remains an open stub.
+
+### Phase 3 — Extract cross-algorithm patterns (after ≥ 2 probes)
 
 When ≥ 2 algorithms use the same lemma, promote it to a "core lemma"
 with explicit cross-algorithm documentation.

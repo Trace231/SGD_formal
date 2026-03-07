@@ -369,6 +369,64 @@ If your update is `process(t+1) = op(virtualStep(t))`, always include
 
 ---
 
+## Section 4c — Pattern H: Snapshot Freeze = Archetype A Reduction
+
+**Situation**: A control-variate algorithm introduces a snapshot term updated on an
+outer loop, e.g. `wTilde` and `gradLTilde = gradF wTilde`. The full algorithm is
+two-level (macro Archetype B), but each inner epoch has fixed snapshot values.
+
+**Key insight**: During one epoch, treat snapshot objects as fixed parameters,
+not as state fields. This makes the inner update conform to Archetype A:
+`process(t+1) = process(t) - η_t • oracle(process(t), ξ_t)`.
+
+### Template
+
+```lean
+-- Freeze snapshot objects as parameters to the inner-loop analysis.
+variable (wTilde gradLTilde : E)
+
+-- Control-variate oracle at fixed snapshot.
+def cvOracle (w : E) (s : S) : E :=
+  gradL w s - gradL wTilde s + gradLTilde
+
+-- Inner-loop process with standard SGD-shaped recursion.
+noncomputable def cvProcess : ℕ → Ω → E :=
+  sgdProcess w0 η cvOracle ξ
+
+-- Package as ordinary SGDSetup for theorem reuse.
+noncomputable def effectiveSGDSetup : SGDSetup E S Ω := {
+  w₀ := w0
+  η := η
+  gradL := cvOracle
+  gradF := gradF
+  ξ := ξ
+  P := P
+  hP := hP
+  hξ_meas := hξ_meas
+  hξ_indep := hξ_indep
+  hξ_ident := hξ_ident
+}
+```
+
+### SVRG example (fixed snapshot epoch)
+
+Use
+`svrgOracle(w,s) = gradL(w,s) - gradL(wTilde,s) + gradLTilde`
+with `gradLTilde = gradF(wTilde)`, then package via `effectiveSGDSetup` and
+discharge the epoch theorem by `simpa` into `sgd_convergence_strongly_convex_v2`.
+
+### Archetype note (macro vs micro)
+
+- **Micro (inner epoch):** Archetype A after freezing `(wTilde, gradLTilde)`.
+- **Macro (whole SVRG):** Archetype B due to periodic snapshot update every `m` steps.
+
+### Applicability
+
+Any method whose control-variate term is snapshot-anchored and frozen within an
+epoch (e.g. SARAH, SPIDER, SCSG).
+
+---
+
 ## Section 5 — Iterate-Dependent Variance Pitfall
 
 This is the most common hidden pitfall when applying the effective oracle reframe.
