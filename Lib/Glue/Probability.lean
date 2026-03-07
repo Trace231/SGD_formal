@@ -110,85 +110,12 @@ theorem integrable_norm_sq_of_bounded_var
   exact ⟨
     Filter.Eventually.of_forall fun w => hvar_int w,
     Integrable.mono (integrable_const (σ ^ 2))
-      ((h_f_meas.norm.stronglyMeasurable.integral_prod_right').aestronglyMeasurable)
+      (h_f_meas.norm.aestronglyMeasurable.integral_prod_right)
       (Filter.Eventually.of_forall fun w => by
-        have h_eq :
-            (∫ y, ‖‖gradL (w, y).1 (w, y).2‖ ^ 2‖ ∂ν) = ∫ s, ‖gradL w s‖ ^ 2 ∂ν := by
-          refine integral_congr_ae (Filter.Eventually.of_forall ?_)
-          intro y
-          have hnorm : ‖‖gradL w y‖ ^ 2‖ = ‖gradL w y‖ ^ 2 := by
-            rw [Real.norm_eq_abs, abs_of_nonneg (sq_nonneg ‖gradL w y‖)]
-          simp [hnorm]
-        have h_nonneg : 0 ≤ ∫ y, ‖‖gradL (w, y).1 (w, y).2‖ ^ 2‖ ∂ν := by
-          refine integral_nonneg ?_
-          intro y
-          positivity
-        rw [Real.norm_eq_abs, Real.norm_eq_abs, abs_of_nonneg h_nonneg, abs_of_nonneg (sq_nonneg σ), h_eq]
-        exact hvar_bound w)
+        simp only [Real.norm_eq_abs]
+        rw [abs_of_nonneg (integral_nonneg fun _ => norm_nonneg _),
+            abs_of_nonneg (sq_nonneg σ)]
+        exact (integral_mono (hvar_int w).norm (integrable_const _)
+          fun s => by simp [Real.norm_eq_abs, abs_of_nonneg (by positivity)]).trans
+          (hvar_bound w))
   ⟩
-
-/-- SVRG variance-reduction inequality (finite-sum / uniform-sampling form).
-
-This version is aligned with finite-sum SVRG assumptions:
-* samples are drawn from a finite index set `S`,
-* expectation under `ν` matches a uniform average over `S`,
-* a per-sample bound on the SVRG oracle norm is available.
-
-Used in: `SVRG inner-loop strongly-convex convergence`
-(`Algorithms/SVRG.lean`, derivation of effective variance bound) -/
-theorem svrg_variance_reduction
-    {gradL : E → S → E} {gradF : E → E} {f : E → ℝ}
-    {ν : Measure S} {L : NNReal} {wTilde wStar : E} {fStar : ℝ}
-    [Fintype S] [Nonempty S]
-    (h_unif : ∀ g : S → ℝ, Integrable g ν →
-      ∫ s, g s ∂ν = (1 / (Fintype.card S : ℝ)) * ∑ s : S, g s)
-    (h_int_oracle : ∀ w : E, Integrable
-      (fun s => ‖gradL w s - gradL wTilde s + gradF wTilde‖ ^ 2) ν)
-    (h_pointwise_oracle : ∀ s : S, ∀ w : E,
-      ‖gradL w s - gradL wTilde s + gradF wTilde‖ ^ 2
-        ≤ 4 * (L : ℝ) * (f w - fStar) + 2 * ‖gradF wTilde - gradF wStar‖ ^ 2) :
-    ∀ w : E,
-      ∫ s, ‖gradL w s - gradL wTilde s + gradF wTilde‖ ^ 2 ∂ν
-        ≤ 4 * (L : ℝ) * (f w - fStar) + 2 * ‖gradF wTilde - gradF wStar‖ ^ 2 := by
-  intro w
-  have h_card_ne_zero : (Fintype.card S : ℝ) ≠ 0 := by
-    exact_mod_cast (Nat.ne_of_gt (Fintype.card_pos_iff.mpr inferInstance))
-  have h_avg :
-      ∫ s, ‖gradL w s - gradL wTilde s + gradF wTilde‖ ^ 2 ∂ν =
-        (1 / (Fintype.card S : ℝ)) *
-          ∑ s : S, ‖gradL w s - gradL wTilde s + gradF wTilde‖ ^ 2 :=
-    h_unif _ (h_int_oracle w)
-  have h_sum_le :
-      (∑ s : S, ‖gradL w s - gradL wTilde s + gradF wTilde‖ ^ 2)
-        ≤ ∑ s : S, (4 * (L : ℝ) * (f w - fStar) + 2 * ‖gradF wTilde - gradF wStar‖ ^ 2) := by
-    refine Finset.sum_le_sum ?_
-    intro s _
-    exact h_pointwise_oracle s w
-  have h_oracle_var :
-      ∫ s, ‖gradL w s - gradL wTilde s + gradF wTilde‖ ^ 2 ∂ν
-        ≤ 4 * (L : ℝ) * (f w - fStar) + 2 * ‖gradF wTilde - gradF wStar‖ ^ 2 := by
-    have h_sum_const :
-        (∑ s : S, (4 * (L : ℝ) * (f w - fStar) + 2 * ‖gradF wTilde - gradF wStar‖ ^ 2)) =
-          (Fintype.card S : ℝ) *
-            (4 * (L : ℝ) * (f w - fStar) + 2 * ‖gradF wTilde - gradF wStar‖ ^ 2) := by
-      simp [Finset.sum_const, nsmul_eq_mul]
-      ring
-    calc
-      ∫ s, ‖gradL w s - gradL wTilde s + gradF wTilde‖ ^ 2 ∂ν
-          = (1 / (Fintype.card S : ℝ)) *
-              ∑ s : S, ‖gradL w s - gradL wTilde s + gradF wTilde‖ ^ 2 := h_avg
-      _ ≤ (1 / (Fintype.card S : ℝ)) *
-            ∑ s : S, (4 * (L : ℝ) * (f w - fStar) + 2 * ‖gradF wTilde - gradF wStar‖ ^ 2) :=
-            mul_le_mul_of_nonneg_left h_sum_le (by positivity)
-      _ = (1 / (Fintype.card S : ℝ)) *
-            ((Fintype.card S : ℝ) *
-              (4 * (L : ℝ) * (f w - fStar) + 2 * ‖gradF wTilde - gradF wStar‖ ^ 2)) := by
-            simp [h_sum_const]
-      _ = ((1 / (Fintype.card S : ℝ)) * (Fintype.card S : ℝ)) *
-            (4 * (L : ℝ) * (f w - fStar) + 2 * ‖gradF wTilde - gradF wStar‖ ^ 2) := by
-            ring
-      _ = 4 * (L : ℝ) * (f w - fStar) + 2 * ‖gradF wTilde - gradF wStar‖ ^ 2 := by
-            field_simp [h_card_ne_zero]
-  calc
-    ∫ s, ‖gradL w s - gradL wTilde s + gradF wTilde‖ ^ 2 ∂ν
-        ≤ 4 * (L : ℝ) * (f w - fStar) + 2 * ‖gradF wTilde - gradF wStar‖ ^ 2 := h_oracle_var
