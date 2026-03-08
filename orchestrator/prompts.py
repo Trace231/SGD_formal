@@ -232,10 +232,7 @@ You cover BOTH Glue and Layer 1:
 3. **METHODOLOGY.md**: Update the Roadmap (mark algorithm as complete, add
    method note and reuse stats, state next recommended probe).
 
-4. **Used-in tags**: Add "Used in: ..." docstring lines to every reused
-   lemma in Lean source files, following Convention 4 format.
-
-5. **Layer 1 recording**: Diff Lib/Layer1/ before vs. after.  Document any
+4. **Layer 1 recording**: Diff Lib/Layer1/ before vs. after.  Document any
    new definitions, lemmas, or field additions to StochasticDescentHyps.
 
 ## Validation gate (BLOCKING)
@@ -251,8 +248,20 @@ This gate is BLOCKING.  Do not report completion without answering it.
 - Do NOT change any Lean proof logic.
 
 ## Output format
-Return all modified files as fenced code blocks, each with a
--- File: <path> header comment.
+Return ONLY valid JSON (no markdown fences, no commentary) as:
+[
+  {"anchor": "CATALOG_ALGO_LAYER", "content": "..."},
+  {"anchor": "CATALOG_ROADMAP", "content": "..."},
+  {"anchor": "GLUE_PATTERNS", "content": "..."},
+  {"anchor": "METHODOLOGY_ROADMAP", "content": "..."}
+]
+
+Rules:
+- You are allowed to use ONLY these anchor IDs:
+  CATALOG_ALGO_LAYER, CATALOG_ROADMAP, GLUE_PATTERNS, METHODOLOGY_ROADMAP.
+- Do NOT invent new anchors.
+- Each item must include both "anchor" and "content".
+- "content" must be the exact text to insert near that anchor.
 """
 
 # -------------------------------------------------------------------

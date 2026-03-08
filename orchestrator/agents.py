@@ -1,34 +1,68 @@
-"""Agent abstraction with multi-turn conversation state and interaction
-loop helpers (approval loop, proving loop, escalation)."""
+"""Agent abstraction and shared utilities for orchestration."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 from rich.console import Console
 from rich.panel import Panel
 
-from pathlib import Path as _Path
-
 from orchestrator.config import (
     AGENT_CONFIGS,
-    MAX_APPROVAL_ROUNDS,
-    MAX_PROVE_RETRIES,
     MAX_TOKENS,
-    PROJECT_ROOT,
 )
-from orchestrator.file_io import (
-    extract_full_file,
-    load_files,
-    parse_code_blocks,
-    write_lean_file,
-)
+from orchestrator.file_io import load_files
 from orchestrator.prompts import AGENT_FILES, SYSTEM_PROMPTS
 from orchestrator.providers import call_llm
-from orchestrator.verify import verify_lean
 
 console = Console()
+
+
+# ---------------------------------------------------------------------------
+# Tool registry — controlled mapping for agent tool calls
+# ---------------------------------------------------------------------------
+
+class ToolRegistry:
+    """Registry for orchestrator tool callables.
+
+    This keeps tool exposure explicit and centralized.
+    """
+
+    def __init__(self) -> None:
+        self._tools: dict[str, Callable[..., Any]] = {}
+
+    def register(self, name: str, fn: Callable[..., Any]) -> None:
+        """Register a tool callable under *name*."""
+        if not name.strip():
+            raise ValueError("Tool name must be non-empty")
+        self._tools[name] = fn
+
+    def register_default_tools(self) -> None:
+        """Register built-in controlled tools."""
+        from orchestrator.tools import (
+            apply_doc_patch,
+            edit_file_patch,
+            read_file,
+            run_lean_verify,
+            run_repo_verify,
+        )
+
+        self.register("read_file", read_file)
+        self.register("edit_file_patch", edit_file_patch)
+        self.register("run_lean_verify", run_lean_verify)
+        self.register("run_repo_verify", run_repo_verify)
+        self.register("apply_doc_patch", apply_doc_patch)
+
+    def call(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        """Invoke a registered tool by name."""
+        if name not in self._tools:
+            known = ", ".join(sorted(self._tools)) or "<none>"
+            raise KeyError(f"Unknown tool: {name}. Registered: {known}")
+        return self._tools[name](*args, **kwargs)
+
+    def list_tools(self) -> list[str]:
+        """Return all registered tool names."""
+        return sorted(self._tools.keys())
 
 
 # ---------------------------------------------------------------------------
@@ -76,174 +110,6 @@ class Agent:
     def reset(self) -> None:
         """Clear conversation history (keeps system prompt and files)."""
         self.messages.clear()
-
-
-# ---------------------------------------------------------------------------
-# Proof result
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ProofResult:
-    success: bool
-    attempts: int
-    final_sorry_count: int = 0
-    errors: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Pattern 1: Approval Loop (Agent1 ↔ Agent2)
-# ---------------------------------------------------------------------------
-
-def approval_loop(
-    agent1: Agent,
-    agent2: Agent,
-    initial_prompt: str,
-    *,
-    max_rounds: int = MAX_APPROVAL_ROUNDS,
-    on_round: Callable[[int, str], None] | None = None,
-) -> str:
-    """Agent2 proposes a plan; Agent1 reviews.  Repeats until APPROVED.
-
-    *on_round* is called after each round with ``(round_number, review_text)``.
-
-    Returns the approved plan text.
-
-    Raises ``RuntimeError`` if *max_rounds* is exhausted.
-    """
-    plan = agent2.call(initial_prompt)
-    console.print(Panel(plan[:500] + "..." if len(plan) > 500 else plan,
-                        title="[cyan]Agent2 — Initial Plan"))
-
-    for round_num in range(1, max_rounds + 1):
-        review = agent1.call(
-            f"Review this plan from Agent2.  Reply APPROVED on its own line "
-            f"if the plan is acceptable, otherwise explain what must change.\n\n"
-            f"{plan}"
-        )
-
-        if on_round:
-            on_round(round_num, review)
-
-        if "APPROVED" in review.upper():
-            console.print(
-                f"[green]\\[Agent1 ↔ Agent2] Plan APPROVED after {round_num} round(s)."
-            )
-            return plan
-
-        console.print(Panel(
-            review[:400] + "..." if len(review) > 400 else review,
-            title=f"[yellow]Agent1 — Feedback (round {round_num})",
-        ))
-        plan = agent2.call(f"Revise your plan based on this feedback:\n\n{review}")
-        console.print(Panel(
-            plan[:500] + "..." if len(plan) > 500 else plan,
-            title=f"[cyan]Agent2 — Revised Plan (round {round_num})",
-        ))
-
-    raise RuntimeError(
-        f"Agent1 did not approve after {max_rounds} rounds.  "
-        f"Last review:\n{review}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Pattern 2: Proving Loop (Agent2 ↔ Agent3)
-# ---------------------------------------------------------------------------
-
-def proving_loop(
-    agent2: Agent,
-    agent3: Agent,
-    target_file: str,
-    *,
-    max_retries: int = MAX_PROVE_RETRIES,
-    on_attempt: Callable[[int, bool, int], None] | None = None,
-) -> ProofResult:
-    """Agent2 guides, Agent3 fills sorry's, lake build verifies.
-
-    *on_attempt* is called with ``(attempt, build_ok, sorry_count)``.
-
-    Returns a ``ProofResult``.
-    """
-    guidance = agent2.call(
-        "Provide initial proving guidance for Agent3.  Specify which sorry "
-        "to tackle first and the recommended proof strategy (Mathlib lemma, "
-        "glue pattern letter, etc.)."
-    )
-    console.print(Panel(
-        guidance[:400] + "..." if len(guidance) > 400 else guidance,
-        title="[cyan]Agent2 — Initial Guidance",
-    ))
-
-    for attempt in range(1, max_retries + 1):
-        code_reply = agent3.call(
-            f"Fill the sorry placeholders following this guidance:\n\n{guidance}"
-        )
-
-        # Write every tagged block that Agent3 returned (Archetype B may
-        # produce multiple files: algorithm + Layer1 + Glue).
-        blocks = parse_code_blocks(code_reply)
-        wrote_target = False
-        for block in blocks:
-            block_path = block.get("path")
-            block_code = block["code"]
-            if block_path:
-                write_lean_file(block_path, block_code)
-                abs_block = _Path(PROJECT_ROOT / block_path).resolve()
-                abs_target = _Path(target_file)
-                if not abs_target.is_absolute():
-                    abs_target = _Path(PROJECT_ROOT / target_file).resolve()
-                else:
-                    abs_target = abs_target.resolve()
-                if abs_block == abs_target:
-                    wrote_target = True
-            else:
-                # Tagless block — assume it replaces the target file
-                write_lean_file(target_file, block_code)
-                wrote_target = True
-
-        if not wrote_target:
-            # Last-resort fallback: single-block extraction
-            new_code = extract_full_file(code_reply, target_file)
-            if new_code:
-                write_lean_file(target_file, new_code)
-
-        build_ok, errors, sorry_count = verify_lean(target_file)
-
-        if on_attempt:
-            on_attempt(attempt, build_ok, sorry_count)
-
-        if build_ok and sorry_count == 0:
-            console.print(
-                f"[green]\\[Agent3] Success on attempt {attempt} — "
-                f"lake build passed, 0 sorry."
-            )
-            return ProofResult(
-                success=True, attempts=attempt, final_sorry_count=0
-            )
-
-        console.print(
-            f"[yellow]\\[Agent3] Attempt {attempt}/{max_retries} — "
-            f"build={'OK' if build_ok else 'FAIL'}, sorry={sorry_count}"
-        )
-
-        guidance = agent2.call(
-            f"Attempt {attempt} failed.\n"
-            f"Build exit code: {'0' if build_ok else 'nonzero'}\n"
-            f"Sorry count: {sorry_count}\n"
-            f"Errors:\n```\n{errors[:2000]}\n```\n"
-            f"Adjust your guidance for Agent3."
-        )
-        console.print(Panel(
-            guidance[:400] + "..." if len(guidance) > 400 else guidance,
-            title=f"[cyan]Agent2 — Revised Guidance (attempt {attempt})",
-        ))
-
-    return ProofResult(
-        success=False,
-        attempts=max_retries,
-        final_sorry_count=sorry_count,
-        errors=errors,
-    )
 
 
 # ---------------------------------------------------------------------------

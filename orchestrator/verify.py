@@ -17,7 +17,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from orchestrator.config import LEVERAGE_THRESHOLD, PROJECT_ROOT
+from orchestrator.config import LEAN_BUILD_TIMEOUT, LEVERAGE_THRESHOLD, PROJECT_ROOT
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +51,7 @@ def lake_build(target: str | None = None) -> BuildResult:
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
-        timeout=600,
+        timeout=LEAN_BUILD_TIMEOUT,
     )
     errors = result.stderr if result.returncode != 0 else ""
     sorry_count = _count_sorry_in_output(result.stderr + result.stdout)

@@ -1,10 +1,8 @@
-"""File I/O utilities for reading project files, writing Lean sources, and
-parsing LLM-emitted code blocks."""
+"""File I/O utilities for reading and atomically writing project files."""
 
 from __future__ import annotations
 
 import os
-import re
 import tempfile
 from pathlib import Path
 
@@ -37,52 +35,6 @@ def load_files(paths: list[str | Path]) -> str:
         except FileNotFoundError:
             parts.append(f'<file path="{p}">\n[FILE NOT FOUND]\n</file>')
     return "\n\n".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# Parsing code blocks from LLM output
-# ---------------------------------------------------------------------------
-
-_CODE_BLOCK_RE = re.compile(
-    r"```\w*\s*\n(.*?)```",
-    re.DOTALL,
-)
-
-_FILE_PATH_RE = re.compile(
-    r"(?:--|//-)\s*(?:File|Path|Target):\s*(.+)",
-    re.IGNORECASE,
-)
-
-
-def parse_code_blocks(text: str) -> list[dict[str, str]]:
-    """Extract fenced code blocks from *text*.
-
-    Returns a list of dicts with keys ``code`` and optionally ``path``
-    (if the block contains a ``-- File: …`` or ``-- Path: …`` comment on
-    its first line).
-    """
-    results: list[dict[str, str]] = []
-    for m in _CODE_BLOCK_RE.finditer(text):
-        code = m.group(1).strip()
-        path_match = _FILE_PATH_RE.search(code.split("\n", 1)[0])
-        entry: dict[str, str] = {"code": code}
-        if path_match:
-            entry["path"] = path_match.group(1).strip()
-        results.append(entry)
-    return results
-
-
-def extract_full_file(text: str, target_path: str) -> str | None:
-    """Try to extract a complete replacement file for *target_path* from LLM
-    output.  Returns ``None`` if no matching block is found."""
-    blocks = parse_code_blocks(text)
-    for block in blocks:
-        if block.get("path") and target_path in block["path"]:
-            return block["code"]
-    # Fallback: if there is exactly one large code block, assume it is the file
-    if len(blocks) == 1 and blocks[0]["code"].count("\n") > 10:
-        return blocks[0]["code"]
-    return None
 
 
 # ---------------------------------------------------------------------------

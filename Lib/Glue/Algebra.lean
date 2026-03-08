@@ -16,6 +16,8 @@ Exported:
    Used in: `descent_lemma'` (non-convex pointwise bound)
 3. `norm_neg_smul_sq` — `‖−(η•g)‖² = η² · ‖g‖²`
    Used in: `descent_lemma'` (non-convex pointwise bound)
+4. `proj_nonexp_sq` — `‖proj x − w*‖² ≤ ‖x − w*‖²` when proj is non-expansive and proj(w*)=w*
+   Used in: `pgd_convergence_convex_v2` (Algorithms/ProjectedGD.lean, Step 1 — projection bound)
 
 Used by: `Lib.Layer1.StochasticDescent`.
 -/

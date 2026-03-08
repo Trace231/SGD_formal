@@ -1,4 +1,4 @@
-"""Configuration: project paths, per-agent provider/model mapping, retry limits."""
+"""Centralized configuration for orchestrator runtime behavior."""
 
 from __future__ import annotations
 
@@ -52,10 +52,50 @@ AGENT_CONFIGS: dict[str, dict] = {
 }
 
 # ---------------------------------------------------------------------------
-# Orchestration parameters
+# Centralized runtime controls
 # ---------------------------------------------------------------------------
 
-MAX_APPROVAL_ROUNDS = 10
-MAX_PROVE_RETRIES = 10
+WHITELIST_PATHS = ["Algorithms/", "Lib/", "docs/"]
+LEAN_VERIFY_PATHS = ["Algorithms/", "Lib/"]
+
+DOC_ANCHORS_BY_FILE: dict[str, list[str]] = {
+    "docs/CATALOG.md": ["CATALOG_ALGO_LAYER", "CATALOG_ROADMAP"],
+    "docs/GLUE_TRICKS.md": ["GLUE_PATTERNS"],
+    "docs/METHODOLOGY.md": ["METHODOLOGY_ROADMAP"],
+}
+
+DOC_ANCHORS: dict[str, dict[str, str]] = {
+    "CATALOG_ALGO_LAYER": {
+        "path": "docs/CATALOG.md",
+        "regex": r"^## Algorithm Layer \(Layer 2\)\s+—\s+`Algorithms/SGD\.lean`",
+    },
+    "CATALOG_ROADMAP": {
+        "path": "docs/CATALOG.md",
+        "regex": r"^## Roadmap & Dependency Tree",
+    },
+    "GLUE_PATTERNS": {
+        "path": "docs/GLUE_TRICKS.md",
+        "regex": r"^## Section 3 — Standard Proof Patterns",
+    },
+    "METHODOLOGY_ROADMAP": {
+        "path": "docs/METHODOLOGY.md",
+        "regex": r"^## 2\. Stub-Probe Protocol",
+    },
+}
+
+RETRY_LIMITS: dict[str, int] = {
+    "MAX_PHASE2_APPROVAL_ROUNDS": 10,
+    "MAX_PHASE3_RETRIES": 5,
+}
+
+TIMEOUTS: dict[str, int] = {
+    "LEAN_BUILD_TIMEOUT": 300,
+}
+
+# Backward-compatible aliases (to be removed after full migration).
+MAX_APPROVAL_ROUNDS = RETRY_LIMITS["MAX_PHASE2_APPROVAL_ROUNDS"]
+MAX_PHASE3_RETRIES = RETRY_LIMITS["MAX_PHASE3_RETRIES"]
+MAX_PROVE_RETRIES = MAX_PHASE3_RETRIES
+LEAN_BUILD_TIMEOUT = TIMEOUTS["LEAN_BUILD_TIMEOUT"]
 LEVERAGE_THRESHOLD = 0.5
 MAX_TOKENS = 32768
