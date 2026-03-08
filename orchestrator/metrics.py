@@ -36,6 +36,11 @@ class RunRecord:
     new_lib_declarations: int = 0
     algorithm_calls_to_new_lib_declarations: int = 0
     physical_leverage_rate: float = 0.0
+    # Dual leverage metrics
+    # L_coverage: fraction of new Lib decls actually used in Algorithms/
+    lib_coverage_rate: float = 0.0
+    # L_density: avg calls per used new Lib decl (reuse intensity)
+    lib_density_rate: float = 0.0
     phase3_retry_count: int = 0
     estimated_token_consumption: int = 0
     doc_code_alignment_ok: bool = True
@@ -144,6 +149,28 @@ def _count_algorithm_calls(symbols: list[str]) -> int:
     return total
 
 
+def _used_symbol_set(symbols: list[str]) -> set[str]:
+    """Return subset of *symbols* that appear at least once in Algorithms/*.lean.
+
+    Used to compute L_coverage = |Used| / |Total|.
+    """
+    if not symbols:
+        return set()
+    used: set[str] = set()
+    algo_root = PROJECT_ROOT / "Algorithms"
+    if not algo_root.exists():
+        return used
+    file_contents = [
+        f.read_text(encoding="utf-8")
+        for f in algo_root.rglob("*.lean")
+    ]
+    for sym in symbols:
+        pattern = re.compile(rf"\b{re.escape(sym)}\b")
+        if any(pattern.search(c) for c in file_contents):
+            used.add(sym)
+    return used
+
+
 def _collect_lib_and_algo_decl_names() -> set[str]:
     """Collect declaration names from Lib/ and Algorithms/ for alignment audit."""
     names: set[str] = set()
@@ -180,7 +207,17 @@ def capture_physical_metrics(
     repo_verify = run_repo_verify()
     new_lib_symbols = _new_lib_declarations_from_diff()
     algo_calls = _count_algorithm_calls(new_lib_symbols)
-    denom = algo_calls + len(new_lib_symbols)
+    used_symbols = _used_symbol_set(new_lib_symbols)
+
+    total_new = len(new_lib_symbols)
+    used_new = len(used_symbols)
+
+    # L_coverage: fraction of new Lib decls used at least once in Algorithms/
+    lib_coverage = (used_new / total_new) if total_new > 0 else 1.0
+    # L_density: average call frequency per used Lib decl
+    lib_density = (algo_calls / used_new) if used_new > 0 else 0.0
+    # Composite physical leverage rate (legacy formula kept for backward compat)
+    denom = algo_calls + total_new
     leverage = (algo_calls / denom) if denom > 0 else 1.0
 
     retries = 0
@@ -203,9 +240,11 @@ def capture_physical_metrics(
         final_sorry_count=int(repo_verify.get("total_sorry_count", 0)),
         physical_exit_code=int(repo_verify.get("exit_code", 1)),
         total_repo_sorry_count=int(repo_verify.get("total_sorry_count", 0)),
-        new_lib_declarations=len(new_lib_symbols),
+        new_lib_declarations=total_new,
         algorithm_calls_to_new_lib_declarations=algo_calls,
         physical_leverage_rate=leverage,
+        lib_coverage_rate=lib_coverage,
+        lib_density_rate=lib_density,
         phase3_retry_count=retries,
         estimated_token_consumption=estimated_token_consumption,
         doc_code_alignment_ok=alignment_ok,

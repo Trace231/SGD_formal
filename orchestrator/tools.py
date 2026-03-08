@@ -179,13 +179,21 @@ def apply_doc_patch(path: str | Path, anchor: str, new_content: str) -> dict[str
             "reason": "content already present",
         }
 
-    match = re.search(anchor, original, flags=re.MULTILINE)
-    if match is None:
+    matches = list(re.finditer(anchor, original, flags=re.MULTILINE))
+    if not matches:
         raise ValueError(
             f"Anchor not found in {resolved.relative_to(PROJECT_ROOT)}: {anchor}"
         )
+    if len(matches) > 1:
+        positions = [m.start() for m in matches]
+        raise ValueError(
+            f"Anchor matches {len(matches)} locations in "
+            f"{resolved.relative_to(PROJECT_ROOT)} "
+            f"(positions {positions}); anchor must be unique. "
+            "Refine the regex to target a single match."
+        )
 
-    insert_at = match.end()
+    insert_at = matches[0].end()
     patch_body = "\n\n" + new_content.strip() + "\n"
     updated = original[:insert_at] + patch_body + original[insert_at:]
     _atomic_write(resolved, updated)
