@@ -75,17 +75,22 @@ def count_sorrys(filepath: str | Path) -> int:
 
 
 _SORRY_SOURCE_RE = re.compile(r"\bsorry\b")
-_SORRY_OUTPUT_RE = re.compile(r"declaration uses 'sorry'|sorry", re.IGNORECASE)
+# Only match the Lean compiler's semantic warning, not raw "sorry" strings in
+# build output prose.  This avoids counting sorry occurrences in error messages,
+# documentation echoes, or user-visible strings.
+_SORRY_OUTPUT_RE = re.compile(r"declaration uses 'sorry'")
+# Matches Lean block comments (possibly multi-line).
+_BLOCK_COMMENT_RE = re.compile(r"/-.*?-/", re.DOTALL)
 
 
 def _count_sorry_in_source(text: str) -> int:
-    lines = text.split("\n")
+    # 1. Strip block comments (/-...-/) which may span multiple lines.
+    text = _BLOCK_COMMENT_RE.sub("", text)
     count = 0
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("--") or stripped.startswith("/-"):
-            continue
-        count += len(_SORRY_SOURCE_RE.findall(line))
+    for line in text.split("\n"):
+        # 2. Strip inline line comment (everything after the first "--").
+        code_part = line.split("--")[0]
+        count += len(_SORRY_SOURCE_RE.findall(code_part))
     return count
 
 
@@ -128,12 +133,24 @@ _RATIO_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches the mandatory machine-readable block emitted by the Planner:
+#   {"leverage_stats": {"reused": N, "new": M}}
+_LEVERAGE_JSON_RE = re.compile(
+    r'"leverage_stats"\s*:\s*\{\s*"reused"\s*:\s*(\d+)\s*,\s*"new"\s*:\s*(\d+)\s*\}',
+)
+
 
 def parse_leverage_from_plan(plan_text: str) -> tuple[int, int]:
     """Extract (reused, new) counts from a plan's leverage section.
 
-    Falls back to (0, 0) if nothing is found.
+    Prefers the structured JSON block ``{"leverage_stats": {"reused": N, "new": M}}``
+    emitted by the Planner.  Falls back to free-text regex parsing for plans
+    that pre-date the JSON requirement.  Returns (0, 0) if nothing is found.
     """
+    m = _LEVERAGE_JSON_RE.search(plan_text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
     m = _RATIO_RE.search(plan_text)
     if m:
         reused = int(m.group(1))

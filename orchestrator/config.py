@@ -24,8 +24,8 @@ METRICS_PATH = PROJECT_ROOT / "orchestrator" / "metrics.json"
 # ---------------------------------------------------------------------------
 
 API_KEYS: dict[str, str] = {
-    "qwen": os.getenv("QWEN_API_KEY", ""),
-    "deepseek": os.getenv("DEEPSEEK_API_KEY", ""),
+    "qwen": os.getenv("QWEN_API_KEY", "sk-71231aa14faa4a319a61d4c59208f9a4"),
+    "deepseek": os.getenv("DEEPSEEK_API_KEY", "sk-2f6d72eb427d44d8b96b96da7c6f9b5c"),
     "anthropic": os.getenv("ANTHROPIC_API_KEY", ""),
 }
 

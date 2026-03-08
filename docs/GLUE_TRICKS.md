@@ -80,6 +80,9 @@ Example: "integral" + "inner" → `integral_inner` in `Mathlib.MeasureTheory.Int
 
 ## Section 3 — Standard Proof Patterns
 
+No new patterns — GLUE_TRICKS.md unchanged.
+
+
 Each pattern is a mini-recipe: problem statement → Mathlib lemmas → code template.
 
 ---

@@ -137,6 +137,15 @@ docs/ALGORITHM_TEMPLATE.md §5.
 Return a structured plan in markdown with clear sections:
 ### Statement scaffold, ### Proof strategy per sorry,
 ### Leverage prediction, ### New glue needed.
+
+## Machine-readable leverage (MANDATORY)
+At the very end of your plan, output exactly one JSON block:
+```json
+{"leverage_stats": {"reused": N, "new": M}}
+```
+N = number of existing CATALOG lemmas/theorems reused.
+M = number of new lemmas/theorems you will write.
+This block takes precedence over the text calculation; omitting it will block the pipeline.
 """
 
 # -------------------------------------------------------------------

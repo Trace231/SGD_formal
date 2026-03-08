@@ -8,6 +8,7 @@ via its native SDK.  All providers are accessed through a single
 from __future__ import annotations
 
 import re
+import time
 from functools import lru_cache
 
 from orchestrator.config import API_KEYS, MAX_TOKENS, PROVIDER_URLS
@@ -55,8 +56,18 @@ def strip_think_tags(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Unified call
+# Unified call — with exponential-backoff retry for transient network errors
 # ---------------------------------------------------------------------------
+
+_RETRYABLE_ERRORS = frozenset({
+    "ConnectTimeout",
+    "ReadTimeout",
+    "RemoteProtocolError",
+    "APIConnectionError",
+    "APITimeoutError",
+})
+_RETRY_DELAYS = (2, 4, 8)  # seconds between attempts 1→2, 2→3, 3→4
+
 
 def call_llm(
     provider: str,
@@ -69,9 +80,32 @@ def call_llm(
     """Send *messages* to the LLM behind *provider*/*model* and return the
     assistant reply as a plain string.
 
-    For Anthropic the native SDK is used; for everything else the
-    OpenAI-compatible chat completions endpoint is used.
+    Retries up to 3 times (4 total attempts) with exponential backoff on
+    transient network errors (timeouts, connection drops).  All other
+    exceptions are re-raised immediately.
     """
+    last_exc: Exception | None = None
+    for attempt, delay in enumerate((*_RETRY_DELAYS, None), start=1):
+        try:
+            return _call_llm_once(provider, model, system, messages, max_tokens=max_tokens)
+        except Exception as exc:
+            if type(exc).__name__ not in _RETRYABLE_ERRORS or delay is None:
+                raise
+            last_exc = exc
+            print(f"[LLM] {type(exc).__name__} on attempt {attempt}/3, retrying in {delay}s…")
+            time.sleep(delay)
+    raise last_exc  # type: ignore[misc]  # unreachable, satisfies type checker
+
+
+def _call_llm_once(
+    provider: str,
+    model: str,
+    system: str,
+    messages: list[dict[str, str]],
+    *,
+    max_tokens: int = MAX_TOKENS,
+) -> str:
+    """Single (non-retrying) LLM call — the inner workhorse of ``call_llm``."""
     client = get_client(provider)
 
     if provider == "anthropic":

@@ -110,6 +110,21 @@ def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, A
 def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     """Run Lean verification and return a JSON-serializable result."""
     resolved = _resolve_allowed_path(file_path, _LEAN_VERIFY_ALLOWLIST)
+
+    # Guard: do not run lake build if the target file does not yet exist.
+    if not resolved.exists():
+        return {
+            "target": str(file_path),
+            "success": False,
+            "exit_code": 1,
+            "sorry_count": 0,
+            "error_count": 1,
+            "errors": [
+                f"Target file does not exist: {file_path}. "
+                "Did you forget to write it with 'edit_file_patch'?"
+            ],
+        }
+
     rel = str(resolved.relative_to(PROJECT_ROOT))
 
     build = lake_build()

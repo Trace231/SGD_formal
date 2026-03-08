@@ -17,11 +17,13 @@ Or interactive mode::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
@@ -94,6 +96,14 @@ def _extract_catalog_lemma_names(content: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Git baseline helpers
 # ---------------------------------------------------------------------------
+
+def _file_hash(path: str | Path) -> str | None:
+    """Return MD5 hex-digest of *path*, or None if the file does not exist."""
+    p = Path(path)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    return hashlib.md5(p.read_bytes()).hexdigest() if p.exists() else None
+
 
 def _git_diff_files() -> set[str]:
     """Return tracked files with unstaged/staged modifications."""
@@ -301,6 +311,13 @@ def phase3_prove(
     execution_history: list[ExecutionResult] = []
     token_char_budget = 0
 
+    # Snapshot target-file state before any Agent3 edits.
+    # Used to detect "no-op" attempts where Agent3 never touched the file.
+    _tgt = Path(target_file) if Path(target_file).is_absolute() else PROJECT_ROOT / target_file
+    initial_exists: bool = _tgt.exists()
+    initial_hash: str | None = _file_hash(target_file)
+    file_changed: bool = False  # updated each attempt
+
     for attempt in range(1, max_retries + 1):
         attempts = attempt
         prover_prompt = (
@@ -447,9 +464,30 @@ def phase3_prove(
         verify_text = "\n".join(verify_errors) if isinstance(verify_errors, list) else str(verify_errors)
         last_errors = verify_text
 
-        # Strict success criterion: verify result only.
-        if exit_code == 0 and last_sorry_count == 0:
+        # 4-condition success gate:
+        #   1. exit_code == 0   (compiler clean)
+        #   2. sorry_count == 0 (no sorry placeholders)
+        #   3. target file exists
+        #   4. target file content changed since Phase 3 started
+        current_hash = _file_hash(target_file)
+        file_changed = _tgt.exists() and (not initial_exists or current_hash != initial_hash)
+
+        if exit_code == 0 and last_sorry_count == 0 and file_changed:
             prove_state = "PROVE_SUCCESS"
+        elif exit_code == 0 and last_sorry_count == 0 and not file_changed:
+            # Build looks green but Agent3 never touched the file — no-op trap.
+            no_change_msg = (
+                "FAILURE: No changes detected in the target file. "
+                "You must use 'edit_file_patch' to implement the proof "
+                "before calling verification."
+            )
+            exec_results.append(ExecutionResult(
+                status_code="ERROR",
+                message=no_change_msg,
+                attempt=attempt,
+            ))
+            last_errors = no_change_msg
+            prove_state = "PROVE_RETRY"
         else:
             prove_state = "PROVE_RETRY"
 
@@ -476,6 +514,22 @@ def phase3_prove(
             }
 
         # Intelligent retry prompts.
+        # Priority 1: no-op trap — Agent3 never touched the file.
+        if prove_state == "PROVE_RETRY" and not file_changed and exit_code == 0:
+            guidance = agent2.call(
+                f"Attempt {attempt} failed.\n"
+                "FAILURE: No changes detected in the target file. "
+                "Agent3 must use 'edit_file_patch' to CREATE or MODIFY the target "
+                f"file '{target_file}' BEFORE calling run_lean_verify. "
+                "Instruct Agent3 to write actual Lean proof code first."
+            )
+            console.print(
+                f"  [Agent3] attempt {attempt}/{max_retries} — "
+                "build=NOOP (file unchanged)"
+            )
+            continue
+
+        # Priority 2: security violation.
         if blocked_msgs:
             blocked_hint = (
                 f"Security violation: You cannot edit path {blocked_path or '?'}."
@@ -511,8 +565,12 @@ def phase3_prove(
             "\n".join(diag_log[-12:]),
             title="[yellow]Phase 3 Retry Log",
         ))
-    agent5 = Agent("diagnostician", extra_files=[target_file])
-    sorry_context = load_file(target_file)
+    agent5 = Agent("diagnostician", extra_files=[target_file] if _tgt.exists() else [])
+    sorry_context = (
+        load_file(target_file)
+        if _tgt.exists()
+        else f"(File '{target_file}' does not exist — Prover Agent never created it.)"
+    )
     action = escalate(agent5, sorry_context, last_errors, guidance)
 
     if action == "abort":
