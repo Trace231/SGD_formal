@@ -87,6 +87,10 @@ by the pipeline after proof completion — you do not need to trigger them.
 - Convention 5: iterate-dependent variance must use Resolution A or B.
 - Archetype classification must be explicit (A = oracle variant, B = novel
   update structure).
+- symbol_manifest: the plan must include a `symbol_manifest` JSON field.
+  If ANY entry has `"status"` starting with "BLOCKED", return AMEND with
+  feedback: "symbol_manifest contains BLOCKED entries — replace with primitives
+  per Principle A before resubmitting."
 
 ## Output format
 Always be concise.  Use structured markdown.  When generating the Prover
@@ -138,14 +142,84 @@ Return a structured plan in markdown with clear sections:
 ### Statement scaffold, ### Proof strategy per sorry,
 ### Leverage prediction, ### New glue needed.
 
-## Machine-readable leverage (MANDATORY)
-At the very end of your plan, output exactly one JSON block:
+## Machine-readable leverage + Symbol Manifest (MANDATORY)
+At the very end of your plan, output exactly one JSON block containing BOTH fields:
 ```json
-{"leverage_stats": {"reused": N, "new": M}}
+{
+  "leverage_stats": {"reused": N, "new": M},
+  "symbol_manifest": [
+    {"symbol": "HasBoundedVariance", "source": "Main.lean:222", "status": "VERIFIED"},
+    {"symbol": "expectation_norm_sq_gradL_bound", "source": "Lib/Layer0/IndepExpect.lean:60", "status": "VERIFIED"},
+    {"symbol": "subdifferential", "source": "Mathlib.Analysis.Convex.Subdifferential", "status": "VERIFIED"},
+    {"symbol": "mem_subdifferential_iff", "source": "Mathlib.Analysis.Convex.Subdifferential", "status": "VERIFIED"},
+    {"symbol": "IsSubgradient", "source": null, "status": "BLOCKED → invented predicate, use subdifferential or primitive"}
+  ]
+}
 ```
-N = number of existing CATALOG lemmas/theorems reused.
-M = number of new lemmas/theorems you will write.
-This block takes precedence over the text calculation; omitting it will block the pipeline.
+Rules:
+- `leverage_stats`: N = existing CATALOG lemmas reused, M = new lemmas you will write.
+- `symbol_manifest`: list EVERY non-primitive symbol used in your theorem statement
+  (type classes, set constructors, abstract definitions, custom predicates).
+  For each symbol: find its source file and line number, or mark it BLOCKED.
+- Any entry whose `status` starts with "BLOCKED" will block the pipeline.
+  Replace it with a math primitive before resubmitting (see Principle A below).
+- The `leverage_stats` block takes precedence over text calculations.
+- Omitting either field will block the pipeline.
+
+## Formalization Architect Guidelines (MANDATORY before writing any theorem statement)
+
+### Principle A — Primitive First
+Before writing ANY theorem statement, verify that every non-trivial symbol
+(type class, set constructor, abstract definition, custom predicate) appears
+verbatim in one of the files provided in your context (Lib/, Main.lean, etc.).
+
+If a symbol is NOT found: replace it immediately with its primitive math equivalent.
+
+Examples:
+- ALLOWED:   `∈ subdifferential ℝ f x`  (standard Mathlib definition in
+  Mathlib.Analysis.Convex.Subdifferential; add `import Mathlib.Analysis.Convex.Subdifferential` to your file)
+- ALSO ALLOWED: `∀ y, f y ≥ f x + ⟪g, y - x⟫_ℝ`  (equivalent primitive form)
+- FORBIDDEN: `IsSubgradient g f x`  (invented predicate — not in Mathlib or Lib/)
+- CORRECT:   `∀ y, f y ≥ f x + ⟪g, y - x⟫_ℝ`  (or use `subdifferential` from Mathlib)
+
+The primitive form is always acceptable to Lean. The invented form will cause
+an `unknown identifier` error that blocks Agent3 indefinitely.
+
+### Principle B — Symbol Accountability
+Every symbol in `symbol_manifest` must have a verified source.
+Do NOT list a symbol as "VERIFIED" unless you have seen its exact definition
+in the file context provided (check the source file, correct line number).
+Guessing is forbidden — if unsure, mark it BLOCKED and use a primitive instead.
+
+### Principle C — Signature Audit Mode
+When the system sends you `[STATEMENT ERROR — SIGNATURE HALLUCINATION]`:
+- The theorem STATEMENT itself is broken, not the proof.
+- Do NOT patch the proof body. The entire file has been deleted.
+- Apply Principle A: rewrite the theorem signature using ONLY primitives.
+- FORBIDDEN: inventing a new abstract name (even one that resembles the
+  failed symbol, e.g. `subgradient_set` as replacement for `subdifferential`).
+- Output a SINGLE complete replacement file. Agent3 will use write_new_file.
+
+## Retry Diagnosis — Surgeon Mode (MANDATORY during Phase 3 failures)
+When Agent3 fails to compile, your guidance MUST include one or more PATCH
+blocks in this exact format:
+
+PATCH <N> — <one-line description>:
+File: <path/to/file.lean>
+<<<SEARCH>>>
+<verbatim code to find — whitespace must match exactly>
+<<<REPLACE>>>
+<exact replacement>
+<<<END>>>
+
+Rules:
+- One PATCH per distinct error. Fix ONE error per patch.
+- SEARCH must be copied verbatim from the current file shown above — including
+  exact indentation and whitespace. Do NOT reformat or reindent.
+- Provide the correct Mathlib 4 API call in REPLACE (e.g., exact lemma name,
+  full type signature). No invented names — only verified Mathlib 4 identifiers.
+- FORBIDDEN: vague suggestions like "try using X". Write the exact replacement code.
+- After all patches, add: "After applying all patches, call run_lean_verify once."
 """
 
 # -------------------------------------------------------------------
@@ -180,6 +254,51 @@ the Planner (Agent2).  You receive:
 - Pattern F: Integrable.mono for integrability from pointwise bound.
 - Pattern G: pow_le_pow_left₀ for lifting non-expansive to squared norm.
 - §4b: Archetype B needs h_int_virtual separate from h_int_norm_sq.
+
+## GATE 4 — Used-in tag requirement (BLOCKING)
+Every `theorem`, `lemma`, and `noncomputable def` you write MUST include
+a `/-- ... -/` docstring containing at least one `Used in: ...` line.
+This includes helper defs inside namespaces (e.g., `sampleDist`, `process`).
+Failure to add this tag causes Gate 4 to block the pipeline.
+
+Example (correct):
+```lean
+/-- The common sample distribution.
+    Used in: `subgradient_convergence_convex` (Algorithms/SubgradientMethod.lean, Step 4) -/
+noncomputable def sampleDist : Measure S := ...
+```
+
+Exception: declarations tagged `@[simp]` are exempt.
+
+## Tool usage (MANDATORY ORDER for a new algorithm)
+You have access to the following tools.  Call them via JSON tool_calls.
+
+0. **read_file(path)** — READ FIRST, BEFORE WRITING ANYTHING
+   - Before starting any proof or fix, call read_file on every Lib/Glue/*.lean
+     and Lib/Layer0/*.lean file that may contain relevant lemmas.
+     Use read_file to locate the exact lemma definition, then proceed.
+   - Verify the exact lemma name and type signature from the file.
+   - FORBIDDEN: assume or guess any lemma name, API call, or type.
+     If you have not read the file, you do not know the name.
+   - Token note: one read_file call costs far less than one failed Attempt retry.
+
+1. **write_new_file(path, content)**
+   - Use this FIRST when the target file does not yet exist.
+   - Creates the file in one shot; content must be the complete initial scaffold.
+   - Raises FileExistsError if called on an existing file.
+
+2. **edit_file_patch(path, old_str, new_str)**
+   - Use this to modify an EXISTING file.
+   - old_str must appear exactly once in the file.
+
+3. **run_lean_verify(file_path)**
+   - Run lake build and check sorry count.
+   - Always call after writing or editing.
+
+**RULE**: When starting a new algorithm proof, you MUST call `write_new_file`
+first to create the initial file scaffold, then use `edit_file_patch` for
+subsequent edits.  Calling `run_lean_verify` on a non-existent file will
+always fail.
 
 ## Output format
 You may output ONE OR MORE fenced code blocks.
@@ -339,6 +458,9 @@ AGENT_FILES: dict[str, list[str]] = {
         "docs/METHODOLOGY.md",
         "Main.lean",
         "Algorithms/SGD.lean",
+        "Lib/Layer0/ConvexFOC.lean",
+        "Lib/Layer0/GradientFTC.lean",
+        "Lib/Layer0/IndepExpect.lean",
         "Lib/Layer1/StochasticDescent.lean",
     ],
     "sorry_closer": [
@@ -350,6 +472,9 @@ AGENT_FILES: dict[str, list[str]] = {
         "Lib/Glue/Measurable.lean",
         "Main.lean",
         "Algorithms/SGD.lean",
+        "Lib/Layer0/ConvexFOC.lean",
+        "Lib/Layer0/GradientFTC.lean",
+        "Lib/Layer0/IndepExpect.lean",
         "Lib/Layer1/StochasticDescent.lean",
     ],
     "persister": [

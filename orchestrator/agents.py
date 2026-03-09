@@ -45,9 +45,11 @@ class ToolRegistry:
             read_file,
             run_lean_verify,
             run_repo_verify,
+            write_new_file,
         )
 
         self.register("read_file", read_file)
+        self.register("write_new_file", write_new_file)
         self.register("edit_file_patch", edit_file_patch)
         self.register("run_lean_verify", run_lean_verify)
         self.register("run_repo_verify", run_repo_verify)
@@ -58,7 +60,13 @@ class ToolRegistry:
         if name not in self._tools:
             known = ", ".join(sorted(self._tools)) or "<none>"
             raise KeyError(f"Unknown tool: {name}. Registered: {known}")
-        return self._tools[name](*args, **kwargs)
+        result = self._tools[name](*args, **kwargs)
+        try:
+            from orchestrator.audit_logger import AuditLogger
+            AuditLogger.get().log_tool_call(name, kwargs, result)
+        except Exception:  # noqa: BLE001
+            pass  # audit must not break tool execution
+        return result
 
     def list_tools(self) -> list[str]:
         """Return all registered tool names."""
@@ -105,6 +113,11 @@ class Agent:
             max_tokens=self.max_tokens,
         )
         self.messages.append({"role": "assistant", "content": reply})
+        try:
+            from orchestrator.audit_logger import AuditLogger
+            AuditLogger.get().log_agent_call(self.role, full_msg, reply)
+        except Exception:  # noqa: BLE001
+            pass  # audit must not break agent execution
         return reply
 
     def reset(self) -> None:

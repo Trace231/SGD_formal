@@ -18,6 +18,8 @@ DOCS_DIR = PROJECT_ROOT / "docs"
 LIB_DIR = PROJECT_ROOT / "Lib"
 ALGORITHMS_DIR = PROJECT_ROOT / "Algorithms"
 METRICS_PATH = PROJECT_ROOT / "orchestrator" / "metrics.json"
+AUDIT_DIR = PROJECT_ROOT / "orchestrator" / "audits"
+AUDIT_ENABLED = os.getenv("ORCHESTRATOR_AUDIT", "1") != "0"
 
 # ---------------------------------------------------------------------------
 # API keys (loaded from .env or environment)

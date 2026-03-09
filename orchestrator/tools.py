@@ -107,6 +107,25 @@ def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, A
     }
 
 
+def write_new_file(path: str | Path, content: str) -> dict[str, Any]:
+    """Create a brand-new file under Algorithms/ or Lib/.
+
+    Raises FileExistsError if the file already exists — use edit_file_patch
+    to modify an existing file.
+    """
+    resolved = _resolve_allowed_path(path, _READ_WRITE_ALLOWLIST)
+    if resolved.exists():
+        raise FileExistsError(
+            f"File already exists: {path}. Use edit_file_patch to modify it."
+        )
+    _atomic_write(resolved, content)
+    return {
+        "path": str(resolved.relative_to(PROJECT_ROOT)),
+        "created": True,
+        "size_bytes": len(content.encode("utf-8")),
+    }
+
+
 def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     """Run Lean verification and return a JSON-serializable result."""
     resolved = _resolve_allowed_path(file_path, _LEAN_VERIFY_ALLOWLIST)

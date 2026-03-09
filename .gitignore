@@ -1,5 +1,6 @@
 /.lake
 .env
 orchestrator/metrics.json
+orchestrator/audits/
 __pycache__/
 *.pyc

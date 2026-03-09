@@ -619,6 +619,67 @@ This file formalizes the stochastic subgradient method for convex non-smooth opt
 | File | `Algorithms/SubgradientMethod.lean` |
 | Kind | `structure` |
 | Layer | 2 |
+| **Critical distinction** | Contains **NO `gradF` field** (unlike `SGDSetup`), reflecting absence of true gradient for non-smooth functions |
+
+**Fields:**
+- `w₀ : E` — initial point
+- `η : ℕ → ℝ` — step size schedule
+- `gradL : E → S → E` — stochastic subgradient oracle (satisfies subdifferential membership)
+- `ξ : ℕ → Ω → S` — sample stream
+- `P : Measure Ω` — probability measure
+- `hP : IsProbabilityMeasure P`
+- `hξ_meas : ∀ t, Measurable (ξ t)`
+- `hξ_indep : iIndepFun ξ P`
+- `hξ_ident : ∀ t, IdentDistrib (ξ t) (ξ 0) P P`
+
+**Design note:** Subgradient membership is enforced via hypothesis `hsubgrad` in the convergence theorem.
+
+### `process` alias & infrastructure lemmas
+
+| Component | Role | Delegation target |
+|---|---|---|
+| `process` | Reuses SGD recursion verbatim | `sgdProcess w₀ η gradL ξ` |
+| `subgradientProcess_measurable` | Thin wrapper | `sgdProcess_measurable` |
+| `subgradientProcess_adapted` | Thin wrapper | `sgdProcess_adapted` |
+| `subgradientProcess_indepFun_xi` | Thin wrapper | `sgdProcess_indepFun_xi` |
+
+### `subgradient_convergence_convex`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/SubgradientMethod.lean` |
+| Layer | 2 |
+| Conclusion | `$\frac{1}{T} \sum_{t<T} (\mathbb{E}[f(w_t)] - f(w^*)) \leq \frac{\|w_0 - w^*\|^2}{2\eta T} + \frac{\eta G^2}{2}$` |
+| Archetype | B — novel proof structure despite identical update syntax |
+| Call chain | `norm_sq_sgd_step` (pointwise norm expansion) → `mem_subdifferential_iff` (subgradient inequality) → `integral_mono` (integrate bound) → `expectation_norm_sq_gradL_bound` (variance bound) → `Finset.sum_range_sub` (telescoping) |
+| Key distinction | Uses subgradient inequality directly in pointwise bound and integrates via `integral_mono`, bypassing Layer 1 meta-theorems entirely. No `gradF` or unbiasedness hypotheses required. |
+
+### Hit Report — Glue Usage Count
+
+| Component | File | Used by |
+|---|---|---|
+| `sgdProcess` | `Main.lean` | `process` definition |
+| `sgdProcess_measurable` | `Main.lean` | `subgradientProcess_measurable` |
+| `sgdProcess_indepFun_xi` | `Main.lean` | variance bound step (via `subgradientProcess_indepFun_xi`) |
+| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | Step 1 (pointwise norm expansion) |
+| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 4 (variance bound) |
+| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | integrability of `$\|w_{t+1}-w^*\|^2$` term |
+| `mem_subdifferential_iff` | Mathlib | pointwise subgradient inequality derivation |
+
+**Leverage score (Archetype B):** reused existing components = 9; new algorithm-specific items = 6 (`SubgradientSetup`, `process` alias, 3 process infrastructure lemmas, convergence theorem); reuse ratio = `$9 / (9 + 6) = 60.0\%$`.
+
+
+## Algorithm Layer (Layer 2) — `Algorithms/SubgradientMethod.lean`
+
+This file formalizes the stochastic subgradient method for convex non-smooth optimization (Archetype B). Although the update rule syntactically matches SGD (`$w_{t+1} = w_t - \eta \cdot g_t$`), the oracle semantics differ fundamentally: `gradL` provides subgradients satisfying `$\text{gradL}(w, s) \in \partial f(w)$` (not unbiased estimates of a smooth gradient). Therefore, the proof cannot reuse Layer 1 meta-theorems (which require `gradF` and unbiasedness) and instead derives the one-step bound directly using the pointwise subgradient inequality.
+
+### `SubgradientSetup`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/SubgradientMethod.lean` |
+| Kind | `structure` |
+| Layer | 2 |
 
 **Fields:**
 - `w₀ : E` — initial point
@@ -1217,6 +1278,27 @@ new SVRG bridge components documented = 6; reuse ratio = `3 / (3 + 6) = 33.3%` (
 ---
 
 ## Roadmap & Dependency Tree
+
+| Lemma | File | SGD non-convex | SGD convex | SGD strongly convex | WD non-convex | WD convex | WD strongly convex | PGD convex | SVRG inner strongly convex | SVRG outer stub | Subgradient convex | Reusable for |
+|-------|------|:--------------:|:----------:|:-------------------:|:-------------:|:---------:|:------------------:|:----------:|:--------------------------:|:---------------:|:------------------:|--------------|
+| `lipschitz_gradient_quadratic_bound` | `Lib/Layer0/GradientFTC.lean` | Step 1 | — | — | Step 1 | — | — | — | — | — | | Any L-smooth algorithm |
+| `convex_first_order_condition` | `Lib/Layer0/ConvexFOC.lean` | — | (via Step 4) | — | — | (via Step 4) | — | (via Step 4) | — | — | | Any convex algorithm |
+| `convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean` | — | Step 4 | — | — | Step 4 | — | Step 4 (virtual) | — | — | | Any convex algorithm |
+| `strong_convex_first_order_condition` | `Lib/Layer0/ConvexFOC.lean` | — | — | (via Step 4) | — | — | (via Step 4) | — | (via Step 4) | — | | Any strongly convex algorithm |
+| `strong_convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean` | — | — | Step 4 | — | — | Step 4 | — | Step 4 | — | | Any strongly convex algorithm |
+| `expectation_inner_gradL_eq` | `Lib/Layer0/IndepExpect.lean` | Step 4 | Step 4 | Step 4 | Step 4 | Step 4 | Step 4 | Step 4 | Step 4 | — | | **Universal** — any IID stochastic gradient algorithm |
+| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | — | **Step 4** | **Universal** — any IID stochastic gradient algorithm |
+| `proj_nonexp_sq` | `Lib/Glue/Algebra.lean` | — | — | — | — | — | — | Step 1 | — | — | | Any algorithm with a non-expansive post-update map |
+| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | — | Step 1 | Step 1 | — | Step 1 | Step 1 | Step 1 (virtual) | Step 1 | — | **Step 1** | Any algorithm with SGD-like update (including subgradient methods) |
+| `integrable_norm_sq_of_bounded_var` | `Lib/Glue/Probability.lean` | h_int_sq | h_int_sq | h_int_sq | h_int_sq | h_int_sq | h_int_sq | h_int_sq | h_int_sq | — | | **Universal** — provides `h_int_sq` for any bounded-variance algorithm |
+| `integrable_inner_of_sq_integrable` | `Lib/Glue/Probability.lean` | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | — | | **Universal** — provides `h_int_inner` for any L²-bounded gradient |
+| `svrg_variance_reduction` | `Lib/Glue/Probability.lean` | — | — | — | — | — | — | — | pending (Step 1 plan) | — | | Control-variate algorithms (SARAH, SPIDER, SCSG) |
+| `integrable_lsmooth_comp_measurable` | `Lib/Glue/Measurable.lean` | h_int_ft | h_int_ft | — | h_int_ft | h_int_ft | — | h_int_ft | — | — | | Any algorithm applying a Lipschitz function to an integrable iterate |
+| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | — | h_int_norm_sq | h_int_norm_sq | — | h_int_norm_sq | h_int_norm_sq | h_int_norm_sq, h_int_virtual | h_int_norm_sq | — | **h_int_norm_sq** | Any algorithm with distance-to-optimum recursion |
+| `integrable_inner_gradL_comp` | `Lib/Glue/Measurable.lean` | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | — | | Any IID algorithm needing inner-product integrability |
+
+*Note: Cells marked "—" indicate no usage in that algorithm variant. "Subgradient convex" column added; only three cataloged lemmas have non-blank entries.*
+
 
 | Lemma | File | SGD non-convex | SGD convex | SGD strongly convex | WD non-convex | WD convex | WD strongly convex | PGD convex | SVRG inner strongly convex | SVRG outer stub | Subgradient convex |
 |-------|------|:--------------:|:----------:|:-------------------:|:-------------:|:---------:|:------------------:|:----------:|:--------------------------:|:---------------:|:------------------:|
