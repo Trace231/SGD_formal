@@ -664,88 +664,10 @@ This file formalizes the stochastic subgradient method for convex non-smooth opt
 | `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | Step 1 (pointwise norm expansion) |
 | `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 4 (variance bound) |
 | `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | integrability of `$\|w_{t+1}-w^*\|^2$` term |
+| `hasBoundedVariance_of_pointwise_bound` | `Lib/Glue/Probability.lean` | hvar derivation (bounded variance from pointwise oracle bound) |
 | `mem_subdifferential_iff` | Mathlib | pointwise subgradient inequality derivation |
 
-**Leverage score (Archetype B):** reused existing components = 9; new algorithm-specific items = 6 (`SubgradientSetup`, `process` alias, 3 process infrastructure lemmas, convergence theorem); reuse ratio = `$9 / (9 + 6) = 60.0\%$`.
-
-
-## Algorithm Layer (Layer 2) — `Algorithms/SubgradientMethod.lean`
-
-This file formalizes the stochastic subgradient method for convex non-smooth optimization (Archetype B). Although the update rule syntactically matches SGD (`$w_{t+1} = w_t - \eta \cdot g_t$`), the oracle semantics differ fundamentally: `gradL` provides subgradients satisfying `$\text{gradL}(w, s) \in \partial f(w)$` (not unbiased estimates of a smooth gradient). Therefore, the proof cannot reuse Layer 1 meta-theorems (which require `gradF` and unbiasedness) and instead derives the one-step bound directly using the pointwise subgradient inequality.
-
-### `SubgradientSetup`
-
-| Field | Value |
-|---|---|
-| File | `Algorithms/SubgradientMethod.lean` |
-| Kind | `structure` |
-| Layer | 2 |
-
-**Fields:**
-- `w₀ : E` — initial point
-- `η : ℕ → ℝ` — step size schedule
-- `gradL : E → S → E` — stochastic subgradient oracle (satisfies subdifferential membership)
-- `ξ : ℕ → Ω → S` — sample stream
-- `P : Measure Ω` — probability measure
-- `hP : IsProbabilityMeasure P`
-- `hξ_meas : ∀ t, Measurable (ξ t)`
-- `hξ_indep : iIndepFun ξ P`
-- `hξ_ident : ∀ t, IdentDistrib (ξ t) (ξ 0) P P`
-
-**Design note:** Contains **no `gradF` field** (unlike `SGDSetup`), reflecting the absence of a true gradient for non-smooth functions. Subgradient membership is enforced via hypothesis `hsubgrad` in the convergence theorem.
-
-### `process`
-
-| Field | Value |
-|---|---|
-| File | `Algorithms/SubgradientMethod.lean` |
-| Kind | `noncomputable def` |
-| Layer | 2 |
-
-**Definition:** `process = sgdProcess w₀ η gradL ξ` — reuses SGD process recursion verbatim from `Main.lean`.
-
-**Infrastructure lemmas (thin wrappers):**
-- `subgradientProcess_measurable` — delegates to `sgdProcess_measurable`
-- `subgradientProcess_adapted` — delegates to `sgdProcess_adapted`
-- `subgradientProcess_indepFun_xi` — delegates to `sgdProcess_indepFun_xi`
-
-### `subgradient_convergence_convex`
-
-| Field | Value |
-|---|---|
-| File | `Algorithms/SubgradientMethod.lean` |
-| Layer | 2 |
-| Conclusion | `$\frac{1}{T} \sum_{t<T} (\mathbb{E}[f(w_t)] - f(w^*)) \leq \frac{\|w_0 - w^*\|^2}{2\eta T} + \frac{\eta G^2}{2}$` |
-
-**Archetype:** B — novel proof structure despite identical update syntax.
-
-**Call chain:**
-```
-subgradient_convergence_convex
-  → per-step bound:
-       norm_sq_sgd_step (pointwise norm expansion)
-       + mem_subdifferential_iff (pointwise subgradient inequality: f(wₜ)−f(w*) ≤ ⟨gₜ, wₜ−w*⟩)
-       → combine to bound ‖wₜ₊₁−w*‖²
-  → integral_mono + integral linearity (integral_add/sub/const_mul)
-  → expectation_norm_sq_gradL_bound (variance bound on ‖gₜ‖²)
-  → Finset.sum_range_sub (telescoping sum over t < T)
-```
-
-**Key distinction:** Uses subgradient inequality directly in pointwise bound and integrates via `integral_mono`, bypassing Layer 1 meta-theorems entirely. No `gradF` or unbiasedness hypotheses required.
-
-### Hit Report — Glue Usage Count
-
-| Component | File | Used by |
-|---|---|---|
-| `sgdProcess` | `Main.lean` | `process` definition |
-| `sgdProcess_measurable` | `Main.lean` | `subgradientProcess_measurable` |
-| `sgdProcess_indepFun_xi` | `Main.lean` | variance bound step (via `subgradientProcess_indepFun_xi`) |
-| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | Step 1 (pointwise norm expansion) |
-| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 4 (variance bound) |
-| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | integrability of `‖wₜ₊₁−w*‖²` term |
-| `mem_subdifferential_iff` | Mathlib | pointwise subgradient inequality derivation |
-
-**Leverage score (Archetype B):** reused existing components = 9; new algorithm-specific items = 6 (`SubgradientSetup`, `process` alias, 3 process infrastructure lemmas, convergence theorem); reuse ratio = `$9 / (9 + 6) = 60.0\%$`.
+**Leverage score (Archetype B):** reused existing components = 10; new algorithm-specific items = 6 (`SubgradientSetup`, `process` alias, 3 process infrastructure lemmas, convergence theorem); reuse ratio = `$10 / (10 + 6) = 62.5\%$`.
 
 
 This file instantiates the Layer 1 meta-theorems for the concrete SGD algorithm.
@@ -1278,6 +1200,39 @@ new SVRG bridge components documented = 6; reuse ratio = `3 / (3 + 6) = 33.3%` (
 ---
 
 ## Roadmap & Dependency Tree
+
+| Lemma | File | SGD non-convex | SGD convex | SGD strongly convex | WD non-convex | WD convex | WD strongly convex | PGD convex | SVRG inner strongly convex | SVRG outer stub | Subgradient convex |
+|-------|------|:--------------:|:----------:|:-------------------:|:-------------:|:---------:|:------------------:|:----------:|:--------------------------:|:---------------:|:------------------:|
+| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | — | Step 1 | Step 1 | — | Step 1 | Step 1 | Step 1 (virtual) | Step 1 | — | **Step 1** |
+| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | — | **Step 4** |
+| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | — | h_int_norm_sq | h_int_norm_sq | — | h_int_norm_sq | h_int_norm_sq | h_int_norm_sq, h_int_virtual | h_int_norm_sq | — | **h_int_norm_sq** |
+| `hasBoundedVariance_of_pointwise_bound` | `Lib/Glue/Probability.lean` | — | — | — | — | — | — | — | — | — | **Step (deriving hvar)** |
+| *All other lemmas* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* |
+
+*Note: Cells marked "—" indicate no usage in that algorithm variant. "Subgradient convex" column updated with verified usage points.*
+
+
+| Lemma | File | SGD non-convex | SGD convex | SGD strongly convex | WD non-convex | WD convex | WD strongly convex | PGD convex | SVRG inner strongly convex | SVRG outer stub | Subgradient convex |
+|-------|------|:--------------:|:----------:|:-------------------:|:-------------:|:---------:|:------------------:|:----------:|:--------------------------:|:---------------:|:------------------:|
+| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | — | Step 1 | Step 1 | — | Step 1 | Step 1 | Step 1 (virtual) | Step 1 | — | **Step 1** |
+| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | — | **Step 4** |
+| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | — | h_int_norm_sq | h_int_norm_sq | — | h_int_norm_sq | h_int_norm_sq | h_int_norm_sq, h_int_virtual | h_int_norm_sq | — | **h_int_norm_sq** |
+| `hasBoundedVariance_of_pointwise_bound` | `Lib/Glue/Probability.lean` | — | — | — | — | — | — | — | — | — | **Step (deriving hvar)** |
+| *All other lemmas* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* |
+
+### Universally reusable glue lemmas
+
+The following lemmas have no SGD-specific content and are expected to apply directly to any future algorithm that uses IID stochastic gradients:
+
+| Lemma | Why universal |
+|-------|--------------|
+| `expectation_inner_gradL_eq` | Any IID stochastic gradient algorithm |
+| `expectation_norm_sq_gradL_bound` | Any IID stochastic gradient algorithm |
+| `integrable_norm_sq_of_bounded_var` | Provides `h_int_sq` for any bounded-variance algorithm |
+| `integrable_inner_of_sq_integrable` | Provides `h_int_inner` for any L²-bounded gradient |
+| `integrable_sq_norm_of_pointwise_bound` | Pure measure theory — any `NormedAddCommGroup`-valued function with a constant pointwise norm bound; no optimization vocabulary |
+| `hasBoundedVariance_of_pointwise_bound` | Only requires uniform pointwise oracle bound `‖gradL w s‖ ≤ G`; works for any algorithm with uniformly bounded stochastic oracle (subgradient methods, clipped SGD, etc.) |
+
 
 | Lemma | File | SGD non-convex | SGD convex | SGD strongly convex | WD non-convex | WD convex | WD strongly convex | PGD convex | SVRG inner strongly convex | SVRG outer stub | Subgradient convex | Reusable for |
 |-------|------|:--------------:|:----------:|:-------------------:|:-------------:|:---------:|:------------------:|:----------:|:--------------------------:|:---------------:|:------------------:|--------------|

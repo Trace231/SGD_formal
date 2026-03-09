@@ -13,10 +13,18 @@ This file provides integrability lemmas that bridge the gap between Mathlib's
 pointwise measure-theoretic infrastructure and the composed integrability
 conditions required by stochastic optimization proofs.
 
+ARCHITECTURAL INVARIANT: This file MUST NOT import any file under `Lib/Layer1/`.
+All return types must use expanded forms rather than Layer 1 predicates such as
+`HasBoundedVariance'`. See `hasBoundedVariance_of_pointwise_bound` for the
+established pattern (expanded ∀ w, Integrable ∧ ∫ ≤ G²).
+
 ## Main results
 
 * `integrable_inner_of_sq_integrable` — inner product integrability from L² bounds
 * `integrable_norm_sq_of_bounded_var` — ‖gradL(wt,ξt)‖² integrability from bounded variance
+* `integrable_sq_norm_of_pointwise_bound` — L² integrability + Bochner bound from pointwise norm bound (atomic, any NormedAddCommGroup)
+* `hasBoundedVariance_of_pointwise_bound` — bounded-variance wrapper for optimization-vocabulary callers
+* `svrg_variance_reduction` — SVRG variance-reduction inequality (finite-sum / uniform-sampling form)
 
 ## Gap taxonomy
 
@@ -25,6 +33,8 @@ All gaps here are Level 2 (composition missing):
   "inner product of two L²-integrable random vectors" pattern.
 - Mathlib has Fubini + independence + integral_map, but not the composed
   "bounded variance implies finite second moment under joint distribution" pattern.
+- Mathlib has `Integrable.mono` + `integral_mono` + `integral_const`, but not the
+  composed "pointwise constant bound implies L²-integrability and Bochner bound" pattern.
 -/
 
 open MeasureTheory ProbabilityTheory
@@ -126,6 +136,59 @@ theorem integrable_norm_sq_of_bounded_var
         rw [Real.norm_eq_abs, Real.norm_eq_abs, abs_of_nonneg h_nonneg, abs_of_nonneg (sq_nonneg σ), h_eq]
         exact hvar_bound w)
   ⟩
+
+
+
+
+/-- If `f : S → β` is pointwise bounded by `G`, then `fun s => ‖f s‖ ^ 2` is
+integrable and its Bochner integral is at most `G ^ 2`.
+
+Layer: Glue | Gap: Level 2 (composition missing)
+Technique: `Integrable.mono` with constant domination, `integral_mono`, `integral_const`,
+`pow_le_pow_left₀`.
+
+This is the atomic, optimization-vocabulary-free form. The only requirement on
+`β` is `NormedAddCommGroup`. For the optimization-specific wrapper that speaks
+in terms of a stochastic gradient oracle `gradL : E → S → E`, see
+`hasBoundedVariance_of_pointwise_bound`. -/
+theorem integrable_sq_norm_of_pointwise_bound
+    {β : Type*} [NormedAddCommGroup β]
+    {f : S → β} {G : ℝ} {ν : Measure S} [IsProbabilityMeasure ν]
+    (hbounded : ∀ s, ‖f s‖ ≤ G) :
+    Integrable (fun s => ‖f s‖ ^ 2) ν ∧ ∫ s, ‖f s‖ ^ 2 ∂ν ≤ G ^ 2 := by
+  constructor
+  · apply Integrable.mono (integrable_const (G ^ 2))
+    · intro s
+      exact pow_le_pow_left₀ (norm_nonneg _) (hbounded s) 2
+    · exact integrable_const _
+  · calc
+      ∫ s, ‖f s‖ ^ 2 ∂ν
+        ≤ ∫ s, G ^ 2 ∂ν := integral_mono (by
+            apply Integrable.mono (integrable_const _) _ _
+            · intro s; exact pow_le_pow_left₀ (norm_nonneg _) (hbounded s) 2
+            · exact integrable_const _)
+          (integrable_const _) (fun s => pow_le_pow_left₀ (norm_nonneg _) (hbounded s) 2)
+      _ = G ^ 2 := by simp [integral_const, probReal_univ]
+
+/-- From a uniform pointwise oracle bound `‖gradL w s‖ ≤ G`, derive the
+bounded-variance property: for every `w`, `fun s => ‖gradL w s‖ ^ 2` is
+integrable and its Bochner integral is at most `G ^ 2`.
+
+This is a thin optimization-vocabulary wrapper over
+`integrable_sq_norm_of_pointwise_bound`. The return type is intentionally kept
+in expanded form (rather than `HasBoundedVariance' gradL ν G`) to avoid
+importing `Lib.Layer1`, which would create a circular module dependency.
+Callers holding `HasBoundedVariance' gradL ν G` can use this directly because
+Lean unfolds the definition during type-checking.
+
+Layer: Glue | Gap: Level 2 (composition missing)
+Used in: `Subgradient convex convergence` (Algorithms/SubgradientMethod.lean, Step deriving hvar)
+Used in: any algorithm with a uniformly bounded stochastic oracle (clipped SGD, etc.) -/
+theorem hasBoundedVariance_of_pointwise_bound
+    {gradL : E → S → E} {G : ℝ} {ν : Measure S} [IsProbabilityMeasure ν]
+    (hbounded : ∀ w s, ‖gradL w s‖ ≤ G) :
+    ∀ w, Integrable (fun s => ‖gradL w s‖ ^ 2) ν ∧ ∫ s, ‖gradL w s‖ ^ 2 ∂ν ≤ G ^ 2 :=
+  fun w => integrable_sq_norm_of_pointwise_bound (fun s => hbounded w s)
 
 /-- SVRG variance-reduction inequality (finite-sum / uniform-sampling form).
 

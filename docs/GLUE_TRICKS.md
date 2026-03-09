@@ -278,6 +278,58 @@ goals of this form is `pow_le_pow_left₀` with `norm_nonneg`.
 
 ---
 
+### Pattern I: Pointwise Bound → Bounded Variance
+
+**Problem**: You have a uniform pointwise bound `‖f s‖ ≤ G` (or
+`‖gradL w s‖ ≤ G` for all `w` and `s`) and need to show that
+`fun s => ‖f s‖ ^ 2` is integrable under a probability measure `ν`,
+and that `∫ s, ‖f s‖ ^ 2 ∂ν ≤ G ^ 2`.
+
+**Two-layer design** (implemented in `Lib/Glue/Probability.lean`):
+
+*Layer 1 — atomic, pure measure theory (use for any normed-valued function):*
+
+```lean
+-- Works for any β : Type* with [NormedAddCommGroup β]
+theorem integrable_sq_norm_of_pointwise_bound
+    {β : Type*} [NormedAddCommGroup β]
+    {f : S → β} {G : ℝ} {ν : Measure S} [IsProbabilityMeasure ν]
+    (hbounded : ∀ s, ‖f s‖ ≤ G) :
+    Integrable (fun s => ‖f s‖ ^ 2) ν ∧ ∫ s, ‖f s‖ ^ 2 ∂ν ≤ G ^ 2
+```
+
+*Layer 2 — thin optimization-vocabulary wrapper (use when the caller has `gradL : E → S → E`):*
+
+```lean
+theorem hasBoundedVariance_of_pointwise_bound
+    {gradL : E → S → E} {G : ℝ} {ν : Measure S} [IsProbabilityMeasure ν]
+    (hbounded : ∀ w s, ‖gradL w s‖ ≤ G) :
+    ∀ w, Integrable (fun s => ‖gradL w s‖ ^ 2) ν ∧ ∫ s, ‖gradL w s‖ ^ 2 ∂ν ≤ G ^ 2 :=
+  fun w => integrable_sq_norm_of_pointwise_bound (fun s => hbounded w s)
+```
+
+**Caller pattern** (in an algorithm proof that has `HasBoundedVariance'`):
+
+```lean
+have hvar : HasBoundedVariance' setup.gradL setup.sampleDist G :=
+  hasBoundedVariance_of_pointwise_bound hbounded
+-- Lean unfolds HasBoundedVariance' and unifies with the expanded return type.
+```
+
+**Key ingredients**: `Integrable.mono`, `integrable_const`, `integral_mono`,
+`integral_const`, `pow_le_pow_left₀`, `probReal_univ`.
+
+**ARCHITECTURAL RULE**: `integrable_sq_norm_of_pointwise_bound` lives in
+`Lib/Glue/Probability.lean` and must stay free of any `Lib/Layer1/` imports.
+`hasBoundedVariance_of_pointwise_bound` uses the **expanded return type**
+(`∀ w, Integrable ... ∧ ∫ ... ≤ G²`) rather than the `HasBoundedVariance'`
+predicate, to prevent circular module dependencies.
+
+**When to use**: Any algorithm whose stochastic oracle is uniformly bounded
+pointwise (subgradient methods, clipped SGD, gradient clipping variants).
+
+---
+
 ## Section 4 — The Effective Oracle Reframe Technique
 
 **Situation**: An algorithm's update looks like:

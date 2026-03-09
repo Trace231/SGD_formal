@@ -85,6 +85,45 @@ DOC_ANCHORS: dict[str, dict[str, str]] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Lib/Glue anchors for glue lemma insertion (Phase 4 refactoring architect)
+# ---------------------------------------------------------------------------
+
+LIB_GLUE_ANCHORS: dict[str, dict[str, dict[str, str]]] = {
+    "Lib/Glue/Probability.lean": {
+        "BEFORE_LEMMA_2": {
+            "regex": r"^-- Lemma 2: Squared norm of stochastic gradient",
+            "insert": "before",
+        },
+        "BEFORE_SVRG": {
+            "regex": r"^/-- SVRG variance-reduction inequality",
+            "insert": "before",
+        },
+    },
+    "Lib/Glue/Algebra.lean": {
+        "BEFORE_INNER_PRODUCT": {
+            "regex": r"^-- Inner product and norm helpers for the non-convex step",
+            "insert": "before",
+        },
+        "AFTER_NORM_SQ_SGD": {
+            "regex": r"simp \[inner_smul_right, norm_smul, mul_pow, sq_abs\]; ring$",
+            "insert": "after",
+        },
+    },
+    "Lib/Glue/Measurable.lean": {
+        "BEFORE_SECTION_2": {
+            "regex": r"^-- 2\. Integrability of Lipschitz function composed",
+            "insert": "before",
+        },
+    },
+    "Lib/Glue/Calculus.lean": {
+        "BEFORE_PART_2": {
+            "regex": r"^-- Part 2: FTC along a segment",
+            "insert": "before",
+        },
+    },
+}
+
 RETRY_LIMITS: dict[str, int] = {
     "MAX_PHASE2_APPROVAL_ROUNDS": 10,
     "MAX_PHASE3_RETRIES": 5,

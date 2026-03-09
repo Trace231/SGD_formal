@@ -42,6 +42,7 @@ class ToolRegistry:
         from orchestrator.tools import (
             apply_doc_patch,
             edit_file_patch,
+            overwrite_file,
             read_file,
             run_lean_verify,
             run_repo_verify,
@@ -50,6 +51,7 @@ class ToolRegistry:
 
         self.register("read_file", read_file)
         self.register("write_new_file", write_new_file)
+        self.register("overwrite_file", overwrite_file)
         self.register("edit_file_patch", edit_file_patch)
         self.register("run_lean_verify", run_lean_verify)
         self.register("run_repo_verify", run_repo_verify)

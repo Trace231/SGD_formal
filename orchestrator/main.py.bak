@@ -218,25 +218,6 @@ def _get_modified_lean_files(
     return sorted(newly_tracked | newly_untracked | baseline_untracked_promoted)
 
 
-def _parse_persister_json(raw: str) -> list:
-    """Robustly parse Agent4 JSON output. Strips markdown blocks, tolerates trailing text.
-    Coerces a bare JSON object into a single-element list for forward compatibility."""
-    text = raw.strip()
-    # Step 1: Strip markdown code block if present.
-    # Use flexible regex: \s* allows no newline between ``` and JSON; (.*?)\s* allows
-    # content with or without trailing newline before closing ```.
-    match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
-    if match:
-        text = match.group(1).strip()
-    # Step 2: Parse first complete JSON value only (ignore trailing commentary)
-    decoder = json.JSONDecoder()
-    obj, _ = decoder.raw_decode(text)
-    # Step 3: Coerce bare object to list (Agent4 sometimes returns a single op as an object)
-    if isinstance(obj, dict):
-        obj = [obj]
-    return obj
-
-
 # ---------------------------------------------------------------------------
 # Phase implementations
 # ---------------------------------------------------------------------------
@@ -321,12 +302,11 @@ def phase2_plan_and_approve(
 
         round_num += 1
         review_raw = agent1.call(
-            "Review the plan from Agent2. Return ONLY valid JSON:\n"
-            '{"decision": "APPROVED" | "AMEND" | "REJECTED", "feedback": "..."}\n\n'
-            "Decision rules:\n"
-            "- AMEND: Use for fixable issues (missing docs section, Used-in tags, format). Provide specific feedback.\n"
-            "- REJECTED: Use ONLY for unfixable math errors or safety violations. Do NOT use for docs/tags.\n"
-            "- APPROVED: Plan meets all criteria.\n\n"
+            "Review the plan from Agent2 and return ONLY valid JSON with this schema:\n"
+            "{\n"
+            '  "decision": "APPROVED" | "REJECTED" | "AMEND",\n'
+            '  "feedback": "<required when decision is AMEND; optional otherwise>"\n'
+            "}\n\n"
             f"Plan to review:\n{plan}"
         )
 
@@ -341,7 +321,7 @@ def phase2_plan_and_approve(
         if not isinstance(review, dict):
             raise RuntimeError("[Phase 2] Reviewer response must be a JSON object.")
 
-        decision = str(review.get("decision", "")).strip().upper()
+        decision = review.get("decision")
         feedback = review.get("feedback", "")
         feedback_text = feedback if isinstance(feedback, str) else str(feedback)
 
@@ -1036,7 +1016,7 @@ def phase4_persist(
     )
 
     try:
-        patch_ops = _parse_persister_json(persistence_output)
+        patch_ops = json.loads(persistence_output)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
             "[Phase 4] Persister returned invalid JSON. "
@@ -1051,9 +1031,6 @@ def phase4_persist(
     patch_ops_summary: list[dict] = []
     lib_write_ops: list[dict] = []
     algorithm_refactor_ops: list[dict] = []
-    # Guard A: track anchors already patched in this run to prevent double-insert
-    # when Agent4 emits two ops with the same anchor in one response.
-    patched_anchors: set[str] = set()
 
     for idx, op in enumerate(patch_ops, start=1):
         if not isinstance(op, dict):
@@ -1071,23 +1048,6 @@ def phase4_persist(
                 raise RuntimeError(
                     f"[Phase 4] patch_ops[{idx}] uses non-allowed anchor: {anchor_id}"
                 )
-            # Guard A: skip if this anchor was already patched earlier in this run.
-            if anchor_id in patched_anchors:
-                console.print(
-                    f"[yellow]\\[Agent4] Skipping duplicate anchor {anchor_id} in same run"
-                )
-                continue
-            # Guard B: for CATALOG_ALGO_LAYER, skip if algorithm section already exists.
-            if anchor_id == "CATALOG_ALGO_LAYER":
-                catalog_text = (PROJECT_ROOT / "docs/CATALOG.md").read_text(encoding="utf-8")
-                algo_pat = (
-                    rf"^## Algorithm Layer \(Layer 2\)\s+—\s+`Algorithms/{re.escape(algorithm)}\.lean`"
-                )
-                if re.search(algo_pat, catalog_text, re.MULTILINE):
-                    console.print(
-                        f"[cyan]\\[Agent4] Algorithm section already exists in CATALOG.md — skipping"
-                    )
-                    continue
             cfg = allowed_anchors[anchor_id]
             patch_result = registry.call(
                 "apply_doc_patch",
@@ -1103,7 +1063,6 @@ def phase4_persist(
                 "changed": changed,
             })
             if changed:
-                patched_anchors.add(anchor_id)
                 console.print(
                     f"[green]\\[Agent4] Patched {cfg['path']} via anchor {anchor_id}"
                 )

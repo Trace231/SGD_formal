@@ -126,6 +126,18 @@ def write_new_file(path: str | Path, content: str) -> dict[str, Any]:
     }
 
 
+def overwrite_file(path: str | Path, content: str) -> dict[str, Any]:
+    """Overwrite an existing file with content. Used for restore/rollback."""
+    resolved = _resolve_allowed_path(path, _READ_WRITE_ALLOWLIST)
+    if not resolved.exists():
+        raise FileNotFoundError(f"Target file does not exist: {path}")
+    _atomic_write(resolved, content)
+    return {
+        "path": str(resolved.relative_to(PROJECT_ROOT)),
+        "overwritten": True,
+    }
+
+
 def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     """Run Lean verification and return a JSON-serializable result."""
     resolved = _resolve_allowed_path(file_path, _LEAN_VERIFY_ALLOWLIST)

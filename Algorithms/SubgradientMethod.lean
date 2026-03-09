@@ -1,6 +1,7 @@
 import Main
 import Lib.Layer0.IndepExpect
 import Lib.Glue.Algebra
+import Lib.Glue.Probability
 import Mathlib.Analysis.Convex.Subdifferential
 
 /-!
@@ -151,22 +152,8 @@ theorem subgradient_convergence_convex
         (∫ ω, f (setup.process t ω) ∂setup.P - f wStar) ≤
       ‖setup.w₀ - wStar‖ ^ 2 / (2 * η * T) + η * G ^ 2 / 2 := by
   haveI := setup.hP
-  -- Derive bounded variance from pointwise norm bound
-  have hvar : HasBoundedVariance' setup.gradL setup.sampleDist G := by
-    intro w
-    -- Integrability component (Convention §1)
-    have h_int : Integrable (fun s => ‖setup.gradL w s‖ ^ 2) setup.sampleDist := by
-      apply Integrable.mono (integrable_const (G ^ 2))
-      · intro s; exact pow_le_pow_left₀ (norm_nonneg _) (hbounded w s) 2
-      · exact integrable_const _
-    -- Bound component
-    have h_bound : ∫ s, ‖setup.gradL w s‖ ^ 2 ∂setup.sampleDist ≤ G ^ 2 := by
-      calc
-        ∫ s, ‖setup.gradL w s‖ ^ 2 ∂setup.sampleDist
-          ≤ ∫ s, G ^ 2 ∂setup.sampleDist := integral_mono h_int (integrable_const _)
-            (fun s => pow_le_pow_left₀ (norm_nonneg _) (hbounded w s) 2)
-        _ = G ^ 2 := by simp [integral_const, probReal_univ]
-    exact ⟨h_int, h_bound⟩
+  have hvar : HasBoundedVariance' setup.gradL setup.sampleDist G :=
+    hasBoundedVariance_of_pointwise_bound hbounded
   -- Per-step bound
   have hstep : ∀ t < T,
       ∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P ≤
