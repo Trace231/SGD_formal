@@ -76,7 +76,8 @@ _LIB_DECL_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 _SIGNATURE_HALLUCINATION_RE = re.compile(
-    r"unknown identifier|unknown constant|unknown tactic|failed to synthesize instance",
+    r"unknown identifier|unknown constant|unknown tactic|"
+    r"failed to synthesize instance|has already been declared",
     re.IGNORECASE,
 )
 
@@ -152,7 +153,7 @@ def _format_agent3_tool_feedback(
         "",
         f"### Current file ({target_file})",
         "```lean",
-        current_code[:4000] if current_code else "(empty)",
+        current_code[:10000] if current_code else "(empty)",
         "```",
     ])
     return "\n".join(parts)
@@ -400,6 +401,62 @@ def _parse_persister_json(raw: str) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Agent2 guided lookup helper
+# ---------------------------------------------------------------------------
+
+def _call_agent2_with_tools(
+    agent2: "Agent",
+    registry: "ToolRegistry",
+    user_msg: str,
+    max_tool_rounds: int = 5,
+) -> str:
+    """Call Agent2 with optional read-only tool support.
+
+    Agent2 may reply with a lookup request:
+        {"type": "lookup", "tool_calls": [{"tool": "read_file", "arguments": {...}}, ...]}
+    In that case the tools are executed against *registry* (read-only) and
+    results are fed back to Agent2.  Any other reply format (plain text, or
+    JSON without ``"type": "lookup"``) is returned immediately as final guidance.
+    After *max_tool_rounds* the last reply is returned regardless.
+    """
+    reply = agent2.call(user_msg)
+
+    for _ in range(max_tool_rounds):
+        # Try to parse as JSON lookup request.
+        try:
+            payload = json.loads(reply)
+        except (json.JSONDecodeError, ValueError):
+            return reply  # plain text → final guidance
+
+        if not isinstance(payload, dict) or payload.get("type") != "lookup":
+            return reply  # non-lookup JSON → final guidance
+
+        tool_calls = payload.get("tool_calls", [])
+        if not isinstance(tool_calls, list) or not tool_calls:
+            return reply
+
+        results: list[dict] = []
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            tool_name = tc.get("tool", "")
+            args = tc.get("arguments", {}) if isinstance(tc.get("arguments"), dict) else {}
+            try:
+                result = registry.call(tool_name, **args)
+            except Exception as exc:  # noqa: BLE001
+                result = {"error": str(exc)}
+            results.append({"tool": tool_name, "arguments": args, "result": result})
+
+        reply = agent2.call(
+            "Lookup results:\n"
+            + json.dumps(results, indent=2, ensure_ascii=False)
+            + "\n\nContinue planning or issue more lookups if still needed."
+        )
+
+    return reply  # max rounds exhausted → return last reply as-is
+
+
+# ---------------------------------------------------------------------------
 # Phase implementations
 # ---------------------------------------------------------------------------
 
@@ -583,6 +640,9 @@ def phase3_prove(
     agent3 = Agent("sorry_closer", extra_files=[target_file])
     registry = ToolRegistry()
     registry.register_default_tools()
+    # Read-only registry for Agent2 lookup rounds (no write tools exposed).
+    readonly_registry = ToolRegistry()
+    readonly_registry.register_readonly_tools()
     diag_log: list[str] = []
 
     # Pre-check: if the target file already has 0 sorry and builds clean,
@@ -622,7 +682,9 @@ def phase3_prove(
         if not initial_exists
         else ""
     )
-    guidance = agent2.call(
+    guidance = _call_agent2_with_tools(
+        agent2,
+        readonly_registry,
         "The verification target file is "
         + target_file
         + ". Provide initial proving guidance for Agent3.  Specify which sorry "
@@ -632,7 +694,7 @@ def phase3_prove(
         "guidance MUST instruct Agent3 to complete BOTH in a single attempt, "
         "or verification will fail."
         + _archetype_b_warning
-        + _file_absent_suffix
+        + _file_absent_suffix,
     )
     console.print(Panel(
         guidance[:400] + "..." if len(guidance) > 400 else guidance,
@@ -698,10 +760,12 @@ def phase3_prove(
                 message=err_msg,
                 attempt=attempt,
             ))
-            guidance = agent2.call(
+            guidance = _call_agent2_with_tools(
+                agent2,
+                readonly_registry,
                 f"Attempt {attempt} failed.\n"
                 "Invalid JSON format from Agent3.\n"
-                "Adjust your guidance so Agent3 returns strict JSON tool calls."
+                "Adjust your guidance so Agent3 returns strict JSON tool calls.",
             )
             console.print(
                 f"  [Agent3] attempt {attempt}/{max_retries} — "
@@ -717,10 +781,12 @@ def phase3_prove(
                 message=last_errors,
                 attempt=attempt,
             ))
-            guidance = agent2.call(
+            guidance = _call_agent2_with_tools(
+                agent2,
+                readonly_registry,
                 f"Attempt {attempt} failed.\n"
                 "Agent3 JSON top-level was not an object.\n"
-                "Adjust your guidance for strict output schema."
+                "Adjust your guidance for strict output schema.",
             )
             console.print(
                 f"  [Agent3] attempt {attempt}/{max_retries} — "
@@ -737,10 +803,12 @@ def phase3_prove(
                 message=last_errors,
                 attempt=attempt,
             ))
-            guidance = agent2.call(
+            guidance = _call_agent2_with_tools(
+                agent2,
+                readonly_registry,
                 f"Attempt {attempt} failed.\n"
                 "Agent3 output schema invalid: tool_calls is not a list.\n"
-                "Adjust your guidance for strict output schema."
+                "Adjust your guidance for strict output schema.",
             )
             console.print(
                 f"  [Agent3] attempt {attempt}/{max_retries} — "
@@ -916,13 +984,15 @@ def phase3_prove(
         # Intelligent retry prompts.
         # Priority 1: no-op trap — Agent3 never touched the file THIS attempt.
         if prove_state == "PROVE_RETRY" and not attempt_file_changed and exit_code == 0:
-            guidance = agent2.call(
+            guidance = _call_agent2_with_tools(
+                agent2,
+                readonly_registry,
                 f"Attempt {attempt} NOOP — Agent3 made no file changes.\n"
                 f"Target file: {target_file}\n"
                 "SURGEON MODE: Agent3 called run_lean_verify without editing the file first. "
                 "Output a PATCH block (<<<SEARCH>>>/<<<REPLACE>>>) with the exact Lean code "
                 "Agent3 must write, or a write_new_file instruction if the file does not exist. "
-                "Be specific — no natural language advice. Agent3 will execute your patch verbatim."
+                "Be specific — no natural language advice. Agent3 will execute your patch verbatim.",
             )
             console.print(
                 f"  [Agent3] attempt {attempt}/{max_retries} — "
@@ -937,10 +1007,12 @@ def phase3_prove(
                 " Stay within Algorithms/ or Lib/."
             )
             diag_log.extend([f"attempt={attempt} {m}" for m in blocked_msgs])
-            guidance = agent2.call(
+            guidance = _call_agent2_with_tools(
+                agent2,
+                readonly_registry,
                 f"Attempt {attempt} failed.\n"
                 f"{blocked_hint}\n"
-                "Adjust your guidance for safe path usage."
+                "Adjust your guidance for safe path usage.",
             )
             continue
 
@@ -949,13 +1021,15 @@ def phase3_prove(
 
         # Priority 2.5: File still does not exist — Agent3 never called write_new_file.
         if not _tgt.exists() and "Target file does not exist" in (verify_text or ""):
-            guidance = agent2.call(
+            guidance = _call_agent2_with_tools(
+                agent2,
+                readonly_registry,
                 f"Attempt {attempt} failed: Target file still does not exist.\n"
                 f"Agent3 did NOT call write_new_file. You MUST output the FULL Lean file content "
                 f'and explicitly instruct Agent3 to call write_new_file(path="{target_file}", '
                 "content=<complete file>) as the FIRST tool call.\n"
                 f"Guidance format: Provide a code block with the complete {target_file} "
-                "scaffold (imports, setup, theorem stubs with sorry). Agent3 will pass it to write_new_file."
+                "scaffold (imports, setup, theorem stubs with sorry). Agent3 will pass it to write_new_file.",
             )
             console.print(
                 f"  [Agent3] attempt {attempt}/{max_retries} — "
@@ -986,7 +1060,9 @@ def phase3_prove(
             initial_exists = False
             initial_hash = None
             file_changed = False
-            guidance = agent2.call(
+            guidance = _call_agent2_with_tools(
+                agent2,
+                readonly_registry,
                 f"[STATEMENT ERROR — SIGNATURE HALLUCINATION]\n"
                 f"Lean error excerpt:\n```\n{verify_text[:800]}\n```\n\n"
                 f"The theorem STATEMENT itself is broken: it references a symbol "
@@ -998,7 +1074,7 @@ def phase3_prove(
                 f"including any name resembling the one that just failed.\n"
                 f"Express every property as a direct inequality, ∀/∃ quantifier,\n"
                 f"or inner-product expression (e.g. ∀ y, f y ≥ f x + ⟪g, y-x⟫_ℝ).\n\n"
-                f"Output a complete corrected file. Agent3 will use write_new_file."
+                f"Output a complete corrected file. Agent3 will use write_new_file.",
             )
             continue
 
@@ -1131,7 +1207,9 @@ def phase3_prove(
                 if err_summary_match
                 else verify_text[:120].replace("\n", " ")
             )
-            guidance = agent2.call(
+            guidance = _call_agent2_with_tools(
+                agent2,
+                readonly_registry,
                 f"[LOCAL PROOF ERROR — SORRY DEGRADATION REQUIRED]\n"
                 f"Build exit code: {exit_code} | Sorry count: {last_sorry_count}\n"
                 f"Error at line {line_no_display}:\n```\n{verify_text[:4000]}\n```\n\n"
@@ -1147,7 +1225,7 @@ def phase3_prove(
                 f"     sorry -- LOCAL_ERROR: {err_summary}\n"
                 f"   This keeps the file compilable so the next attempt can close this sorry.\n"
                 f"3. SEARCH must be copied verbatim from the current file shown above.\n"
-                f"4. Output ONLY the patch block — no prose explanation needed."
+                f"4. Output ONLY the patch block — no prose explanation needed.",
             )
             continue
 
@@ -1161,7 +1239,9 @@ def phase3_prove(
                 "will cause edit_file_patch to fail again.\n\n"
             )
 
-        guidance = agent2.call(
+        guidance = _call_agent2_with_tools(
+            agent2,
+            readonly_registry,
             mismatch_prefix
             + f"Attempt {attempt} failed.\n"
             f"Build exit code: {exit_code} | Sorry count: {last_sorry_count}\n"
@@ -1177,7 +1257,7 @@ def phase3_prove(
             "If REPLACE uses a Lib/ lemma, add a comment above the patch: "
             "# Source: Lib/Glue/<File>.lean or Lib/Layer0/<File>.lean — <lemma name>. "
             "Do NOT name a lemma you have not verified in the file context provided. "
-            "Agent3 will apply your patches verbatim as edit_file_patch calls."
+            "Agent3 will apply your patches verbatim as edit_file_patch calls.",
         )
 
     console.print("[red bold]Max retries exhausted — escalating to Agent5.")

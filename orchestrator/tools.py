@@ -6,6 +6,7 @@ agent behavior safer and more predictable.
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 import tempfile
@@ -208,7 +209,24 @@ def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, A
     original = resolved.read_text(encoding="utf-8")
     occurrences = original.count(old_str)
     if occurrences == 0:
-        raise ValueError("old_str not found in target file")
+        old_lines = old_str.splitlines()
+        file_lines = original.splitlines()
+        window_size = max(1, len(old_lines))
+        # Cap scan at 200 windows to avoid O(N²) on very large files.
+        max_windows = min(200, max(1, len(file_lines) - window_size + 1))
+        best_score, best_line = 0.0, 1
+        for i in range(max_windows):
+            window = "\n".join(file_lines[i : i + window_size])
+            score = difflib.SequenceMatcher(None, old_str, window).ratio()
+            if score > best_score:
+                best_score, best_line = score, i + 1
+        raise ValueError(
+            f"old_str not found in {path}. "
+            f"Nearest match starts at line {best_line} "
+            f"(similarity {best_score:.0%}). "
+            f"Call read_file(path, start_line={best_line}, "
+            f"end_line={best_line + window_size - 1}) to verify exact text."
+        )
     if occurrences > 1:
         raise ValueError(
             f"old_str appears {occurrences} times; patch would be ambiguous"
@@ -320,6 +338,10 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
         }
 
     rel = str(resolved.relative_to(PROJECT_ROOT))
+
+    # Invalidate Lake cache for this target so errors are re-emitted with
+    # file:line:col locations instead of being silently replayed.
+    resolved.touch()
 
     build = lake_build(target=_path_to_lean_module(rel))
     sorry_count = count_sorrys(rel)

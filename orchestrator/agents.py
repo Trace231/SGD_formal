@@ -11,7 +11,7 @@ from orchestrator.config import (
     AGENT_CONFIGS,
     MAX_TOKENS,
 )
-from orchestrator.file_io import load_files
+from orchestrator.file_io import generate_project_manifest, load_files
 from orchestrator.prompts import AGENT_FILES, SYSTEM_PROMPTS
 from orchestrator.providers import call_llm
 
@@ -59,6 +59,13 @@ class ToolRegistry:
         self.register("run_repo_verify", run_repo_verify)
         self.register("apply_doc_patch", apply_doc_patch)
 
+    def register_readonly_tools(self) -> None:
+        """Register read-only tools for agents that may only inspect files."""
+        from orchestrator.tools import read_file, search_in_file
+
+        self.register("read_file", read_file)
+        self.register("search_in_file", search_in_file)
+
     def call(self, name: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke a registered tool by name."""
         if name not in self._tools:
@@ -94,9 +101,18 @@ class Agent:
         self.messages: list[dict[str, str]] = []
 
         files = list(AGENT_FILES.get(role, []))
-        if extra_files:
-            files.extend(extra_files)
-        self._file_context = load_files(files) if files else ""
+        use_manifest: bool = cfg.get("use_manifest", False)
+        if use_manifest:
+            # Manifest mode: shared context files are indexed compactly so the
+            # agent uses read_file / search_in_file to fetch actual signatures.
+            # The target algorithm file (extra_files) is always loaded in full.
+            self._file_context = generate_project_manifest(files)
+            if extra_files:
+                self._file_context += "\n\n" + load_files(extra_files)
+        else:
+            if extra_files:
+                files.extend(extra_files)
+            self._file_context = load_files(files) if files else ""
 
     def call(self, user_msg: str) -> str:
         """Send *user_msg* (prepended with file context on the first call)

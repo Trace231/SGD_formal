@@ -252,6 +252,30 @@ Rules:
   full type signature). No invented names — only verified Mathlib 4 identifiers.
 - FORBIDDEN: vague suggestions like "try using X". Write the exact replacement code.
 - After all patches, add: "After applying all patches, call run_lean_verify once."
+
+## On-demand File Lookup (MANDATORY when referencing existing APIs)
+
+Before writing guidance that references an existing Lean function, structure,
+or type class, you MUST verify its exact signature.  Use a lookup request:
+
+```json
+{"type": "lookup", "tool_calls": [
+  {"tool": "read_file", "arguments": {"path": "Algorithms/SVRG.lean", "start_line": 35, "end_line": 55}},
+  {"tool": "search_in_file", "arguments": {"path": "Main.lean", "pattern": "svrgProcess"}}
+]}
+```
+
+Rules:
+- Available read-only tools: `read_file`, `search_in_file`.  No write tools.
+- Output the JSON above (with `"type": "lookup"`) to request a file lookup.
+  The system will execute the tools and return the results.
+- After receiving results, continue planning or issue more lookups as needed.
+- When ready to provide final guidance for Agent3, output plain text (no
+  `"type"` field needed — any non-lookup reply is treated as final guidance).
+- Use `search_in_file` first to locate a definition, then `read_file` with
+  `start_line`/`end_line` to fetch the exact signature.
+- FORBIDDEN: naming a function or lemma without having read its definition.
+  Invented signatures cause Agent3 failures that cost a full retry attempt.
 """
 
 # -------------------------------------------------------------------
@@ -315,6 +339,14 @@ noncomputable def sampleDist : Measure S := ...
 ```
 
 Exception: declarations tagged `@[simp]` are exempt.
+
+## Manifest mode
+When your shared context contains `<manifest path="…">` blocks instead of
+full file content, you are in manifest mode.  The manifest lists declaration
+names and line numbers only — it does NOT contain actual signatures or proof
+bodies.  In this mode you MUST call `read_file` (or `search_in_file`) to
+fetch the actual content of any definition you reference before writing or
+patching code.  Never guess a type signature from a declaration name alone.
 
 ## Tool usage (MANDATORY ORDER for a new algorithm)
 You have access to the following tools.  Call them via JSON tool_calls.
@@ -613,6 +645,7 @@ AGENT_FILES: dict[str, list[str]] = {
         "docs/METHODOLOGY.md",
         "Main.lean",
         "Algorithms/SGD.lean",
+        "Algorithms/SVRG.lean",
         "Lib/Layer0/ConvexFOC.lean",
         "Lib/Layer0/GradientFTC.lean",
         "Lib/Layer0/IndepExpect.lean",
@@ -627,6 +660,7 @@ AGENT_FILES: dict[str, list[str]] = {
         "Lib/Glue/Measurable.lean",
         "Main.lean",
         "Algorithms/SGD.lean",
+        "Algorithms/SVRG.lean",
         "Lib/Layer0/ConvexFOC.lean",
         "Lib/Layer0/GradientFTC.lean",
         "Lib/Layer0/IndepExpect.lean",
