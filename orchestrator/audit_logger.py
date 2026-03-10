@@ -47,6 +47,8 @@ class AuditLogger:
         self._phase3_execution_history: list[dict[str, Any]] = []
         self._phase3_attempt_failures: list[dict[str, Any]] = []
         self._phase4_patch_ops_summary: list[dict[str, Any]] = []
+        self._phase1_detail: dict[str, Any] | None = None
+        self._phase2_rounds: list[dict[str, Any]] = []
 
     @classmethod
     def get(cls) -> AuditLogger:
@@ -65,7 +67,6 @@ class AuditLogger:
 
     def start_run(self, algorithm: str) -> str:
         """Begin a new run, compute prompt hashes, return run_id."""
-        AuditLogger.reset()
         self.enabled = AUDIT_ENABLED
         self.audit_dir = Path(AUDIT_DIR)
         self.algorithm = algorithm
@@ -78,6 +79,8 @@ class AuditLogger:
         self._phase3_execution_history = []
         self._phase3_attempt_failures = []
         self._phase4_patch_ops_summary = []
+        self._phase1_detail = None
+        self._phase2_rounds = []
 
         if self.enabled:
             self.events.append({
@@ -136,6 +139,38 @@ class AuditLogger:
             evt["created"] = created
         self.events.append(evt)
 
+    def log_phase1_detail(self, prompt_full: str, reply_full: str) -> None:
+        """Log Phase 1 full prompt and generated Prover prompt."""
+        if not self.enabled:
+            return
+        self._phase1_detail = {
+            "prompt_full": prompt_full,
+            "reply_full": reply_full,
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+
+    def log_phase2_round(
+        self,
+        round_num: int,
+        agent2_plan: str,
+        agent1_prompt: str,
+        agent1_review: str,
+        decision: str,
+        feedback: str,
+    ) -> None:
+        """Log one Phase 2 review round: Agent2 plan, Agent1 prompt and review."""
+        if not self.enabled:
+            return
+        self._phase2_rounds.append({
+            "round": round_num,
+            "agent2_plan": agent2_plan,
+            "agent1_prompt": agent1_prompt,
+            "agent1_review": agent1_review,
+            "decision": decision,
+            "feedback": feedback,
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+
     def add_phase3_data(
         self,
         execution_history: list[dict[str, Any]],
@@ -172,6 +207,8 @@ class AuditLogger:
             "success": success,
             "prompt_hashes": self.prompt_hashes,
             "events": self.events,
+            "phase1_detail": self._phase1_detail,
+            "phase2_rounds": self._phase2_rounds,
             "phase3_execution_history": self._phase3_execution_history,
             "phase3_attempt_failures": self._phase3_attempt_failures,
             "phase4_patch_ops_summary": self._phase4_patch_ops_summary,

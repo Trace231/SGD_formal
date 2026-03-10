@@ -53,7 +53,7 @@ def lake_build(target: str | None = None) -> BuildResult:
         text=True,
         timeout=LEAN_BUILD_TIMEOUT,
     )
-    errors = result.stderr if result.returncode != 0 else ""
+    errors = (result.stderr + result.stdout) if result.returncode != 0 else ""
     sorry_count = _count_sorry_in_output(result.stderr + result.stdout)
     return BuildResult(
         success=result.returncode == 0 and sorry_count == 0,

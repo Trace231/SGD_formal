@@ -80,17 +80,48 @@ _SIGNATURE_HALLUCINATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Lean standard error format: `SomeFile.lean:LINE:COL: error:`
+_LEAN_ERROR_LINE_RE = re.compile(
+    r"[\w./\\-]+\.lean:(\d+):\d+:\s*error:",
+    re.IGNORECASE,
+)
+
+# Errors whose line number exceeds this threshold are considered proof-body
+# problems, not signature problems — file deletion is prohibited.
+_PROOF_BODY_LINE_THRESHOLD = 50
+
+
+def _extract_first_error_line(verify_text: str) -> int | None:
+    """Return the line number of the first Lean compiler error, or None."""
+    m = _LEAN_ERROR_LINE_RE.search(verify_text)
+    return int(m.group(1)) if m else None
+
 
 def _classify_lean_error(verify_text: str) -> str:
-    """Return 'SIGNATURE_HALLUCINATION' or 'PROOF_ERROR'.
+    """Three-way classification of Lean build errors.
 
-    SIGNATURE_HALLUCINATION means the *theorem statement* is broken (undefined
-    symbol, missing type class).  Patching the proof body cannot fix it —
-    the whole file must be rewritten with a corrected signature.
+    SIGNATURE_HALLUCINATION  — unknown symbol detected within the first
+        _PROOF_BODY_LINE_THRESHOLD lines → theorem *statement* is broken →
+        full file rewrite is allowed.
+
+    LOCAL_PROOF_ERROR  — unknown symbol detected but error line is beyond the
+        threshold (deep in the proof body) → patching is the right response →
+        file deletion is PROHIBITED.
+
+    PROOF_ERROR  — all other errors (type mismatch, unsolved goals, etc.) →
+        normal Surgeon-Mode patch.
     """
-    if _SIGNATURE_HALLUCINATION_RE.search(verify_text):
+    has_hallucination_pattern = bool(_SIGNATURE_HALLUCINATION_RE.search(verify_text))
+    if not has_hallucination_pattern:
+        return "PROOF_ERROR"
+
+    line_no = _extract_first_error_line(verify_text)
+    if line_no is not None and line_no <= _PROOF_BODY_LINE_THRESHOLD:
         return "SIGNATURE_HALLUCINATION"
-    return "PROOF_ERROR"
+
+    # Pattern matched but error is deep in the proof body (or no line number
+    # could be extracted — assume deep rather than nuke the file).
+    return "LOCAL_PROOF_ERROR"
 
 
 def _extract_symbol_manifest(plan: str) -> list[dict]:
@@ -324,12 +355,14 @@ def phase1_generate_prompt(
     meta_a = load_meta_prompt_a()
     card = build_algorithm_card(algorithm, update_rule, proof_sketch, archetype)
 
-    prompt_text = agent1.call(
+    phase1_prompt = (
         f"Generate a complete Prover prompt by instantiating the Meta-Prompt A "
         f"template below with the algorithm card.\n\n"
         f"## Meta-Prompt A Template\n{meta_a}\n\n"
         f"## Algorithm Card\n{card}"
     )
+    prompt_text = agent1.call(phase1_prompt)
+    AuditLogger.get().log_phase1_detail(phase1_prompt, prompt_text)
     console.print(
         f"[green]\\[Agent1] Prover prompt generated "
         f"({len(prompt_text)} chars)."
@@ -390,7 +423,7 @@ def phase2_plan_and_approve(
             continue  # re-check symbol_manifest before Agent1 review
 
         round_num += 1
-        review_raw = agent1.call(
+        review_prompt = (
             "Review the plan from Agent2. Return ONLY valid JSON:\n"
             '{"decision": "APPROVED" | "AMEND" | "REJECTED", "feedback": "..."}\n\n'
             "Decision rules:\n"
@@ -399,6 +432,7 @@ def phase2_plan_and_approve(
             "- APPROVED: Plan meets all criteria.\n\n"
             f"Plan to review:\n{plan}"
         )
+        review_raw = agent1.call(review_prompt)
 
         try:
             review = json.loads(review_raw)
@@ -414,6 +448,10 @@ def phase2_plan_and_approve(
         decision = str(review.get("decision", "")).strip().upper()
         feedback = review.get("feedback", "")
         feedback_text = feedback if isinstance(feedback, str) else str(feedback)
+
+        AuditLogger.get().log_phase2_round(
+            round_num, plan, review_prompt, review_raw, decision, feedback_text
+        )
 
         if decision == "APPROVED":
             console.print(
@@ -866,6 +904,9 @@ def phase3_prove(
         # Priority 3: Signature Hallucination — the theorem statement is broken.
         # Patching the proof body cannot fix this; the file must be rewritten.
         error_type = _classify_lean_error(verify_text)
+        err_line_no = _extract_first_error_line(verify_text)
+        line_no_display = str(err_line_no) if err_line_no is not None else "unknown"
+
         if error_type == "SIGNATURE_HALLUCINATION":
             console.print(
                 f"  [Agent3] attempt {attempt}/{max_retries} — "
@@ -893,9 +934,45 @@ def phase3_prove(
             )
             continue
 
+        # Priority 3b: Local Proof Error — unknown symbol deep in the proof body.
+        # The theorem statement and imports are fine; only a specific tactic step
+        # is broken.  File deletion is ABSOLUTELY PROHIBITED here.
+        if error_type == "LOCAL_PROOF_ERROR":
+            console.print(
+                f"  [Agent3] attempt {attempt}/{max_retries} — "
+                f"[yellow]LOCAL_PROOF_ERROR at line {line_no_display} — "
+                "sorry-degrading, file preserved"
+            )
+            # Extract a short error summary (first 200 chars of the error line).
+            err_summary_match = re.search(
+                r"error:(.+)", verify_text, re.IGNORECASE | re.DOTALL
+            )
+            err_summary = (
+                err_summary_match.group(1).strip()[:120].replace("\n", " ")
+                if err_summary_match
+                else verify_text[:120].replace("\n", " ")
+            )
+            guidance = agent2.call(
+                f"[LOCAL PROOF ERROR — SORRY DEGRADATION REQUIRED]\n"
+                f"Build exit code: {exit_code} | Sorry count: {last_sorry_count}\n"
+                f"Error at line {line_no_display}:\n```\n{verify_text[:1200]}\n```\n\n"
+                f"\n=== AGENT3'S CURRENT FILE ({target_file}) ===\n"
+                f"```lean\n{current_code[:3000]}\n```\n\n"
+                f"The error is DEEP in the proof body (line {line_no_display}). "
+                f"The theorem statement and imports are correct.\n\n"
+                f"STRICT RULES — violation causes automatic failure:\n"
+                f"1. Do NOT use write_new_file — the file must NOT be deleted or overwritten.\n"
+                f"2. Use edit_file_patch with a <<<SEARCH>>>/<<<REPLACE>>> block to replace "
+                f"   the broken tactic/term at line {line_no_display} with:\n"
+                f"     sorry -- LOCAL_ERROR: {err_summary}\n"
+                f"   This keeps the file compilable so the next attempt can close this sorry.\n"
+                f"3. SEARCH must be copied verbatim from the current file shown above.\n"
+                f"4. Output ONLY the patch block — no prose explanation needed."
+            )
+            continue
+
         # Priority 4: Normal Surgeon Mode — proof body error.
-        line_match = re.search(r":(\d+):\d+|line\s+(\d+)", verify_text, flags=re.IGNORECASE)
-        line_no = line_match.group(1) or line_match.group(2) if line_match else "unknown"
+        # Use the line number already extracted above (err_line_no / line_no_display).
 
         # Prepend patch-mismatch context when SEARCH block failed to match.
         mismatch_prefix = ""
@@ -911,10 +988,12 @@ def phase3_prove(
             mismatch_prefix
             + f"Attempt {attempt} failed.\n"
             f"Build exit code: {exit_code} | Sorry count: {last_sorry_count}\n"
+            f"Error first occurs at line {line_no_display}.\n"
             f"=== FULL LEAN ERROR OUTPUT ===\n```\n{verify_text[:4000]}\n```\n"
             f"\n=== AGENT3'S CURRENT FILE ({target_file}) ===\n"
             f"```lean\n{current_code[:3000]}\n```\n\n"
-            "SURGEON MODE: Diagnose the root cause of the Lean error above. "
+            f"SURGEON MODE: Diagnose the root cause of the Lean error above. "
+            f"Focus on line {line_no_display} and its surrounding context. "
             "Then output one PATCH block per error in the <<<SEARCH>>>/<<<REPLACE>>> format. "
             "SEARCH must be copied verbatim from the current file (exact whitespace/indentation). "
             "Write the exact correct Mathlib 4 code in REPLACE — no vague suggestions. "
