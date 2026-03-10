@@ -46,11 +46,11 @@ PROVIDER_URLS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 AGENT_CONFIGS: dict[str, dict] = {
-    "orchestrator":  {"provider": "qwen",     "model": "qwen3-max",          "max_tokens": 32768},
-    "planner":       {"provider": "qwen",     "model": "qwen3-max",          "max_tokens": 32768},
-    "sorry_closer":  {"provider": "deepseek", "model": "deepseek-reasoner",  "max_tokens": 32768},
-    "persister":     {"provider": "qwen",     "model": "qwen3-max",          "max_tokens": 32768},
-    "diagnostician": {"provider": "qwen",     "model": "qwen3-max",          "max_tokens": 16384},
+    "orchestrator":  {"provider": "qwen",     "model": "qwen3-max",     "temperature": 0.0   ,  "max_tokens": 32768},
+    "planner":       {"provider": "qwen",     "model": "qwen3-max",       "temperature": 0.0,   "max_tokens": 32768},
+    "sorry_closer":  {"provider": "deepseek", "model": "deepseek-reasoner", "temperature": 0.0,   "max_tokens": 32768},
+    "persister":     {"provider": "qwen",     "model": "qwen3-max",          "temperature": 0.0,   "max_tokens": 32768},
+    "diagnostician": {"provider": "qwen",     "model": "qwen3-max",          "temperature": 0.0,   "max_tokens": 16384},
 }
 
 # ---------------------------------------------------------------------------

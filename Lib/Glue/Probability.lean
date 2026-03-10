@@ -154,20 +154,21 @@ in terms of a stochastic gradient oracle `gradL : E → S → E`, see
 theorem integrable_sq_norm_of_pointwise_bound
     {β : Type*} [NormedAddCommGroup β]
     {f : S → β} {G : ℝ} {ν : Measure S} [IsProbabilityMeasure ν]
+    (hf_meas : AEStronglyMeasurable f ν)
     (hbounded : ∀ s, ‖f s‖ ≤ G) :
     Integrable (fun s => ‖f s‖ ^ 2) ν ∧ ∫ s, ‖f s‖ ^ 2 ∂ν ≤ G ^ 2 := by
+  have hbound : ∀ s, ‖‖f s‖ ^ 2‖ ≤ ‖G ^ 2‖ := fun s => by
+    rw [Real.norm_of_nonneg (sq_nonneg _), Real.norm_of_nonneg (sq_nonneg G)]
+    exact pow_le_pow_left₀ (norm_nonneg _) (hbounded s) 2
+  have hint : Integrable (fun s => ‖f s‖ ^ 2) ν :=
+    Integrable.mono (integrable_const (G ^ 2)) (hf_meas.norm.pow 2)
+      (Filter.Eventually.of_forall hbound)
   constructor
-  · apply Integrable.mono (integrable_const (G ^ 2))
-    · intro s
-      exact pow_le_pow_left₀ (norm_nonneg _) (hbounded s) 2
-    · exact integrable_const _
+  · exact hint
   · calc
       ∫ s, ‖f s‖ ^ 2 ∂ν
-        ≤ ∫ s, G ^ 2 ∂ν := integral_mono (by
-            apply Integrable.mono (integrable_const _) _ _
-            · intro s; exact pow_le_pow_left₀ (norm_nonneg _) (hbounded s) 2
-            · exact integrable_const _)
-          (integrable_const _) (fun s => pow_le_pow_left₀ (norm_nonneg _) (hbounded s) 2)
+        ≤ ∫ s, G ^ 2 ∂ν := integral_mono hint (integrable_const _)
+            (fun s => pow_le_pow_left₀ (norm_nonneg _) (hbounded s) 2)
       _ = G ^ 2 := by simp [integral_const, probReal_univ]
 
 /-- From a uniform pointwise oracle bound `‖gradL w s‖ ≤ G`, derive the
@@ -186,9 +187,12 @@ Used in: `Subgradient convex convergence` (Algorithms/SubgradientMethod.lean, St
 Used in: any algorithm with a uniformly bounded stochastic oracle (clipped SGD, etc.) -/
 theorem hasBoundedVariance_of_pointwise_bound
     {gradL : E → S → E} {G : ℝ} {ν : Measure S} [IsProbabilityMeasure ν]
+    (hgL_meas : Measurable (Function.uncurry gradL))
     (hbounded : ∀ w s, ‖gradL w s‖ ≤ G) :
     ∀ w, Integrable (fun s => ‖gradL w s‖ ^ 2) ν ∧ ∫ s, ‖gradL w s‖ ^ 2 ∂ν ≤ G ^ 2 :=
-  fun w => integrable_sq_norm_of_pointwise_bound (fun s => hbounded w s)
+  fun w => integrable_sq_norm_of_pointwise_bound
+    ((hgL_meas.comp (measurable_const.prodMk measurable_id)).aestronglyMeasurable)
+    (fun s => hbounded w s)
 
 /-- SVRG variance-reduction inequality (finite-sum / uniform-sampling form).
 

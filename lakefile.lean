@@ -20,5 +20,6 @@ lean_lib Main where
 -- Algorithm layer: concrete SGD convergence proofs built on Layer1 meta-theorems
 -- Depends on Main (for SGDSetup, sgdProcess, etc.) which itself depends on StochOptLib
 lean_lib SGDAlgorithms where
-  roots := #[`Algorithms.SGD]
+  roots := #[`Algorithms.SGD, `Algorithms.WeightDecaySGD,
+             `Algorithms.ProjectedGD,  `Algorithms.SVRG, `Algorithms.SubgradientMethod]
   extraDepTargets := #[`Main]

@@ -1,0 +1,25 @@
+{
+  "SVRGOuterLoop": {
+    "algorithm": "SVRGOuterLoop",
+    "update_rule": "w_{k+1} = InnerLoop(w_k, m, η, μ); full rate: E[‖w_K - w*‖²] ≤ (1-ημ)^{mK} ‖w_0-w*‖²",
+    "proof_sketch": "Archetype B: epoch contraction via inner-loop strongly-convex rate + two-level telescope over K epochs using svrg_variance_reduction",
+    "archetype": "B",
+    "glue_required": [
+      {
+        "symbol": "svrg_variance_reduction",
+        "file": "Lib/Glue/Probability.lean",
+        "reason": "variance reduction bound across inner loop"
+      },
+      {
+        "symbol": "sgdProcess_indepFun_xi",
+        "file": "Main.lean",
+        "reason": "nested independence: snapshot independent of inner samples"
+      }
+    ],
+    "assumptions_primary": {
+      "strongly_convex": "μ-strongly convex f",
+      "inner_steps": "m inner steps per epoch"
+    },
+    "assumptions_alternatives": []
+  }
+}

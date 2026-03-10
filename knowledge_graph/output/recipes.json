@@ -1,0 +1,632 @@
+{
+  "meta": {
+    "built_at": "2026-03-09T17:12:15+00:00",
+    "algorithms_count": 7
+  },
+  "recipes": {
+    "SGD": {
+      "main_instruction": {
+        "algorithm": "SGD",
+        "update_rule": "(1/T) · Σ_{t<T} E[‖∇f(wt)‖²] ≤ 2(f(w₀)−f*) / (η·T) + η·L·σ²",
+        "proof_sketch": "sgd_to_hyps setup t hgL (hsmooth.continuous.measurable) hunb →  → (h_int_f t) (h_int_f (t+1)) (h_int_inner t) (h_int_sq t)",
+        "archetype": "A"
+      },
+      "glue_required": [],
+      "difficulty": {
+        "score": 0.4,
+        "sources": {
+          "leverage": 0.0,
+          "retries": 0,
+          "lib_coverage": null
+        },
+        "estimated_retries": 1
+      },
+      "assumptions": {
+        "primary": {},
+        "alternatives": []
+      },
+      "graph_position": {
+        "depends_on": [],
+        "depended_by": [],
+        "depth": 3,
+        "prerequisites": [],
+        "similar_to": []
+      }
+    },
+    "ClippedSGD": {
+      "main_instruction": {
+        "algorithm": "ClippedSGD",
+        "update_rule": "$$ \\frac{1}{T}\\sum_{t<T} (\\mathbb{E}[f(w_t)] - f^*) \\leq \\frac{\\|w_0 - w^*\\|^2}{2\\eta T} + \\delta R + \\frac{\\eta G^2}{2} $$",
+        "proof_sketch": "`norm_sq_sgd_step` (pointwise norm expansion) → bias decomposition (conditional expectation measurability via `measurable_integral_of_measurable_prod`) → `convex_inner_lower_bound` (convex FOC) → `integral_mono` (bias bound) → `expectation_norm_sq_gradL_bound` (variance bound) → `Finset.sum_range_sub` (telescoping)",
+        "archetype": "B"
+      },
+      "glue_required": [
+        {
+          "symbol": "clip_G.bounded",
+          "file": "Algorithms/ClippedSGD.lean",
+          "reason": "Algorithms/ClippedSGD.lean",
+          "step": null
+        },
+        {
+          "symbol": "clip_G.measurable",
+          "file": "Algorithms/ClippedSGD.lean",
+          "reason": "Algorithms/ClippedSGD.lean",
+          "step": null
+        },
+        {
+          "symbol": "norm_sq_sgd_step",
+          "file": "Lib/Glue/Algebra.lean",
+          "reason": "Lib/Glue/Algebra.lean",
+          "step": null
+        },
+        {
+          "symbol": "sgdProcess_indepFun_xi",
+          "file": "Main.lean",
+          "reason": "Main.lean",
+          "step": null
+        },
+        {
+          "symbol": "sgdProcess_measurable",
+          "file": "Main.lean",
+          "reason": "Main.lean",
+          "step": null
+        },
+        {
+          "symbol": "hasBoundedVariance_of_pointwise_bound",
+          "file": "Lib/Glue/Probability.lean",
+          "reason": "Lib/Glue/Probability.lean",
+          "step": null
+        },
+        {
+          "symbol": "expectation_norm_sq_gradL_bound",
+          "file": "Lib/Layer0/IndepExpect.lean",
+          "reason": "Lib/Layer0/IndepExpect.lean",
+          "step": null
+        },
+        {
+          "symbol": "convex_inner_lower_bound",
+          "file": "Lib/Layer0/ConvexFOC.lean",
+          "reason": "Lib/Layer0/ConvexFOC.lean",
+          "step": null
+        },
+        {
+          "symbol": "integral_inner",
+          "file": "Mathlib.MeasureTheory.Integral.Bochner.Basic",
+          "reason": "Mathlib.MeasureTheory.Integral.Bochner.Basic",
+          "step": null
+        },
+        {
+          "symbol": "integral_mono",
+          "file": "Mathlib.MeasureTheory.Integral.Bochner.Basic",
+          "reason": "Mathlib.MeasureTheory.Integral.Bochner.Basic",
+          "step": null
+        },
+        {
+          "symbol": "Finset.sum_range_sub",
+          "file": "Mathlib.Data.Finset.Basic",
+          "reason": "Mathlib.Data.Finset.Basic",
+          "step": null
+        }
+      ],
+      "difficulty": {
+        "score": 0.125,
+        "sources": {
+          "leverage": 0.6875,
+          "retries": 1,
+          "lib_coverage": null
+        },
+        "estimated_retries": 2
+      },
+      "assumptions": {
+        "primary": {},
+        "alternatives": []
+      },
+      "graph_position": {
+        "depends_on": [
+          "clip_G.bounded",
+          "sgdProcess_measurable",
+          "expectation_norm_sq_gradL_bound",
+          "convex_inner_lower_bound",
+          "integral_mono",
+          "hasBoundedVariance_of_pointwise_bound",
+          "norm_sq_sgd_step",
+          "integral_inner",
+          "sgdProcess_indepFun_xi",
+          "Finset.sum_range_sub",
+          "clip_G.measurable"
+        ],
+        "depended_by": [],
+        "depth": 3,
+        "prerequisites": [],
+        "similar_to": []
+      }
+    },
+    "SubgradientMethod": {
+      "main_instruction": {
+        "algorithm": "SubgradientMethod",
+        "update_rule": "$\\frac{1}{T} \\sum_{t<T} (\\mathbb{E}[f(w_t)] - f(w^*)) \\leq \\frac{\\|w_0 - w^*\\|^2}{2\\eta T} + \\frac{\\eta G^2}{2}$",
+        "proof_sketch": "`norm_sq_sgd_step` (pointwise norm expansion) → `mem_subdifferential_iff` (subgradient inequality) → `integral_mono` (integrate bound) → `expectation_norm_sq_gradL_bound` (variance bound) → `Finset.sum_range_sub` (telescoping)",
+        "archetype": "B"
+      },
+      "glue_required": [
+        {
+          "symbol": "sgdProcess",
+          "file": "Main.lean",
+          "reason": "Main.lean",
+          "step": null
+        },
+        {
+          "symbol": "sgdProcess_measurable",
+          "file": "Main.lean",
+          "reason": "Main.lean",
+          "step": null
+        },
+        {
+          "symbol": "sgdProcess_indepFun_xi",
+          "file": "Main.lean",
+          "reason": "Main.lean",
+          "step": null
+        },
+        {
+          "symbol": "norm_sq_sgd_step",
+          "file": "Lib/Glue/Algebra.lean",
+          "reason": "Lib/Glue/Algebra.lean",
+          "step": null
+        },
+        {
+          "symbol": "expectation_norm_sq_gradL_bound",
+          "file": "Lib/Layer0/IndepExpect.lean",
+          "reason": "Lib/Layer0/IndepExpect.lean",
+          "step": null
+        },
+        {
+          "symbol": "integrable_norm_sq_iterate_comp",
+          "file": "Lib/Glue/Measurable.lean",
+          "reason": "Lib/Glue/Measurable.lean",
+          "step": null
+        },
+        {
+          "symbol": "hasBoundedVariance_of_pointwise_bound",
+          "file": "Lib/Glue/Probability.lean",
+          "reason": "Lib/Glue/Probability.lean",
+          "step": null
+        },
+        {
+          "symbol": "mem_subdifferential_iff",
+          "file": "Mathlib",
+          "reason": "Mathlib",
+          "step": null
+        },
+        {
+          "symbol": "Field",
+          "file": "Type",
+          "reason": "Type",
+          "step": null
+        },
+        {
+          "symbol": "P",
+          "file": "Measure Ω",
+          "reason": "Measure Ω",
+          "step": null
+        },
+        {
+          "symbol": "hP",
+          "file": "IsProbabilityMeasure P",
+          "reason": "IsProbabilityMeasure P",
+          "step": null
+        },
+        {
+          "symbol": "ν",
+          "file": "Measure S",
+          "reason": "Measure S",
+          "step": null
+        },
+        {
+          "symbol": "wt",
+          "file": "Ω → E",
+          "reason": "Ω → E",
+          "step": null
+        },
+        {
+          "symbol": "ξt",
+          "file": "Ω → S",
+          "reason": "Ω → S",
+          "step": null
+        },
+        {
+          "symbol": "gradL",
+          "file": "E → S → E",
+          "reason": "E → S → E",
+          "step": null
+        },
+        {
+          "symbol": "gradF",
+          "file": "E → E",
+          "reason": "E → E",
+          "step": null
+        },
+        {
+          "symbol": "η",
+          "file": "ℝ",
+          "reason": "ℝ",
+          "step": null
+        },
+        {
+          "symbol": "h_indep",
+          "file": "IndepFun wt ξt P",
+          "reason": "IndepFun wt ξt P",
+          "step": null
+        },
+        {
+          "symbol": "h_dist",
+          "file": "Mea",
+          "reason": "Mea",
+          "step": null
+        }
+      ],
+      "difficulty": {
+        "score": 0.15,
+        "sources": {
+          "leverage": 0.625,
+          "retries": 1,
+          "lib_coverage": null
+        },
+        "estimated_retries": 2
+      },
+      "assumptions": {
+        "primary": {},
+        "alternatives": []
+      },
+      "graph_position": {
+        "depends_on": [
+          "gradF",
+          "wt",
+          "gradL",
+          "sgdProcess",
+          "sgdProcess_measurable",
+          "expectation_norm_sq_gradL_bound",
+          "hasBoundedVariance_of_pointwise_bound",
+          "sgdProcess_indepFun_xi",
+          "h_dist",
+          "h_indep",
+          "η",
+          "integrable_norm_sq_iterate_comp",
+          "Field",
+          "hP",
+          "mem_subdifferential_iff",
+          "P",
+          "ξt",
+          "norm_sq_sgd_step",
+          "ν"
+        ],
+        "depended_by": [],
+        "depth": 3,
+        "prerequisites": [],
+        "similar_to": []
+      }
+    },
+    "WeightDecaySGD": {
+      "main_instruction": {
+        "algorithm": "WeightDecaySGD",
+        "update_rule": "(1/T) · Σ_{t<T} E[‖∇f_eff(wt)‖²] ≤ 2(f(w₀)−f*) / (η·T) + η·L·σ²",
+        "proof_sketch": "weight_decay_convergence_nonconvex_v2 → simpa → sgd_convergence_nonconvex_v2 → sgd_to_hyps → stochastic_descent_nonconvex'",
+        "archetype": "A"
+      },
+      "glue_required": [
+        {
+          "symbol": "effectiveSGDSetup` reframe",
+          "file": "Algorithms/WeightDecaySGD.lean",
+          "reason": "Algorithms/WeightDecaySGD.lean",
+          "step": null
+        },
+        {
+          "symbol": "sgd_convergence_nonconvex_v2",
+          "file": "Algorithms/SGD.lean",
+          "reason": "Algorithms/SGD.lean",
+          "step": null
+        },
+        {
+          "symbol": "sgd_convergence_convex_v2",
+          "file": "Algorithms/SGD.lean",
+          "reason": "Algorithms/SGD.lean",
+          "step": null
+        },
+        {
+          "symbol": "sgd_convergence_strongly_convex_v2",
+          "file": "Algorithms/SGD.lean",
+          "reason": "Algorithms/SGD.lean",
+          "step": null
+        },
+        {
+          "symbol": "sgd_to_hyps",
+          "file": "Algorithms/SGD.lean",
+          "reason": "Algorithms/SGD.lean",
+          "step": null
+        },
+        {
+          "symbol": "stochastic_descent_nonconvex'",
+          "file": "Lib/Layer1/StochasticDescent.lean",
+          "reason": "Lib/Layer1/StochasticDescent.lean",
+          "step": null
+        },
+        {
+          "symbol": "stochastic_descent_convex'",
+          "file": "Lib/Layer1/StochasticDescent.lean",
+          "reason": "Lib/Layer1/StochasticDescent.lean",
+          "step": null
+        },
+        {
+          "symbol": "stochastic_descent_strongly_convex'",
+          "file": "Lib/Layer1/StochasticDescent.lean",
+          "reason": "Lib/Layer1/StochasticDescent.lean",
+          "step": null
+        },
+        {
+          "symbol": "measurable_effGradL",
+          "file": "Algorithms/WeightDecaySGD.lean",
+          "reason": "Algorithms/WeightDecaySGD.lean",
+          "step": null
+        },
+        {
+          "symbol": "unbiased_effGrad_of_unbiased",
+          "file": "Algorithms/WeightDecaySGD.lean",
+          "reason": "Algorithms/WeightDecaySGD.lean",
+          "step": null
+        }
+      ],
+      "difficulty": {
+        "score": 0.0889,
+        "sources": {
+          "leverage": 0.7777777777777778,
+          "retries": 0,
+          "lib_coverage": null
+        },
+        "estimated_retries": 1
+      },
+      "assumptions": {
+        "primary": {},
+        "alternatives": []
+      },
+      "graph_position": {
+        "depends_on": [
+          "stochastic_descent_convex'",
+          "unbiased_effGrad_of_unbiased",
+          "stochastic_descent_nonconvex'",
+          "stochastic_descent_strongly_convex'",
+          "effectiveSGDSetup` reframe",
+          "sgd_to_hyps",
+          "sgd_convergence_nonconvex_v2",
+          "measurable_effGradL",
+          "sgd_convergence_strongly_convex_v2",
+          "sgd_convergence_convex_v2"
+        ],
+        "depended_by": [],
+        "depth": 3,
+        "prerequisites": [],
+        "similar_to": []
+      }
+    },
+    "ProjectedGD": {
+      "main_instruction": {
+        "algorithm": "ProjectedGD",
+        "update_rule": "(1/T) · Σ_{t<T} (E[f(w_t)] − f(w*)) ≤ ‖w₀ − w*‖² / (2ηT) + ησ²/2",
+        "proof_sketch": "pgd_convergence_convex_v2 → proj_nonexp_sq + integral_mono [actual step: E[‖w_{t+1}−w*‖²] ≤ E[‖virtual_t − w*‖²]] → stochastic_descent_convex' (pgd_to_hyps setup t ...) [virtual step: E[‖virtual_t − w*‖²] ≤ E[‖w_t−w*‖²] − 2η·gap + η²σ²] →",
+        "archetype": "B"
+      },
+      "glue_required": [
+        {
+          "symbol": "stochastic_descent_convex'",
+          "file": "Lib/Layer1/StochasticDescent.lean",
+          "reason": "Lib/Layer1/StochasticDescent.lean",
+          "step": null
+        },
+        {
+          "symbol": "expectation_inner_gradL_eq",
+          "file": "Lib/Layer0/IndepExpect.lean",
+          "reason": "Lib/Layer0/IndepExpect.lean",
+          "step": null
+        },
+        {
+          "symbol": "expectation_norm_sq_gradL_bound",
+          "file": "Lib/Layer0/IndepExpect.lean",
+          "reason": "Lib/Layer0/IndepExpect.lean",
+          "step": null
+        },
+        {
+          "symbol": "convex_inner_lower_bound",
+          "file": "Lib/Layer0/ConvexFOC.lean",
+          "reason": "Lib/Layer0/ConvexFOC.lean",
+          "step": null
+        },
+        {
+          "symbol": "norm_sq_sgd_step",
+          "file": "Lib/Glue/Algebra.lean",
+          "reason": "Lib/Glue/Algebra.lean",
+          "step": null
+        },
+        {
+          "symbol": "integrable_norm_sq_of_bounded_var",
+          "file": "Lib/Glue/Probability.lean",
+          "reason": "Lib/Glue/Probability.lean",
+          "step": null
+        },
+        {
+          "symbol": "integrable_inner_of_sq_integrable",
+          "file": "Lib/Glue/Probability.lean",
+          "reason": "Lib/Glue/Probability.lean",
+          "step": null
+        },
+        {
+          "symbol": "integrable_norm_sq_iterate_comp",
+          "file": "Lib/Glue/Measurable.lean",
+          "reason": "Lib/Glue/Measurable.lean",
+          "step": null
+        },
+        {
+          "symbol": "sgdFiltration",
+          "file": "Main.lean",
+          "reason": "Main.lean",
+          "step": null
+        },
+        {
+          "symbol": "proj_nonexp_sq",
+          "file": "Lib/Glue/Algebra.lean",
+          "reason": "Lib/Glue/Algebra.lean",
+          "step": null
+        },
+        {
+          "symbol": "pgd_to_hyps",
+          "file": "Algorithms/ProjectedGD.lean",
+          "reason": "Algorithms/ProjectedGD.lean",
+          "step": null
+        }
+      ],
+      "difficulty": {
+        "score": 0.0727,
+        "sources": {
+          "leverage": 0.8181818181818182,
+          "retries": 0,
+          "lib_coverage": null
+        },
+        "estimated_retries": 1
+      },
+      "assumptions": {
+        "primary": {},
+        "alternatives": []
+      },
+      "graph_position": {
+        "depends_on": [
+          "proj_nonexp_sq",
+          "stochastic_descent_convex'",
+          "integrable_inner_of_sq_integrable",
+          "expectation_norm_sq_gradL_bound",
+          "convex_inner_lower_bound",
+          "pgd_to_hyps",
+          "norm_sq_sgd_step",
+          "integrable_norm_sq_of_bounded_var",
+          "integrable_norm_sq_iterate_comp",
+          "expectation_inner_gradL_eq",
+          "sgdFiltration"
+        ],
+        "depended_by": [],
+        "depth": 3,
+        "prerequisites": [],
+        "similar_to": []
+      }
+    },
+    "SVRG": {
+      "main_instruction": {
+        "algorithm": "SVRG",
+        "update_rule": "E[‖w_T−w*‖²] ≤ (1−ημ)^T · ‖w₀−w*‖² + η·σeff²/μ",
+        "proof_sketch": "svrg_convergence_inner_strongly_convex → effectiveSGDSetup (svrgOracle packaged as plain SGDSetup) → sgd_convergence_strongly_convex_v2 (via simpa) → sgd_to_hyps → stochastic_descent_strongly_convex'",
+        "archetype": "A"
+      },
+      "glue_required": [
+        {
+          "symbol": "effectiveSGDSetup` packaging",
+          "file": "Algorithms/SVRG.lean",
+          "reason": "Algorithms/SVRG.lean",
+          "step": null
+        },
+        {
+          "symbol": "sgd_convergence_strongly_convex_v2",
+          "file": "Algorithms/SGD.lean",
+          "reason": "Algorithms/SGD.lean",
+          "step": null
+        },
+        {
+          "symbol": "sgd_to_hyps",
+          "file": "Algorithms/SGD.lean",
+          "reason": "Algorithms/SGD.lean",
+          "step": null
+        },
+        {
+          "symbol": "stochastic_descent_strongly_convex'",
+          "file": "Lib/Layer1/StochasticDescent.lean",
+          "reason": "Lib/Layer1/StochasticDescent.lean",
+          "step": null
+        },
+        {
+          "symbol": "svrg_variance_reduction",
+          "file": "Lib/Glue/Probability.lean",
+          "reason": "Lib/Glue/Probability.lean",
+          "step": null
+        }
+      ],
+      "difficulty": {
+        "score": 0.2667,
+        "sources": {
+          "leverage": 0.3333333333333333,
+          "retries": 0,
+          "lib_coverage": null
+        },
+        "estimated_retries": 1
+      },
+      "assumptions": {
+        "primary": {},
+        "alternatives": []
+      },
+      "graph_position": {
+        "depends_on": [
+          "effectiveSGDSetup` packaging",
+          "stochastic_descent_strongly_convex'",
+          "sgd_to_hyps",
+          "svrg_variance_reduction",
+          "sgd_convergence_strongly_convex_v2"
+        ],
+        "depended_by": [],
+        "depth": 3,
+        "prerequisites": [],
+        "similar_to": []
+      }
+    },
+    "SVRGOuterLoop": {
+      "main_instruction": {
+        "algorithm": "SVRGOuterLoop",
+        "update_rule": "w_{k+1} = InnerLoop(w_k, m, η, μ); full rate: E[‖w_K - w*‖²] ≤ (1-ημ)^{mK} ‖w_0-w*‖²",
+        "proof_sketch": "Archetype B: epoch contraction via inner-loop strongly-convex rate + two-level telescope over K epochs using svrg_variance_reduction",
+        "archetype": "B"
+      },
+      "glue_required": [
+        {
+          "symbol": "svrg_variance_reduction",
+          "file": "Lib/Glue/Probability.lean",
+          "reason": "variance reduction bound across inner loop",
+          "step": null
+        },
+        {
+          "symbol": "sgdProcess_indepFun_xi",
+          "file": "nested independence: snapshot independent of inner samples",
+          "reason": "nested independence: snapshot independent of inner samples",
+          "step": null
+        }
+      ],
+      "difficulty": {
+        "score": 0.4,
+        "sources": {
+          "leverage": 0.0,
+          "retries": 0,
+          "lib_coverage": null
+        },
+        "estimated_retries": 1
+      },
+      "assumptions": {
+        "primary": {
+          "strongly_convex": "μ-strongly convex f",
+          "inner_steps": "m inner steps per epoch"
+        },
+        "alternatives": []
+      },
+      "graph_position": {
+        "depends_on": [
+          "svrg_variance_reduction",
+          "sgdProcess_indepFun_xi"
+        ],
+        "depended_by": [],
+        "depth": 3,
+        "prerequisites": [],
+        "similar_to": []
+      }
+    }
+  }
+}

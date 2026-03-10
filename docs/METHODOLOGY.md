@@ -35,6 +35,17 @@ root causes. Correctly diagnosing the cause determines the fix strategy.
 
 ## 2. Stub-Probe Protocol
 
+### Phase 3 — Clipped SGD (complete)
+
+**Output:** Convex convergence rate for clipped SGD with explicit bias handling:
+$$
+\frac{1}{T}\sum_{t<T} (\mathbb{E}[f(w_t)] - f^*) \leq \frac{\|w_0 - w^*\|^2}{2\eta T} + \delta R + \frac{\eta G^2}{2}
+$$
+
+**Method:** Archetype B — clipping introduces bias relative to the true gradient; proof explicitly bounds the bias term $\delta = \sup_w \|\mathbb{E}[\text{clip}_G(\text{gradL}(w,\cdot))] - \nabla f(w)\|$ using a domain constraint $\|w_t - w^*\| \leq R$. The rate includes an additive $\delta R$ term reflecting bias-domain coupling. Reuses `sgdProcess` infrastructure, `norm_sq_sgd_step`, `hasBoundedVariance_of_pointwise_bound` (Pattern I), and convex FOC tools. Critical innovation: bias decomposition via conditional expectation measurability (`measurable_integral_of_measurable_prod`) and explicit bias-domain coupling in the rate.
+
+**Leverage score:** reused existing components = 11; new algorithm-specific items = 5; reuse ratio = `$11/(11+5) = 68.8\%$`.
+
 ### Phase 3 — Subgradient Method (complete)
 
 **Output:** Convex convergence rate for non-smooth convex functions:
@@ -58,53 +69,6 @@ $$
 **Reuse estimate:** High — reuses SVRG inner-loop infrastructure, Layer 1 meta-theorems, independence factorization patterns (Pattern D), and `hasBoundedVariance_of_pointwise_bound`.
 **Critical dependency:** `svrg_variance_reduction` lemma (currently pending proof in `Lib/Glue/Probability.lean`).
 **Recommended next probe:** SVRG outer loop (maximizes reuse of existing infrastructure while exposing nested independence patterns).
-
-
-### Phase 3 — Subgradient Method (complete)
-
-**Output:** Convex convergence rate for non-smooth convex functions:
-$$
-\frac{1}{T}\sum_{t<T} (\mathbb{E}[f(w_t)] - f^*) \leq \frac{\|w_0 - w^*\|^2}{2\eta T} + \frac{\eta G^2}{2}
-$$
-
-**Method:** Archetype B — update syntax matches SGD but oracle provides subgradients (not unbiased gradient estimates). Proof derives one-step bound directly using pointwise subgradient inequality (`mem_subdifferential_iff`) and integrates via `integral_mono`, bypassing Layer 1 meta-theorems entirely. Reuses `sgdProcess` infrastructure and key Glue lemmas (`norm_sq_sgd_step`, `expectation_norm_sq_gradL_bound`, `integrable_norm_sq_iterate_comp`). After glue extraction, also reuses `hasBoundedVariance_of_pointwise_bound`.
-
-**Leverage score:** reused existing components = 10; new algorithm-specific items = 6 (`SubgradientSetup`, `process` alias, 3 process infrastructure lemmas, convergence theorem); reuse ratio = `$10/(10+6) = 62.5\%$` (improved from initial 60.0% estimate via glue extraction).
-
-### Phase 4 — SVRG Outer Loop (next)
-
-**Goal:** Formalize outer-loop snapshot update schedule and derive full SVRG convergence rate over multiple epochs.
-
-**Predicted gaps:**
-- Nested independence: snapshot `$w_k$` independent of inner-loop samples `$\xi_{k,t}$`
-- Epoch-wise expectation chaining: `$\mathbb{E}[\|w_{k+1}-w^*\|^2] \leq (1-\eta\mu)^m \mathbb{E}[\|w_k-w^*\|^2] + \text{variance term}$`
-- Two-level telescoping: combine inner-loop contraction with outer-loop snapshot variance reduction
-
-**Reuse estimate:** High — reuses SVRG inner-loop infrastructure, Layer 1 meta-theorems, independence factorization patterns (Pattern D), and newly extracted `hasBoundedVariance_of_pointwise_bound`.
-**Critical dependency:** `svrg_variance_reduction` lemma (currently pending proof in `Lib/Glue/Probability.lean`).
-
-
-### Phase 3 — Subgradient Method (complete)
-
-**Output:** Convex convergence rate for non-smooth convex functions:
-$$
-\frac{1}{T}\sum_{t<T} (\mathbb{E}[f(w_t)] - f^*) \leq \frac{\|w_0 - w^*\|^2}{2\eta T} + \frac{\eta G^2}{2}
-$$
-
-**Method:** Archetype B — update syntax matches SGD but oracle provides subgradients (not unbiased gradient estimates). Proof derives one-step bound directly using pointwise subgradient inequality (`mem_subdifferential_iff`) and integrates via `integral_mono`, bypassing Layer 1 meta-theorems entirely. Reuses `sgdProcess` infrastructure and key Glue lemmas (`norm_sq_sgd_step`, `expectation_norm_sq_gradL_bound`). No new Glue lemmas required.
-
-**Leverage score:** reused existing components = 9; new algorithm-specific items = 6 (`SubgradientSetup`, `process` alias, 3 process infrastructure lemmas, convergence theorem); reuse ratio = `$9/(9+6) = 60.0\%$`.
-
-### Phase 4 — SVRG Outer Loop (next)
-
-**Goal:** Formalize outer-loop snapshot update schedule and derive full SVRG convergence rate over multiple epochs.
-
-**Predicted gaps:**
-- Nested independence: snapshot `$w_k$` independent of inner-loop samples `$\xi_{k,t}$`
-- Epoch-wise expectation chaining: `$\mathbb{E}[\|w_{k+1}-w^*\|^2] \leq (1-\eta\mu)^m \mathbb{E}[\|w_k-w^*\|^2] + \text{variance term}$`
-- Two-level telescoping: combine inner-loop contraction with outer-loop snapshot variance reduction
-
-**Reuse estimate:** High — reuses SVRG inner-loop infrastructure, Layer 1 meta-theorems, and independence factorization patterns (Pattern D). Critical dependency: `svrg_variance_reduction` lemma (currently pending proof in `Lib/Glue/Probability.lean`).
 
 
 The Stub-Probe method is the core workflow for discovering and classifying gaps.

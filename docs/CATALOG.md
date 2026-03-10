@@ -608,6 +608,69 @@ would give measurability of `ω ↦ wt(ω) − w*`, not the pure `w ↦ w − w*
 
 ## Algorithm Layer (Layer 2) — `Algorithms/SGD.lean`
 
+## Algorithm Layer (Layer 2) — `Algorithms/ClippedSGD.lean`
+
+This file formalizes clipped stochastic gradient descent (Archetype B). The update rule applies radial clipping to the stochastic gradient oracle before the step: $w_{t+1} = w_t - \eta \cdot \text{clip}_G(\text{gradL}(w_t, \xi_t))$. Clipping introduces bias relative to the true gradient, which is explicitly bounded via a domain constraint and a bias parameter $\delta$. The convergence rate includes an additional $\delta R$ term reflecting this bias-domain coupling.
+
+### `ClippedSGDSetup`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/ClippedSGD.lean` |
+| Kind | `structure` |
+| Layer | 2 |
+| **Critical distinction** | Wraps `SGDSetup` with clipping threshold `G` and positivity proof `hG_pos`; does not alter sampling infrastructure |
+
+**Fields:**
+- `toSGDSetup : SGDSetup E S Ω` — base SGD data (oracle, samples, step sizes)
+- `G : ℝ` — clipping threshold (norm bound for clipped gradients)
+- `hG_pos : 0 < G` — positivity proof (required for measurability and boundedness)
+
+### `clip_G` infrastructure
+
+| Component | Role | Gap level | Used in |
+|---|---|---|---|
+| `clip_G` | Radial clipping operator: $\text{clip}_G(g) = g$ if $\|g\|\leq G$, else $G \cdot g/\|g\|$ | — | `effGradL` definition |
+| `clip_G.bounded` | Pointwise norm bound: $\|\text{clip}_G(g)\| \leq G$ | Level 2 (case analysis + norm algebra) | `hvar_eff` (deriving bounded variance) |
+| `clip_G.measurable` | Measurability of clipping operator | Level 2 (measurable_if composition) | `measurable_effGradL` (oracle measurability chain) |
+
+### `ClippedSGDSetup` bridge lemmas
+
+| Lemma | Purpose | Gap level | Used in |
+|---|---|---|---|
+| `measurable_effGradL` | Transfer measurability from base oracle to clipped oracle | Level 2 (composition: `clip_G.measurable` + base oracle measurability) | `sgdProcess_measurable` bridge for clipped process |
+| `hvar_eff` | Derive bounded variance for clipped oracle from pointwise bound | Level 2 (Pattern I: pointwise bound → bounded variance) | `clipped_sgd_convergence_convex_v2` Step 5 (variance bound) |
+
+### `clipped_sgd_convergence_convex_v2`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/ClippedSGD.lean` |
+| Layer | 2 |
+| Conclusion | $\frac{1}{T} \sum_{t<T} (\mathbb{E}[f(w_t)] - f(w^*)) \leq \frac{\|w_0 - w^*\|^2}{2\eta T} + \delta R + \frac{\eta G^2}{2}$ |
+| Archetype | B — novel bias handling prevents reduction to plain SGD; requires explicit bias-domain coupling ($\delta R$ term) |
+| Call chain | `norm_sq_sgd_step` (pointwise norm expansion) → bias decomposition (conditional expectation measurability via `measurable_integral_of_measurable_prod`) → `convex_inner_lower_bound` (convex FOC) → `integral_mono` (bias bound) → `expectation_norm_sq_gradL_bound` (variance bound) → `Finset.sum_range_sub` (telescoping) |
+| Key distinction | Explicit bias term $\delta = \sup_w \|\mathbb{E}[\text{clip}_G(\text{gradL}(w,\cdot))] - \nabla f(w)\|$ bounded via domain constraint $\|w_t - w^*\| \leq R$; rate includes additive $\delta R$ reflecting bias-domain coupling. |
+
+### Hit Report — Glue Usage Count
+
+| Component | File | Used by |
+|---|---|---|
+| `clip_G.bounded` | `Algorithms/ClippedSGD.lean` | `hvar_eff` (pointwise bound for variance) |
+| `clip_G.measurable` | `Algorithms/ClippedSGD.lean` | `measurable_effGradL` (oracle measurability) |
+| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | Step 1 (pointwise norm expansion) |
+| `sgdProcess_indepFun_xi` | `Main.lean` | independence for clipped process (via `measurable_effGradL`) |
+| `sgdProcess_measurable` | `Main.lean` | measurability for clipped process (via `measurable_effGradL`) |
+| `hasBoundedVariance_of_pointwise_bound` | `Lib/Glue/Probability.lean` | `hvar_eff` derivation (Pattern I) |
+| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 5 (variance bound) |
+| `convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean` | Step 4 (convex FOC) |
+| `integral_inner` | `Mathlib.MeasureTheory.Integral.Bochner.Basic` | bias decomposition (conditional expectation) |
+| `integral_mono` | `Mathlib.MeasureTheory.Integral.Bochner.Basic` | bias bound step |
+| `Finset.sum_range_sub` | `Mathlib.Data.Finset.Basic` | telescoping sum |
+
+**Leverage score (Archetype B):** reused existing components = 11; new algorithm-specific items = 5 (`ClippedSGDSetup`, `clip_G` infrastructure (3 items: def + 2 lemmas), convergence theorem with bias handling); reuse ratio = `$11 / (11 + 5) = 68.8\%$`.
+
+
 ## Algorithm Layer (Layer 2) — `Algorithms/SubgradientMethod.lean`
 
 This file formalizes the stochastic subgradient method for convex non-smooth optimization (Archetype B). Although the update rule syntactically matches SGD (`$w_{t+1} = w_t - \eta \cdot g_t$`), the oracle semantics differ fundamentally: `gradL` provides subgradients satisfying `$\text{gradL}(w, s) \in \partial f(w)$` (not unbiased estimates of a smooth gradient). Therefore, the proof cannot reuse Layer 1 meta-theorems (which require `gradF` and unbiasedness) and instead derives the one-step bound directly using the pointwise subgradient inequality.
@@ -1201,24 +1264,13 @@ new SVRG bridge components documented = 6; reuse ratio = `3 / (3 + 6) = 33.3%` (
 
 ## Roadmap & Dependency Tree
 
-| Lemma | File | SGD non-convex | SGD convex | SGD strongly convex | WD non-convex | WD convex | WD strongly convex | PGD convex | SVRG inner strongly convex | SVRG outer stub | Subgradient convex |
-|-------|------|:--------------:|:----------:|:-------------------:|:-------------:|:---------:|:------------------:|:----------:|:--------------------------:|:---------------:|:------------------:|
-| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | — | Step 1 | Step 1 | — | Step 1 | Step 1 | Step 1 (virtual) | Step 1 | — | **Step 1** |
-| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | — | **Step 4** |
-| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | — | h_int_norm_sq | h_int_norm_sq | — | h_int_norm_sq | h_int_norm_sq | h_int_norm_sq, h_int_virtual | h_int_norm_sq | — | **h_int_norm_sq** |
-| `hasBoundedVariance_of_pointwise_bound` | `Lib/Glue/Probability.lean` | — | — | — | — | — | — | — | — | — | **Step (deriving hvar)** |
-| *All other lemmas* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* |
-
-*Note: Cells marked "—" indicate no usage in that algorithm variant. "Subgradient convex" column updated with verified usage points.*
-
-
-| Lemma | File | SGD non-convex | SGD convex | SGD strongly convex | WD non-convex | WD convex | WD strongly convex | PGD convex | SVRG inner strongly convex | SVRG outer stub | Subgradient convex |
-|-------|------|:--------------:|:----------:|:-------------------:|:-------------:|:---------:|:------------------:|:----------:|:--------------------------:|:---------------:|:------------------:|
-| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | — | Step 1 | Step 1 | — | Step 1 | Step 1 | Step 1 (virtual) | Step 1 | — | **Step 1** |
-| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | — | **Step 4** |
-| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | — | h_int_norm_sq | h_int_norm_sq | — | h_int_norm_sq | h_int_norm_sq | h_int_norm_sq, h_int_virtual | h_int_norm_sq | — | **h_int_norm_sq** |
-| `hasBoundedVariance_of_pointwise_bound` | `Lib/Glue/Probability.lean` | — | — | — | — | — | — | — | — | — | **Step (deriving hvar)** |
-| *All other lemmas* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* |
+| Lemma | File | SGD non-convex | SGD convex | SGD strongly convex | WD non-convex | WD convex | WD strongly convex | PGD convex | SVRG inner strongly convex | SVRG outer stub | Subgradient convex | Clipped SGD convex | Reusable for |
+|-------|------|:--------------:|:----------:|:-------------------:|:-------------:|:---------:|:------------------:|:----------:|:--------------------------:|:---------------:|:------------------:|:------------------:|--------------|
+| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | — | Step 1 | Step 1 | — | Step 1 | Step 1 | Step 1 (virtual) | Step 1 | — | **Step 1** | **Step 1** | Any algorithm with SGD-like update (including subgradient methods, clipped SGD, etc.) |
+| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | — | **Step 4** | **Step 5** | **Universal** — any IID stochastic gradient algorithm |
+| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | — | h_int_norm_sq | h_int_norm_sq | — | h_int_norm_sq | h_int_norm_sq | h_int_norm_sq, h_int_virtual | h_int_norm_sq | — | **h_int_norm_sq** | **h_int_norm_sq** | Any algorithm with distance-to-optimum recursion |
+| `hasBoundedVariance_of_pointwise_bound` | `Lib/Glue/Probability.lean` | — | — | — | — | — | — | — | — | — | **Step (deriving hvar)** | **Step (deriving hvar)** | Only requires uniform pointwise oracle bound `‖gradL w s‖ ≤ G`; works for any algorithm with uniformly bounded stochastic oracle (subgradient methods, clipped SGD, etc.) |
+| *All other lemmas* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* |
 
 ### Universally reusable glue lemmas
 
@@ -1251,16 +1303,6 @@ The following lemmas have no SGD-specific content and are expected to apply dire
 | `integrable_lsmooth_comp_measurable` | `Lib/Glue/Measurable.lean` | h_int_ft | h_int_ft | — | h_int_ft | h_int_ft | — | h_int_ft | — | — | | Any algorithm applying a Lipschitz function to an integrable iterate |
 | `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | — | h_int_norm_sq | h_int_norm_sq | — | h_int_norm_sq | h_int_norm_sq | h_int_norm_sq, h_int_virtual | h_int_norm_sq | — | **h_int_norm_sq** | Any algorithm with distance-to-optimum recursion |
 | `integrable_inner_gradL_comp` | `Lib/Glue/Measurable.lean` | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | h_int_inner | — | | Any IID algorithm needing inner-product integrability |
-
-*Note: Cells marked "—" indicate no usage in that algorithm variant. "Subgradient convex" column added; only three cataloged lemmas have non-blank entries.*
-
-
-| Lemma | File | SGD non-convex | SGD convex | SGD strongly convex | WD non-convex | WD convex | WD strongly convex | PGD convex | SVRG inner strongly convex | SVRG outer stub | Subgradient convex |
-|-------|------|:--------------:|:----------:|:-------------------:|:-------------:|:---------:|:------------------:|:----------:|:--------------------------:|:---------------:|:------------------:|
-| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | — | Step 1 | Step 1 | — | Step 1 | Step 1 | Step 1 (virtual) | Step 1 | — | **Step 1** |
-| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | Step 5 | — | **Step 4** |
-| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | — | h_int_norm_sq | h_int_norm_sq | — | h_int_norm_sq | h_int_norm_sq | h_int_norm_sq, h_int_virtual | h_int_norm_sq | — | **h_int_norm_sq** |
-| *All other lemmas* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* | *—* |
 
 *Note: Cells marked "—" indicate no usage in that algorithm variant. "Subgradient convex" column added; only three cataloged lemmas have non-blank entries.*
 

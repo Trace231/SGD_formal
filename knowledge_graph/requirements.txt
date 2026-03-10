@@ -1,0 +1,2 @@
+# Optional: marko for Markdown AST parsing (stdlib sufficient for MVP)
+# marko>=1.2.0

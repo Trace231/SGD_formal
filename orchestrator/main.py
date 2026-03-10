@@ -44,6 +44,7 @@ from orchestrator.file_io import (
     load_file,
     snapshot_file,
 )
+from orchestrator.tools import _path_to_lean_module
 from orchestrator.metrics import (
     MetricsStore,
     capture_physical_metrics,
@@ -118,16 +119,22 @@ class ExecutionResult:
 
 _SUBGRADIENT_CONTEXT = """
 
-## Pre-verified Mathlib symbols (subgradient algorithms)
+## Note: subdifferential symbols (Mathlib 4.28+)
 
-The following symbols are in Mathlib and may be listed as VERIFIED in symbol_manifest:
-- `subdifferential` — Mathlib.Analysis.Convex.Subdifferential
-- `mem_subdifferential_iff` — characterizes g ∈ subdifferential ℝ f x via ∀ y, f y ≥ f x + ⟪g, y - x⟫
+`Mathlib.Analysis.Convex.Subdifferential` has been REMOVED in Mathlib 4.28.
+Do NOT add `import Mathlib.Analysis.Convex.Subdifferential` — this module no longer exists.
+Instead, define these symbols locally in your algorithm file, placed AFTER `end <SetupNamespace>`:
 
-Add `import Mathlib.Analysis.Convex.Subdifferential` to your algorithm file. Do NOT mark these as BLOCKED.
+  def subdifferential (_ : Type*) (f : E → ℝ) (w : E) : Set E :=
+    {g : E | ∀ y : E, f y ≥ f w + ⟪g, y - w⟫_ℝ}
+
+  theorem mem_subdifferential_iff {f : E → ℝ} {w g : E} :
+      g ∈ subdifferential ℝ f w ↔ ∀ y : E, f y ≥ f w + ⟪g, y - w⟫_ℝ := Iff.rfl
+
+Mark these as LOCAL in symbol_manifest, NOT as VERIFIED from Mathlib.
 """
 
-_SYMBOL_WHITELIST = frozenset({"subdifferential", "mem_subdifferential_iff"})
+_SYMBOL_WHITELIST: frozenset[str] = frozenset()
 
 
 class Gate4Error(RuntimeError):
@@ -216,6 +223,69 @@ def _get_modified_lean_files(
     baseline_untracked_promoted = tracked_now & baseline_untracked
 
     return sorted(newly_tracked | newly_untracked | baseline_untracked_promoted)
+
+
+def _ensure_algorithm_in_lakefile(algorithm: str) -> bool:
+    """Ensure Algorithms.<algorithm> is listed in lakefile.lean's SGDAlgorithms roots.
+
+    If the module is already present this is a no-op and returns False.  If it
+    is absent it is appended to the end of the roots list so ``lake build
+    SGDAlgorithms`` includes the newly-created file and returns True.
+    """
+    lakefile = PROJECT_ROOT / "lakefile.lean"
+    if not lakefile.exists():
+        console.print(f"[yellow][lakefile] lakefile.lean not found — skipping auto-update")
+        return False
+
+    module_name = f"`Algorithms.{algorithm}"
+    content = lakefile.read_text(encoding="utf-8")
+
+    if module_name in content:
+        return False  # already registered — no-op
+
+    # Find the closing bracket of the SGDAlgorithms roots list and insert before it.
+    # Pattern matches the last backtick-module entry in the roots := #[...] block.
+    roots_re = re.compile(
+        r"(lean_lib SGDAlgorithms.*?roots\s*:=\s*#\[)(.*?)(\])",
+        re.DOTALL,
+    )
+    m = roots_re.search(content)
+    if not m:
+        console.print(
+            "[yellow][lakefile] Could not find SGDAlgorithms roots list — "
+            "please add the module manually."
+        )
+        return False
+
+    updated = content[: m.start(3)] + f", {module_name}" + content[m.start(3) :]
+    lakefile.write_text(updated, encoding="utf-8")
+    console.print(f"[green][lakefile] Added {module_name} to SGDAlgorithms roots.")
+    return True
+
+
+def _remove_algorithm_from_lakefile(algorithm: str) -> None:
+    """Remove Algorithms.<algorithm> from lakefile.lean SGDAlgorithms roots (rollback).
+
+    Called when a pipeline run fails or is interrupted to undo the temporary
+    registration added at the start of Phase 3.
+    """
+    lakefile = PROJECT_ROOT / "lakefile.lean"
+    if not lakefile.exists():
+        return
+
+    module_name = f"`Algorithms.{algorithm}"
+    content = lakefile.read_text(encoding="utf-8")
+    if module_name not in content:
+        return
+
+    # Try removing ", `Algorithms.X" (module was appended after existing entries).
+    updated = re.sub(r",\s*" + re.escape(module_name), "", content)
+    if updated == content:
+        # Fallback: module appears first — remove "`Algorithms.X, " or "`Algorithms.X".
+        updated = re.sub(re.escape(module_name) + r",?\s*", "", content)
+
+    lakefile.write_text(updated, encoding="utf-8")
+    console.print(f"[yellow][lakefile] Removed {module_name} from SGDAlgorithms roots (rollback).")
 
 
 def _parse_persister_json(raw: str) -> list:
@@ -442,11 +512,28 @@ def phase3_prove(
         "Use read_file to verify lemma names before writing anything."
         if archetype.upper() == "B" else ""
     )
+    _tgt = Path(target_file) if Path(target_file).is_absolute() else PROJECT_ROOT / target_file
+    initial_exists: bool = _tgt.exists()
+    _file_absent_suffix = (
+        "\n\nCRITICAL: The target file does NOT exist yet. Your guidance MUST instruct "
+        f'Agent3 to call write_new_file(path="{target_file}", content=<full Lean scaffold>) '
+        "as the FIRST tool call. Output the complete file content in a code block for "
+        "Agent3 to pass to write_new_file. Do NOT suggest edit_file_patch — the file "
+        "must be created first."
+        if not initial_exists
+        else ""
+    )
     guidance = agent2.call(
-        "Provide initial proving guidance for Agent3.  Specify which sorry "
+        "The verification target file is "
+        + target_file
+        + ". Provide initial proving guidance for Agent3.  Specify which sorry "
         "to tackle first and the recommended proof strategy (Mathlib lemma, "
-        "glue pattern letter, etc.)."
+        "glue pattern letter, etc.). "
+        "When the plan requires both new glue AND a new algorithm file, your "
+        "guidance MUST instruct Agent3 to complete BOTH in a single attempt, "
+        "or verification will fail."
         + _archetype_b_warning
+        + _file_absent_suffix
     )
     console.print(Panel(
         guidance[:400] + "..." if len(guidance) > 400 else guidance,
@@ -462,15 +549,22 @@ def phase3_prove(
 
     # Snapshot target-file state before any Agent3 edits.
     # Used to detect "no-op" attempts where Agent3 never touched the file.
-    _tgt = Path(target_file) if Path(target_file).is_absolute() else PROJECT_ROOT / target_file
-    initial_exists: bool = _tgt.exists()
     initial_hash: str | None = _file_hash(target_file)
     file_changed: bool = False  # updated each attempt
 
     for attempt in range(1, max_retries + 1):
         attempts = attempt
+        _file_absent_prefix = (
+            "CRITICAL: Target file does NOT exist. You MUST call write_new_file(path="
+            f'"{target_file}", content=<complete Lean code>) as your FIRST tool call. '
+            "The guidance below contains the full file content — pass it to write_new_file. "
+            "Only after the file exists do you call run_lean_verify.\n\n"
+            if not _tgt.exists()
+            else ""
+        )
         prover_prompt = (
-            "Use tools to close sorry placeholders.\n"
+            _file_absent_prefix
+            + "Use tools to close sorry placeholders.\n"
             "Return ONLY valid JSON with keys: thought, tool_calls.\n"
             "Each tool call must be an object: "
             '{"tool": "<name>", "arguments": {...}}.\n'
@@ -650,7 +744,19 @@ def phase3_prove(
         file_changed = _tgt.exists() and (not initial_exists or current_hash != initial_hash)
 
         if exit_code == 0 and last_sorry_count == 0 and file_changed:
-            prove_state = "PROVE_SUCCESS"
+            # Full-library gate: verify no cascade breakage across SGDAlgorithms.
+            full_build = lake_build(target="SGDAlgorithms")
+            if full_build.returncode != 0:
+                full_errors = full_build.errors or "SGDAlgorithms full build failed"
+                last_errors = full_errors
+                exec_results.append(ExecutionResult(
+                    status_code="ERROR",
+                    message=f"[Full-Build Gate] SGDAlgorithms failed:\n{full_errors[:800]}",
+                    attempt=attempt,
+                ))
+                prove_state = "PROVE_RETRY"
+            else:
+                prove_state = "PROVE_SUCCESS"
         elif exit_code == 0 and last_sorry_count == 0 and not file_changed:
             # Build looks green but Agent3 never touched the file — no-op trap.
             no_change_msg = (
@@ -734,6 +840,22 @@ def phase3_prove(
 
         if error_msgs:
             diag_log.extend([f"attempt={attempt} {m}" for m in error_msgs])
+
+        # Priority 2.5: File still does not exist — Agent3 never called write_new_file.
+        if not _tgt.exists() and "Target file does not exist" in (verify_text or ""):
+            guidance = agent2.call(
+                f"Attempt {attempt} failed: Target file still does not exist.\n"
+                f"Agent3 did NOT call write_new_file. You MUST output the FULL Lean file content "
+                f'and explicitly instruct Agent3 to call write_new_file(path="{target_file}", '
+                "content=<complete file>) as the FIRST tool call.\n"
+                f"Guidance format: Provide a code block with the complete {target_file} "
+                "scaffold (imports, setup, theorem stubs with sorry). Agent3 will pass it to write_new_file."
+            )
+            console.print(
+                f"  [Agent3] attempt {attempt}/{max_retries} — "
+                "build=FAIL (file not created)"
+            )
+            continue
 
         current_code = (
             load_file(target_file)
@@ -1153,7 +1275,9 @@ def phase4_persist(
             })
             console.print(f"[green]\\[Agent4] Inserted lemma into {file_path} via {anchor_id}")
 
-        build_result = lake_build()
+        # Full-library build: catches cascade failures in algorithm files caused
+        # by changes to Lib/Glue lemma signatures or new lemma insertions.
+        build_result = lake_build(target="SGDAlgorithms")
         if build_result.returncode != 0:
             console.print("[red]\\[Phase 4] lib_write caused build failure. Rolling back...")
             for path, snap in lib_snapshots.items():
@@ -1190,7 +1314,9 @@ def phase4_persist(
             })
             console.print(f"[green]\\[Agent4] Refactored {file_path} ({len(patches)} patch(es))")
 
-        build_result = lake_build()
+        # Full-library build: catches cascade failures across all algorithm files,
+        # not just the directly refactored ones.
+        build_result = lake_build(target="SGDAlgorithms")
         if build_result.returncode != 0:
             console.print("[red]\\[Phase 4] algorithm_refactor caused build failure. Rolling back...")
             for path, snap in algo_snapshots.items():
@@ -1329,6 +1455,7 @@ def run(
     audit = AuditLogger.get()
     audit.start_run(algorithm)
     success = False
+    _lakefile_added_by_us = False
     files_modified: list[str] = []
     merged_phase3_audit = {
         "execution_history": [],
@@ -1353,6 +1480,13 @@ def run(
                 algorithm, update_rule, proof_sketch, archetype
             )
             progress.advance(task)
+
+            # Register the algorithm module in lakefile.lean before Phase 3 so
+            # that `lake build Algorithms.<name>` succeeds.  Tracked so we can
+            # roll back on failure.
+            _lakefile_added_by_us = _ensure_algorithm_in_lakefile(
+                Path(target_file).stem
+            )
 
             # Phase 2 (may loop on re-plan)
             success = False
@@ -1446,6 +1580,8 @@ def run(
             console.print(
                 f"[dim][Audit] Files modified: {', '.join(files_modified)}[/dim]"
             )
+        if not success and _lakefile_added_by_us:
+            _remove_algorithm_from_lakefile(Path(target_file).stem)
 
 
 # ---------------------------------------------------------------------------

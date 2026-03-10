@@ -138,6 +138,14 @@ def overwrite_file(path: str | Path, content: str) -> dict[str, Any]:
     }
 
 
+def _path_to_lean_module(rel_path: str) -> str:
+    """Convert a relative .lean path to a dotted Lean module name.
+
+    Example: 'Algorithms/SVRGOuterLoop.lean' → 'Algorithms.SVRGOuterLoop'
+    """
+    return rel_path.removesuffix(".lean").replace("/", ".")
+
+
 def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     """Run Lean verification and return a JSON-serializable result."""
     resolved = _resolve_allowed_path(file_path, _LEAN_VERIFY_ALLOWLIST)
@@ -152,13 +160,13 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
             "error_count": 1,
             "errors": [
                 f"Target file does not exist: {file_path}. "
-                "Did you forget to write it with 'edit_file_patch'?"
+                "Call write_new_file(path, content) first to create it."
             ],
         }
 
     rel = str(resolved.relative_to(PROJECT_ROOT))
 
-    build = lake_build()
+    build = lake_build(target=_path_to_lean_module(rel))
     sorry_count = count_sorrys(rel)
     error_lines = [
         line.strip()

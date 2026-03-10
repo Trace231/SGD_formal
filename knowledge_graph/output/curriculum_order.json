@@ -1,0 +1,55 @@
+{
+  "order": [
+    "ProjectedGD",
+    "WeightDecaySGD",
+    "ClippedSGD",
+    "SubgradientMethod",
+    "SVRG",
+    "SGD",
+    "SVRGOuterLoop"
+  ],
+  "items": [
+    {
+      "algorithm": "ProjectedGD",
+      "difficulty_score": 0.0727,
+      "depth": 3,
+      "prerequisites_satisfied": true
+    },
+    {
+      "algorithm": "WeightDecaySGD",
+      "difficulty_score": 0.0889,
+      "depth": 3,
+      "prerequisites_satisfied": true
+    },
+    {
+      "algorithm": "ClippedSGD",
+      "difficulty_score": 0.125,
+      "depth": 3,
+      "prerequisites_satisfied": true
+    },
+    {
+      "algorithm": "SubgradientMethod",
+      "difficulty_score": 0.15,
+      "depth": 3,
+      "prerequisites_satisfied": true
+    },
+    {
+      "algorithm": "SVRG",
+      "difficulty_score": 0.2667,
+      "depth": 3,
+      "prerequisites_satisfied": true
+    },
+    {
+      "algorithm": "SGD",
+      "difficulty_score": 0.4,
+      "depth": 3,
+      "prerequisites_satisfied": true
+    },
+    {
+      "algorithm": "SVRGOuterLoop",
+      "difficulty_score": 0.4,
+      "depth": 3,
+      "prerequisites_satisfied": true
+    }
+  ]
+}
