@@ -46,10 +46,12 @@ class ToolRegistry:
             read_file,
             run_lean_verify,
             run_repo_verify,
+            search_in_file,
             write_new_file,
         )
 
         self.register("read_file", read_file)
+        self.register("search_in_file", search_in_file)
         self.register("write_new_file", write_new_file)
         self.register("overwrite_file", overwrite_file)
         self.register("edit_file_patch", edit_file_patch)
@@ -117,7 +119,13 @@ class Agent:
         self.messages.append({"role": "assistant", "content": reply})
         try:
             from orchestrator.audit_logger import AuditLogger
-            AuditLogger.get().log_agent_call(self.role, full_msg, reply)
+            AuditLogger.get().log_agent_call(
+                self.role,
+                full_msg,
+                reply,
+                prompt_full=full_msg,
+                reply_full=reply,
+            )
         except Exception:  # noqa: BLE001
             pass  # audit must not break agent execution
         return reply

@@ -1,4 +1,8 @@
-"""Metrics tracking with physical measurements and audit signals."""
+"""Metrics tracking with physical measurements and audit signals.
+
+This module is also a natural place to document high-level audit modes and
+where audit artifacts (JSON + snapshots) are written.
+"""
 
 from __future__ import annotations
 

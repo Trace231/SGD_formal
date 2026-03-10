@@ -166,3 +166,20 @@ theorem strong_convex_inner_lower_bound
   rw [show wStar - w = -(w - wStar) from by abel, inner_neg_right,
       show ‖-(w - wStar)‖ = ‖w - wStar‖ from norm_neg _] at h
   linarith [hmin w]
+
+/-- Gradient norm bound under strong convexity + smoothness: ‖∇f(w)‖ ≤ L‖w − w*‖.
+Layer: 0 | Gap: Level 3 (direct consequence of Lipschitz gradient + Fermat)
+Used in: SVRG outer loop convergence (Algorithms/SVRGOuterLoop.lean, Step 3 — variance conversion) -/
+theorem strongly_convex_gradient_norm_bound
+    {f : E → ℝ} {gradF : E → E} {L : NNReal} {wStar : E}
+    (hsmooth : LipschitzWith L gradF)
+    (hmin : Main.IsMinimizer f wStar)
+    (hgrad : ∀ w, HasGradientAt f (gradF w) w)
+    (w : E) :
+    ‖gradF w‖ ≤ (L : ℝ) * ‖w - wStar‖ := by
+  -- Fermat's theorem: minimizer of differentiable convex function has zero gradient
+  have h_grad_wStar : gradF wStar = 0 := by
+    have h_convex := (hsmooth.convexOn univ).mpr (by simp)
+    exact subgradient_of_is_min h_convex hmin hgrad wStar
+  calc ‖gradF w‖ = ‖gradF w - gradF wStar‖ := by rw [h_grad_wStar, sub_zero]
+    _ ≤ L * ‖w - wStar‖ := hsmooth.dist_le_mul w wStar

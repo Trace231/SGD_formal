@@ -21,6 +21,10 @@ METRICS_PATH = PROJECT_ROOT / "orchestrator" / "metrics.json"
 AUDIT_DIR = PROJECT_ROOT / "orchestrator" / "audits"
 AUDIT_ENABLED = os.getenv("ORCHESTRATOR_AUDIT", "1") != "0"
 
+# Full-audit controls (default ON; can be disabled via env for privacy/volume).
+AUDIT_FULL_PROMPTS_ENABLED = os.getenv("SGD_AUDIT_FULL_PROMPTS", "1") != "0"
+AUDIT_CODE_PATCH_ENABLED = os.getenv("SGD_AUDIT_CODE_PATCH", "1") != "0"
+
 # ---------------------------------------------------------------------------
 # API keys (loaded from .env or environment)
 # ---------------------------------------------------------------------------
@@ -46,11 +50,11 @@ PROVIDER_URLS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 AGENT_CONFIGS: dict[str, dict] = {
-    "orchestrator":  {"provider": "qwen",     "model": "qwen3-max",     "temperature": 0.0   ,  "max_tokens": 32768},
-    "planner":       {"provider": "qwen",     "model": "qwen3-max",       "temperature": 0.0,   "max_tokens": 32768},
+    "orchestrator":  {"provider": "qwen",     "model": "qwen3-max-2026-01-23"  ,  "max_tokens": 32768},
+    "planner":       {"provider": "qwen",     "model": "qwen3-max-2026-01-23",  "max_tokens": 32768},
     "sorry_closer":  {"provider": "deepseek", "model": "deepseek-reasoner", "temperature": 0.0,   "max_tokens": 32768},
-    "persister":     {"provider": "qwen",     "model": "qwen3-max",          "temperature": 0.0,   "max_tokens": 32768},
-    "diagnostician": {"provider": "qwen",     "model": "qwen3-max",          "temperature": 0.0,   "max_tokens": 16384},
+    "persister":     {"provider": "qwen",     "model": "qwen3-max-2026-01-23", "max_tokens": 32768},
+    "diagnostician": {"provider": "qwen",     "model": "qwen3-max-2026-01-23",  "max_tokens": 16384},
 }
 
 # ---------------------------------------------------------------------------

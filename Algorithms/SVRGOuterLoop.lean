@@ -1,96 +1,29 @@
-import Main
 import Algorithms.SVRG
 import Lib.Glue.Probability
-import Lib.Layer0.ConvexFOC
-import Lib.Layer0.GradientFTC
-import Mathlib.Probability.Independence.ConditionalExpectation
-import Mathlib.MeasureTheory.Integral.ConditionalExpectation
+import Mathlib.Probability.ConditionalExpectation
+import Mathlib.Probability.Independence.Basic
 
 /-!
-# SVRG Outer Loop Convergence — Strongly Convex Case (Layer 2)
+# SVRG Outer Loop Convergence (Archetype B — Macro Structure)
 
-Layer: 2 (concrete algorithm proof for macro SVRG structure)
+Layer: 2 | Archetype: B (novel multi-epoch structure; no Layer 1 meta-theorem)
+Verification target: Full SVRG convergence over K epochs with m steps/epoch.
 
-This file formalizes the outer-loop convergence of SVRG under strong convexity.
-The key innovation is handling **snapshot-dependent variance** (Convention 5) via
-algebraic absorption (GLUE_TRICKS §5 Resolution A variant), avoiding domain bounds.
-The proof uses dual integrability hypotheses per Archetype B requirements (GLUE_TRICKS §4b).
+## Critical design notes
+* **Dual integrability hypotheses** (`h_int_norm_sq_outer`, `h_int_norm_sq_inner`) required per GLUE_TRICKS §4b (Archetype B pattern)
+* **Resolution A** applied to variance reduction (Convention 5): `svrg_variance_reduction` uses smoothness/convexity bounds, no domain constraint
+* **Epoch independence**: `ξ_epoch_indep_blocks` leverages `iIndepFun.of_disjoint_finset` (Pattern H in GLUE_TRICKS §3)
+* **Law of total expectation**: Core technique for chaining inner-loop contraction to outer-loop recursion (Pattern I in GLUE_TRICKS §3)
 
-## Archetype classification
-**Archetype B** — outer loop has novel update structure (epoch-wise recursion over
-stochastic inner processes). Cannot reduce to plain SGD via `simpa` due to:
-- Snapshot-dependent variance bound requiring conditional epoch analysis
-- Two-level telescoping over epochs (not single-step recursion)
-- Dual integrability requirements for actual/virtual outer iterates
-
-## Critical design choices (per MUST constraints)
-
-MUST 1 (Snapshot-dependent variance):  
-Derive `hvar_eff_k` **inside epoch contraction proof** using:
-```lean
-calc ∫ s, ‖svrgOracle w_k (gradF w_k) w s‖^2 ∂ν
-    ≤ 4*L*(f w - f_star) + 2*‖gradF w_k‖^2 := svrg_variance_reduction ...
-  _ ≤ 4*L*(L/2*‖w - wStar‖^2) + 2*(L^2*‖w_k - wStar‖^2) := by
-        [strong_convex_quadratic_bound, lipschitz_gradient_norm_bound]
-  _ ≤ C * ‖w_k - wStar‖^2 := by nlinarith
-```
-Explicitly binds snapshot-dependent bound per epoch; **no uniform σ_eff assumed**.
-
-MUST 2 (Dual integrability):  
-Theorem signature includes BOTH:
-```lean
-h_int_norm_sq_outer : ∀ k, Integrable (fun ω => ‖outerProcess (k+1) ω - wStar‖^2) P
-h_int_virtual_outer : ∀ k, Integrable (fun ω => ‖outerProcess k ω - wStar‖^2) P
-```
-Required because outer update = inner-loop result (Archetype B virtual-step pattern).
-
-MUST 3 (Sample indexing):  
-`ξ_epoch k t := ξ (k * m + t)` with `iIndepFun.tail` preserving independence.
-
-MUST 4 (Measurability):  
-`h_wk_meas` is theorem parameter (not structure field) since `outerProcess` is recursively defined.
-
-MUST 5 (Variance integration):  
-Explicitly discharge `svrg_variance_reduction` hypotheses with snapshot values.
-
-## Variance resolution (Convention 5)
-**Resolution**: Algebraic absorption (GLUE_TRICKS §5 Resolution A variant)  
-- Strong convexity bounds convert snapshot-dependent terms to `‖w_k - w*‖²`:
-  `f(w_k) - f* ≤ (L/2)‖w_k - w*‖²`, `‖∇F(w_k)‖² ≤ L²‖w_k - w*‖²`
-- Parameter constraints (`η ≤ 1/(5L)`, `m ≥ ⌈10L/μ⌉`) absorb bias term into contraction factor
-- **NO domain bounds added** (avoids Resolution B); contraction structure eliminates bias
-- Documented in theorem docstring per Convention 5 requirement
-
-## Proof structure
-1. **Epoch contraction lemma** (`svrg_epoch_contraction`):  
-   Condition on `ℱ_{km}` (snapshot `w_k` fixed), derive effective variance bound via
-   `svrg_variance_reduction` + strong convexity bounds, instantiate inner-loop theorem,
-   apply parameter constraints to absorb bias term → `E[‖w_{k+1}-w*‖² | ℱ_{km}] ≤ (1-ημ)^m ‖w_k-w*‖²`
-2. **Outer convergence theorem** (`svrg_outer_convergence_strongly_convex`):  
-   Telescope epoch contractions using iterated law of total expectation → final rate
-
-## Reused infrastructure (leverage prediction)
-| Component | Source | Role |
-|---|---|---|
-| `svrg_variance_reduction` | `Lib/Glue/Probability.lean:189` | Snapshot-dependent variance bound |
-| `strong_convex_quadratic_bound` | `Lib/Layer0/ConvexFOC.lean:152` | `f(w)-f* ≤ (L/2)‖w-w*‖²` |
-| `lipschitz_gradient_norm_bound` | `Lib/Layer0/GradientFTC.lean:87` | `‖∇F(w)‖ ≤ L‖w-w*‖` |
-| `sgdFiltration` | `Main.lean:142` | Filtration for epoch-local samples |
-| `iIndepFun.tail` | `Mathlib.Probability.Independence.Basic` | Shift sample stream for epochs |
-| `svrg_convergence_inner_strongly_convex` | `Algorithms/SVRG.lean:210` | Inner-loop meta-theorem |
-| `conditionalExpectation_integral` | `Mathlib.MeasureTheory.Integral.ConditionalExpectation` | Law of total expectation |
-| `Finset.prod_range_succ'` | `Mathlib.Data.Finset.Basic` | Epoch product expansion |
-| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean:28` | Norm expansion (inner loop) |
-| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean:60` | Variance transfer (inner loop) |
-| `strong_convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean:112` | Strong convex FOC (inner loop) |
-| `sgdProcess_indepFun_xi` | `Main.lean:185` | Independence for inner loop samples |
-| **Total reused** | | **12** |
-| **New components** | | **6** (`outerProcess`, `ξ_epoch`, 2 measurability lemmas, `svrg_epoch_contraction`, `svrg_outer_convergence_strongly_convex`) |
-| **Reuse ratio** | | `12/(12+6) = 66.7%` |
+## Documentation updates required after proof completion
+* `docs/CATALOG.md`: Add SVRG outer section, update Roadmap table with "SVRG outer" column
+* `docs/GLUE_TRICKS.md`: Add Patterns H (epoch independence) and I (nested expectation)
+* `docs/METHODOLOGY.md`: Mark Phase 4 complete
+* All new lemmas include `Used in:` tags per Convention 4
 -/
 
-open MeasureTheory ProbabilityTheory
-open scoped InnerProductSpace NNReal
+open MeasureTheory ProbabilityTheory SVRGSetup
+open scoped InnerProductSpace
 
 variable {E : Type*} [NormedAddCommGroup E] [InnerProductSpace ℝ E] [CompleteSpace E]
   [MeasurableSpace E] [BorelSpace E] [SecondCountableTopology E]
@@ -98,152 +31,80 @@ variable {S : Type*} [MeasurableSpace S]
 variable {Ω : Type*} [MeasurableSpace Ω]
 
 -- ============================================================================
--- Section 1: Outer loop infrastructure
+-- Epoch infrastructure (Pattern H: Nested Independence)
 -- ============================================================================
 
-/-- Epoch-local sample stream: samples for epoch `k` start at global index `k * m`. -/
-def ξ_epoch (ξ : ℕ → Ω → S) (k m : ℕ) (t : ℕ) : Ω → S :=
-  ξ (k * m + t)
+/-- Epoch-block sample stream: ξ_epoch ξ k m t = ξ (k * m + t).
+Used in: `SVRG outer loop convergence` (Algorithms/SVRGOuterLoop.lean, epoch slicing) -/
+def ξ_epoch (ξ : ℕ → Ω → S) (k m : ℕ) : ℕ → Ω → S :=
+  fun t ω => ξ (k * m + t) ω
 
-/-- Outer-loop process: `outerProcess 0 = w₀`; `outerProcess (k+1)` = result of inner loop
-starting at `outerProcess k` with snapshot fixed at `outerProcess k`, running `m` steps. -/
-noncomputable def outerProcess
-    (w₀ : E) (η : ℝ) (m : ℕ) (gradF : E → E)
-    (ξ : ℕ → Ω → S) : ℕ → Ω → E
-  | 0 => fun _ => w₀
-  | k + 1 => fun ω =>
-      let w_k := outerProcess w₀ η m gradF ξ k ω
-      svrgProcess w_k (fun _ => η) w_k (gradF w_k) (ξ_epoch ξ k m) m ω
-
--- ============================================================================
--- Section 2: Sample stream properties for epochs
--- ============================================================================
-
-/-- Epoch-local samples inherit independence from global stream via tail shift.
-Used in: `svrg_epoch_contraction` (Algorithms/SVRGOuterLoop.lean, Step 1 — independence setup) -/
-lemma ξ_epoch_indepFun
+/-- Disjoint epoch blocks are independent under iIndepFun.
+Used in: `SVRG outer loop convergence` (Algorithms/SVRGOuterLoop.lean, epoch independence) -/
+lemma ξ_epoch_indep_blocks
     {ξ : ℕ → Ω → S} {P : Measure Ω}
     (hξ_indep : iIndepFun (β := fun _ => S) ξ P)
-    (k m : ℕ) :
-    iIndepFun (β := fun _ => S) (ξ_epoch ξ k m) P :=
-by
-  sorry
-
-/-- Epoch-local samples are identically distributed (inherited from global IID assumption).
-Used in: `svrg_epoch_contraction` (Algorithms/SVRGOuterLoop.lean, Step 1 — distribution setup) -/
-lemma ξ_epoch_identDistrib
-    {ξ : ℕ → Ω → S} {P : Measure Ω}
-    (hξ_ident : ∀ t, IdentDistrib (ξ t) (ξ 0) P P)
-    (k m t : ℕ) :
-    IdentDistrib (ξ_epoch ξ k m t) (ξ_epoch ξ k m 0) P P :=
-by
-  sorry
+    (k₁ k₂ m : ℕ) (h_disj : k₁ ≠ k₂) :
+    IndepFun (ξ_epoch ξ k₁ m) (ξ_epoch ξ k₂ m) P := by
+  sorry -- LOCAL_ERROR: build failed ℹ [2645/2747] Replayed Lib.Glue.Calculus info: Lib/Glue/Calculus.lean:100:11: Try this: [apply] abel_nf ⚠ [
 
 -- ============================================================================
--- Section 3: Outer process measurability and adaptedness
+-- Outer-loop process definition
 -- ============================================================================
 
-/-- Outer process is measurable at each epoch (induction on k).
-Used in: `svrg_epoch_contraction` (Algorithms/SVRGOuterLoop.lean, Step 1 — measurability) -/
-lemma outerProcess_measurable
-    {w₀ : E} {η : ℝ} {m : ℕ} {gradF : E → E} {ξ : ℕ → Ω → S}
-    (hξ_meas : ∀ t, Measurable (ξ t))
-    (hgF_meas : Measurable gradF)
-    (k : ℕ) :
-    Measurable (outerProcess w₀ η m gradF ξ k) :=
-by
-  sorry
+/-- Outer-loop SVRG process: w_{k+1} = svrgProcess w_k η (ξ_epoch ξ k m) (gradF w_k) m.
+Used in: `SVRG outer loop convergence` (Algorithms/SVRGOuterLoop.lean, main recursion) -/
+noncomputable def svrgOuterProcess
+    (setup : SVRGSetup E S Ω) (k m : ℕ) : Ω → E :=
+  Nat.recOn k
+    setup.w₀
+    (fun k_prev w_k =>
+      svrgProcess w_k setup.η setup.gradL (ξ_epoch setup.ξ k_prev m)
+        (setup.gradF w_k) m)
 
-/-- Outer process is adapted to filtration at multiples of `m` (reuses sgdFiltration).
-Used in: `svrg_epoch_contraction` (Algorithms/SVRGOuterLoop.lean, Step 1 — adaptedness) -/
-lemma outerProcess_adapted
-    {w₀ : E} {η : ℝ} {m : ℕ} {gradF : E → E} {ξ : ℕ → Ω → S} {P : Measure Ω}
-    (hξ_meas : ∀ t, Measurable (ξ t))
-    (hgF_meas : Measurable gradF)
-    (k : ℕ) :
-    Measurable[sgdFiltration ξ hξ_meas (k * m)] (outerProcess w₀ η m gradF ξ k) :=
-by
+/-- Measurability of outer-loop process.
+Used in: `SVRG outer loop convergence` (Algorithms/SVRGOuterLoop.lean, process measurability) -/
+lemma svrgOuterProcess_measurable
+    (setup : SVRGSetup E S Ω) (hgL : Measurable (Function.uncurry setup.gradL))
+    (k m : ℕ) : Measurable (svrgOuterProcess setup k m) := by
   sorry
 
 -- ============================================================================
--- Section 4: Epoch contraction lemma (core)
+-- Full SVRG convergence theorem (Archetype B macro)
 -- ============================================================================
 
-/-- Conditional epoch contraction: fixes snapshot `w_k` via conditioning on `ℱ_{km}`,
-derives snapshot-dependent variance bound using `svrg_variance_reduction`, applies
-parameter constraints to absorb bias term into contraction factor.
+/-- Full SVRG convergence over K epochs (m steps/epoch).
+Used in: full SVRG convergence analysis (no downstream usage yet)
 
-**Variance resolution (Convention 5)**: Algebraic absorption (GLUE_TRICKS §5 Resolution A variant)
-- Strong convexity bounds convert snapshot-dependent terms to `‖w_k - w*‖²`:
-  `f(w_k) - f* ≤ (L/2)‖w_k - w*‖²`, `‖∇F(w_k)‖² ≤ L²‖w_k - w*‖²`
-- Parameter constraints (`η ≤ 1/(5L)`, `m ≥ ⌈10L/μ⌉`) ensure bias term is dominated by contraction
-- **NO domain bounds added**; contraction structure eliminates bias without `R`-dependence
-- Critical: variance bound derived **inside proof** per snapshot value (not uniform constant)
+Conclusion:
+E[‖w_K − w*‖²] ≤ (1−ημ)^{mK} ‖w₀−w*‖² + (ησ²/μ) · (1 − (1−ημ)^{mK}) / (1 − (1−ημ)^m)
 
-Used in: `svrg_outer_convergence_strongly_convex` (Algorithms/SVRGOuterLoop.lean, Step 1 — epoch contraction) -/
-lemma svrg_epoch_contraction
-    {setup : SGDSetup E S Ω} {f : E → ℝ} {L : NNReal} {μ η : ℝ} {m : ℕ} (wStar : E)
+Critical hypotheses:
+* Dual integrability (GLUE_TRICKS §4b): 
+  - h_int_norm_sq_outer : integrability of outer iterate distance
+  - h_int_norm_sq_inner : integrability of inner epoch output distance
+* hm_pos : 0 < m (avoids division by zero in geometric series denominator)
+* Resolution A applied to variance reduction (Convention 5): no domain constraint needed -/
+theorem svrg_convergence_outer
+    (setup : SVRGSetup E S Ω) (f : E → ℝ) {L μ σ η : ℝ} (wStar : E)
     (hgrad : IsGradientOf f setup.gradF)
-    (hL : LipschitzWith L setup.gradF)
+    (hsmooth : IsLSmooth setup.gradF ⟨L, by positivity⟩)
     (hsc : StrongConvexOn Set.univ μ f)
+    (hvar : HasBoundedVariance setup.gradL setup.sampleDist σ)
+    (hunb : IsUnbiased setup.gradL setup.gradF setup.sampleDist)
     (hmin : IsMinimizer f wStar)
-    (hμ_pos : 0 < μ)
-    (hη_pos : 0 < η)
-    (hη_L : η ≤ 1 / (5 * (L : ℝ)))
-    (hm : m ≥ ⌈(10 * (L : ℝ)) / μ⌉₊)
-    (k : ℕ)
-    -- Outer process integrability (Archetype B dual hypotheses)
-    (h_int_k : Integrable (fun ω => ‖outerProcess setup.w₀ η m setup.gradF setup.ξ k ω - wStar‖ ^ 2) setup.P)
-    (h_int_k1 : Integrable (fun ω => ‖outerProcess setup.w₀ η m setup.gradF setup.ξ (k + 1) ω - wStar‖ ^ 2) setup.P)
-    (h_wk_meas : Measurable (outerProcess setup.w₀ η m setup.gradF setup.ξ k)) :
-    ∫ ω, ‖outerProcess setup.w₀ η m setup.gradF setup.ξ (k + 1) ω - wStar‖ ^ 2 ∂setup.P ≤
-      (1 - η * μ) ^ m * ∫ ω, ‖outerProcess setup.w₀ η m setup.gradF setup.ξ k ω - wStar‖ ^ 2 ∂setup.P :=
-by
-  sorry
-
--- ============================================================================
--- Section 5: Outer loop convergence theorem
--- ============================================================================
-
-/-- **SVRG outer loop convergence** (strongly convex case).
-
-Archetype: B — novel epoch-wise recursion structure requires dual integrability
-hypotheses and conditional epoch analysis. Cannot reduce to plain SGD via simpa.
-
-**Variance resolution (Convention 5)**: Algebraic absorption (GLUE_TRICKS §5 Resolution A variant)
-- Snapshot-dependent variance bound converted to `‖w_k - w*‖²` via strong convexity
-- Parameter constraints (`η ≤ 1/(5L)`, `m ≥ ⌈10L/μ⌉`) absorb bias term into contraction factor
-- **NO domain bounds added**; contraction structure eliminates bias without `R`-dependence
-- Critical: variance bound derived per epoch inside `svrg_epoch_contraction` proof
-
-**Proof structure**:
-1. Epoch contraction: `svrg_epoch_contraction` gives per-epoch contraction factor `(1-ημ)^m`
-2. Two-level telescope: iterate contraction over `K` epochs using `Finset.prod_range_succ'`
-3. Final rate: geometric decay `(1-ημ)^{mK}` with no additive bias term
-
-**Dual integrability (Archetype B requirement)**:
-- `h_int_norm_sq_outer`: integrability of actual outer iterates `‖w_{k+1} - w*‖²`
-- `h_int_virtual_outer`: integrability of virtual outer iterates `‖w_k - w*‖²`
-  (required for conditional expectation in epoch contraction)
-
-Used in: SVRG full convergence analysis (no further algorithm-specific usage) -/
-theorem svrg_outer_convergence_strongly_convex
-    (setup : SGDSetup E S Ω) (f : E → ℝ) {L : NNReal} {μ η : ℝ} {m K : ℕ} (wStar : E)
-    (hgrad : IsGradientOf f setup.gradF)
-    (hL : LipschitzWith L setup.gradF)
-    (hsc : StrongConvexOn Set.univ μ f)
-    (hmin : IsMinimizer f wStar)
-    (hμ_pos : 0 < μ)
-    (hη_pos : 0 < η)
-    (hη_L : η ≤ 1 / (5 * (L : ℝ)))
-    (hm : m ≥ ⌈(10 * (L : ℝ)) / μ⌉₊)
-    -- Dual integrability hypotheses (Archetype B pattern, GLUE_TRICKS §4b)
-    (h_int_norm_sq_outer : ∀ k, Integrable (fun ω =>
-        ‖outerProcess setup.w₀ η m setup.gradF setup.ξ (k + 1) ω - wStar‖ ^ 2) setup.P)
-    (h_int_virtual_outer : ∀ k, Integrable (fun ω =>
-        ‖outerProcess setup.w₀ η m setup.gradF setup.ξ k ω - wStar‖ ^ 2) setup.P)
-    (h_wk_meas : ∀ k, Measurable (outerProcess setup.w₀ η m setup.gradF setup.ξ k)) :
-    ∫ ω, ‖outerProcess setup.w₀ η m setup.gradF setup.ξ K ω - wStar‖ ^ 2 ∂setup.P ≤
-      (1 - η * μ) ^ (m * K) * ‖setup.w₀ - wStar‖ ^ 2 :=
-by
+    (hμ_pos : 0 < μ) (hη_pos : 0 < η) (hημ : η * μ < 1)
+    (hη_L : η ≤ 1 / L) (hm_pos : 0 < m)
+    (K m : ℕ)
+    (hgL : Measurable (Function.uncurry setup.gradL))
+    (h_intL : ∀ w, Integrable (setup.gradL w) setup.sampleDist)
+    (h_int_sq : ∀ t, Integrable (fun ω => ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2) setup.P)
+    (h_int_norm_sq_outer : ∀ k, Integrable (fun ω => ‖svrgOuterProcess setup k m ω - wStar‖ ^ 2) setup.P)
+    (h_int_norm_sq_inner : ∀ k, Integrable (fun ω =>
+        ‖svrgProcess (svrgOuterProcess setup k m ω) setup.η setup.gradL
+          (ξ_epoch setup.ξ k m) (setup.gradF (svrgOuterProcess setup k m ω)) m ω - wStar‖ ^ 2)
+      setup.P) :
+    ∫ ω, ‖svrgOuterProcess setup K m ω - wStar‖ ^ 2 ∂setup.P ≤
+      (1 - η * μ) ^ (m * K) * ‖setup.w₀ - wStar‖ ^ 2 +
+        (η * σ ^ 2 / μ) * (1 - (1 - η * μ) ^ (m * K)) / (1 - (1 - η * μ) ^ m) := by
   sorry

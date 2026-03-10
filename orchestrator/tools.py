@@ -68,10 +68,127 @@ def _atomic_write(path: Path, content: str) -> None:
         raise
 
 
-def read_file(path: str | Path) -> str:
-    """Read a file under Algorithms/, Lib/, or docs/."""
+def read_file(
+    path: str | Path,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    with_line_numbers: bool = True,
+) -> str:
+    """Read a file under Algorithms/, Lib/, or docs/.
+
+    Args:
+        path: File path (relative to project root or absolute).
+        start_line: First line to return, 1-indexed (default: 1).
+        end_line: Last line to return, inclusive, 1-indexed (default: last line).
+        with_line_numbers: Prefix each line with its line number (default: True).
+
+    Returns:
+        File content as a string, optionally annotated with line numbers.
+        Returns an error string (not an exception) for out-of-bounds requests.
+    """
     resolved = _resolve_allowed_path(path, _READ_WRITE_ALLOWLIST)
-    return resolved.read_text(encoding="utf-8")
+    lines = resolved.read_text(encoding="utf-8").splitlines(keepends=True)
+    total = len(lines)
+
+    # Resolve defaults
+    s = max(0, (start_line or 1) - 1)   # convert to 0-indexed, clamp negatives
+    e = min(total, end_line or total)    # clamp end beyond EOF
+
+    # Validate after clamping
+    if start_line is not None and start_line > total:
+        return (
+            f"Error: start_line ({start_line}) exceeds total lines ({total}) "
+            f"in {path}"
+        )
+    if start_line is not None and end_line is not None and start_line > end_line:
+        return (
+            f"Error: start_line ({start_line}) is greater than end_line ({end_line})"
+        )
+
+    slice_ = lines[s:e]
+    first_num = s + 1  # 1-indexed line number of first returned line
+
+    if not with_line_numbers:
+        content = "".join(slice_)
+    else:
+        content = "".join(f"{first_num + i:6}|{line}" for i, line in enumerate(slice_))
+
+    # Prepend a header when a sub-range was requested
+    if start_line is not None or end_line is not None:
+        header = (
+            f"# Lines {first_num}–{first_num + len(slice_) - 1} "
+            f"of {total} ({path})\n"
+        )
+        return header + content
+
+    return content
+
+
+def search_in_file(
+    path: str | Path,
+    pattern: str,
+    context_lines: int = 3,
+    max_matches: int = 20,
+) -> dict[str, Any]:
+    """Search a file for a regex pattern, returning matching lines with context.
+
+    Args:
+        path: File path under Algorithms/, Lib/, or docs/.
+        pattern: Python regex pattern to search for.
+        context_lines: Number of lines of context to show before and after each match.
+        max_matches: Maximum number of matches to return (default 20).
+                     Use a more specific pattern if too many results are found.
+
+    Returns:
+        dict with keys:
+          path, pattern, total_matches, shown_matches, truncated,
+          truncation_note (only when truncated), formatted (human-readable string),
+          matches (list of {line, content, context}).
+    """
+    resolved = _resolve_allowed_path(path, _READ_WRITE_ALLOWLIST)
+    lines = resolved.read_text(encoding="utf-8").splitlines()
+
+    all_match_indices: list[int] = [
+        i for i, line in enumerate(lines) if re.search(pattern, line)
+    ]
+    total = len(all_match_indices)
+    truncated = total > max_matches
+    shown_indices = all_match_indices[:max_matches]
+
+    matches: list[dict[str, Any]] = []
+    formatted_parts: list[str] = []
+
+    for idx in shown_indices:
+        ctx_start = max(0, idx - context_lines)
+        ctx_end = min(len(lines), idx + context_lines + 1)
+        context = [
+            {"line": j + 1, "content": lines[j]}
+            for j in range(ctx_start, ctx_end)
+        ]
+        matches.append({"line": idx + 1, "content": lines[idx], "context": context})
+
+        # Build formatted block for this match
+        block: list[str] = []
+        for j in range(ctx_start, ctx_end):
+            marker = ">>>" if j == idx else "   "
+            block.append(f"{j + 1:6}|{marker} {lines[j]}")
+        formatted_parts.append("\n".join(block))
+
+    result: dict[str, Any] = {
+        "path": str(resolved.relative_to(PROJECT_ROOT)),
+        "pattern": pattern,
+        "total_matches": total,
+        "shown_matches": len(shown_indices),
+        "truncated": truncated,
+        "formatted": "\n---\n".join(formatted_parts) if formatted_parts else "(no matches)",
+        "matches": matches,
+    }
+    if truncated:
+        result["truncation_note"] = (
+            f"Found {total} matches, showing first {max_matches}. "
+            "Please use a more specific pattern."
+        )
+    return result
 
 
 def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, Any]:
@@ -104,6 +221,9 @@ def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, A
         "path": str(resolved.relative_to(PROJECT_ROOT)),
         "replacements": 1,
         "changed": original != updated,
+        # For full-audit, callers can log before/after/patch based on these.
+        "before": original,
+        "after": updated,
     }
 
 
@@ -123,6 +243,7 @@ def write_new_file(path: str | Path, content: str) -> dict[str, Any]:
         "path": str(resolved.relative_to(PROJECT_ROOT)),
         "created": True,
         "size_bytes": len(content.encode("utf-8")),
+        "after": content,
     }
 
 
@@ -131,10 +252,13 @@ def overwrite_file(path: str | Path, content: str) -> dict[str, Any]:
     resolved = _resolve_allowed_path(path, _READ_WRITE_ALLOWLIST)
     if not resolved.exists():
         raise FileNotFoundError(f"Target file does not exist: {path}")
+    original = resolved.read_text(encoding="utf-8")
     _atomic_write(resolved, content)
     return {
         "path": str(resolved.relative_to(PROJECT_ROOT)),
         "overwritten": True,
+        "before": original,
+        "after": content,
     }
 
 
@@ -168,11 +292,21 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
 
     build = lake_build(target=_path_to_lean_module(rel))
     sorry_count = count_sorrys(rel)
-    error_lines = [
-        line.strip()
-        for line in build.errors.splitlines()
-        if line.strip()
+
+    all_lines = [line.strip() for line in build.errors.splitlines() if line.strip()]
+    # Prefer lines that carry a specific file:line:col: error: location — these
+    # are real Lean compiler errors.  Info/warning lines and the generic Lake
+    # summary "error: build failed" are filtered into separate buckets so the
+    # line-number extractor in main.py always sees the actionable errors first.
+    lean_error_lines = [
+        l for l in all_lines if re.search(r"\.lean:\d+:\d+:\s*error:", l)
     ]
+    warning_lines = [
+        l for l in all_lines if re.search(r"\.lean:\d+:\d+:\s*warning:", l)
+    ]
+    # Fall back to the full output when no specific error lines were found
+    # (e.g. a top-level "error: build failed" with no per-file location).
+    error_lines = lean_error_lines if lean_error_lines else all_lines
 
     return {
         "target": rel,
@@ -181,6 +315,7 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
         "sorry_count": sorry_count,
         "error_count": len(error_lines),
         "errors": error_lines,
+        "warnings": warning_lines,
     }
 
 
@@ -256,4 +391,6 @@ def apply_doc_patch(path: str | Path, anchor: str, new_content: str) -> dict[str
         "path": str(resolved.relative_to(PROJECT_ROOT)),
         "changed": True,
         "anchor": anchor,
+        "before": original,
+        "after": updated,
     }

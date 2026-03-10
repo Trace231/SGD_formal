@@ -90,11 +90,72 @@ _LEAN_ERROR_LINE_RE = re.compile(
 # problems, not signature problems — file deletion is prohibited.
 _PROOF_BODY_LINE_THRESHOLD = 50
 
+# Agent3 can receive tool results and self-fix up to this many times per attempt
+# before escalating to Agent2 for new guidance.
+MAX_AGENT3_FEEDBACK_TURNS = 3
+
 
 def _extract_first_error_line(verify_text: str) -> int | None:
     """Return the line number of the first Lean compiler error, or None."""
     m = _LEAN_ERROR_LINE_RE.search(verify_text)
     return int(m.group(1)) if m else None
+
+
+def _format_agent3_tool_feedback(
+    exec_results: list,
+    verify_result: dict,
+    target_file: str,
+    current_code: str,
+) -> str:
+    """Format tool execution results for Agent3 to analyze and fix."""
+    exit_code = int(verify_result.get("exit_code", 1))
+    sorry_count = int(verify_result.get("sorry_count", 0))
+    errors = verify_result.get("errors", [])
+    err_text = "\n".join(errors) if isinstance(errors, list) else str(errors)
+    warnings = verify_result.get("warnings", [])
+    warn_text = "\n".join(warnings) if isinstance(warnings, list) else str(warnings)
+    parts = [
+        "## Tool execution results",
+        "",
+        f"run_lean_verify({target_file}) returned:",
+        f"- exit_code: {exit_code}",
+        f"- sorry_count: {sorry_count}",
+        "",
+        "### Build errors (compiler errors with file:line:col)",
+        "```",
+        err_text[:6000] if err_text else "(no errors)",
+        "```",
+    ]
+    if warn_text:
+        parts.extend([
+            "",
+            "### Warnings (for context only — do not fix unless directly related)",
+            "```",
+            warn_text[:1500],
+            "```",
+        ])
+    parts.extend([
+        "",
+        "Analyze the errors above. Each error line shows file:line:col and the issue "
+        "(e.g. unknown identifier, wrong API, type mismatch). "
+        "Fix using edit_file_patch, then call run_lean_verify. "
+        "Output tool_calls with your fix.",
+    ])
+    failed_tools = [r for r in exec_results if r.status_code not in ("SUCCESS",)]
+    if failed_tools:
+        parts.extend([
+            "",
+            "### Other tool results",
+            *[f"- {r.message}" for r in failed_tools],
+        ])
+    parts.extend([
+        "",
+        f"### Current file ({target_file})",
+        "```lean",
+        current_code[:4000] if current_code else "(empty)",
+        "```",
+    ])
+    return "\n".join(parts)
 
 
 def _classify_lean_error(verify_text: str) -> str:
@@ -586,12 +647,14 @@ def phase3_prove(
     token_char_budget = 0
 
     # Snapshot target-file state before any Agent3 edits.
-    # Used to detect "no-op" attempts where Agent3 never touched the file.
+    # initial_hash: used for Phase-3 global success gate (file must change vs start of Phase 3).
+    # attempt_start_hash: snapshotted at the start of each attempt for per-attempt no-op detection.
     initial_hash: str | None = _file_hash(target_file)
     file_changed: bool = False  # updated each attempt
 
     for attempt in range(1, max_retries + 1):
         attempts = attempt
+        attempt_start_hash: str | None = _file_hash(target_file)
         _file_absent_prefix = (
             "CRITICAL: Target file does NOT exist. You MUST call write_new_file(path="
             f'"{target_file}", content=<complete Lean code>) as your FIRST tool call. '
@@ -607,14 +670,14 @@ def phase3_prove(
             "Each tool call must be an object: "
             '{"tool": "<name>", "arguments": {...}}.\n'
             "Allowed tools: read_file, edit_file_patch, write_new_file, run_lean_verify.\n"
-            "YOUR ROLE IS A MECHANICAL ARM, NOT A THINKER: "
-            "If guidance contains PATCH blocks (<<<SEARCH>>>/<<<REPLACE>>>), "
-            "execute each one EXACTLY as "
-            "edit_file_patch(path=<File>, old_str=<SEARCH content>, new_str=<REPLACE content>). "
-            "Do NOT paraphrase, re-derive, or reformat — copy old_str and new_str verbatim "
-            "from the PATCH block. Agent2 has already done the thinking.\n"
-            "After all patch edits call run_lean_verify once. "
-            "Do not call verify before editing.\n\n"
+            "SITUATIONAL BEHAVIOR:\n"
+            "- If guidance contains PATCH blocks (<<<SEARCH>>>/<<<REPLACE>>>): "
+            "execute them exactly — copy old_str and new_str verbatim.\n"
+            "- If you receive build errors in a follow-up: analyze the error "
+            "and line number, then fix (wrong identifier, API usage, etc.). "
+            "You have autonomy to reason and repair.\n"
+            "After edits call run_lean_verify. You will receive tool results "
+            "and can output more tool_calls to fix any errors.\n\n"
             f"Target file: {target_file}\n"
             f"Guidance:\n{guidance}"
         )
@@ -780,6 +843,8 @@ def phase3_prove(
         #   4. target file content changed since Phase 3 started
         current_hash = _file_hash(target_file)
         file_changed = _tgt.exists() and (not initial_exists or current_hash != initial_hash)
+        # Per-attempt change detection: did Agent3 touch the file THIS attempt?
+        attempt_file_changed = _tgt.exists() and (current_hash != attempt_start_hash)
 
         if exit_code == 0 and last_sorry_count == 0 and file_changed:
             # Full-library gate: verify no cascade breakage across SGDAlgorithms.
@@ -795,8 +860,8 @@ def phase3_prove(
                 prove_state = "PROVE_RETRY"
             else:
                 prove_state = "PROVE_SUCCESS"
-        elif exit_code == 0 and last_sorry_count == 0 and not file_changed:
-            # Build looks green but Agent3 never touched the file — no-op trap.
+        elif exit_code == 0 and last_sorry_count == 0 and not attempt_file_changed:
+            # Build looks green but Agent3 never touched the file this attempt — no-op trap.
             no_change_msg = (
                 "FAILURE: No changes detected in the target file. "
                 "You must use 'edit_file_patch' to implement the proof "
@@ -822,6 +887,9 @@ def phase3_prove(
                 "exit_code": exit_code,
                 "sorry_count": last_sorry_count,
                 "lean_errors": verify_text[:4000] if verify_text else "",
+                "target_file_content": (
+                    load_file(target_file)[:50000] if _tgt.exists() else None
+                ),
             })
 
         build_ok = prove_state == "PROVE_SUCCESS"
@@ -846,8 +914,8 @@ def phase3_prove(
             }
 
         # Intelligent retry prompts.
-        # Priority 1: no-op trap — Agent3 never touched the file.
-        if prove_state == "PROVE_RETRY" and not file_changed and exit_code == 0:
+        # Priority 1: no-op trap — Agent3 never touched the file THIS attempt.
+        if prove_state == "PROVE_RETRY" and not attempt_file_changed and exit_code == 0:
             guidance = agent2.call(
                 f"Attempt {attempt} NOOP — Agent3 made no file changes.\n"
                 f"Target file: {target_file}\n"
@@ -934,16 +1002,127 @@ def phase3_prove(
             )
             continue
 
-        # Priority 3b: Local Proof Error — unknown symbol deep in the proof body.
-        # The theorem statement and imports are fine; only a specific tactic step
-        # is broken.  File deletion is ABSOLUTELY PROHIBITED here.
+        # Priority 3b / Priority 4: Proof body error (LOCAL_PROOF_ERROR or PROOF_ERROR).
+        # For both cases: give Agent3 a chance to self-fix using feedback before
+        # escalating.  For LOCAL_PROOF_ERROR, fallback to sorry-degrade if
+        # Agent3 cannot fix within MAX_AGENT3_FEEDBACK_TURNS.
+        # File deletion is ABSOLUTELY PROHIBITED for both cases.
         if error_type == "LOCAL_PROOF_ERROR":
             console.print(
                 f"  [Agent3] attempt {attempt}/{max_retries} — "
                 f"[yellow]LOCAL_PROOF_ERROR at line {line_no_display} — "
-                "sorry-degrading, file preserved"
+                "giving Agent3 self-fix opportunity first"
             )
-            # Extract a short error summary (first 200 chars of the error line).
+
+        feedback_turn = 0
+        feedback_exec_results = exec_results
+        feedback_verify_result = verify_result
+        feedback_current_code = current_code
+        agent3_self_fixed = False
+
+        while feedback_turn < MAX_AGENT3_FEEDBACK_TURNS:
+            feedback_msg = _format_agent3_tool_feedback(
+                feedback_exec_results,
+                feedback_verify_result,
+                target_file,
+                feedback_current_code,
+            )
+            raw_reply = agent3.call(feedback_msg)
+            token_char_budget += len(feedback_msg) + len(raw_reply)
+            console.print(
+                f"  [Agent3] feedback turn {feedback_turn + 1}/{MAX_AGENT3_FEEDBACK_TURNS} — "
+                "analyzing errors, attempting fix"
+            )
+            try:
+                payload = json.loads(raw_reply)
+            except json.JSONDecodeError:
+                break
+            if not isinstance(payload, dict):
+                break
+            tool_calls = payload.get("tool_calls", [])
+            if not isinstance(tool_calls, list) or not tool_calls:
+                break
+
+            # Execute Agent3's fix
+            feedback_exec_results = []
+            for idx, call in enumerate(tool_calls, start=1):
+                if not isinstance(call, dict):
+                    feedback_exec_results.append(ExecutionResult(
+                        status_code="ERROR",
+                        message=f"tool_calls[{idx}] must be an object.",
+                        attempt=attempt,
+                    ))
+                    continue
+                tool_name = call.get("tool")
+                arguments = call.get("arguments", {})
+                if not isinstance(tool_name, str) or not isinstance(arguments, dict):
+                    feedback_exec_results.append(ExecutionResult(
+                        status_code="ERROR",
+                        message=f"tool_calls[{idx}] invalid tool/arguments.",
+                        attempt=attempt,
+                    ))
+                    continue
+                try:
+                    registry.call(tool_name, **arguments)
+                    feedback_exec_results.append(ExecutionResult(
+                        status_code="SUCCESS",
+                        message=f"{tool_name} executed.",
+                        attempt=attempt,
+                    ))
+                except (PermissionError, ValueError, Exception) as exc:
+                    feedback_exec_results.append(ExecutionResult(
+                        status_code="ERROR",
+                        message=f"{tool_name} failed: {exc}",
+                        attempt=attempt,
+                    ))
+
+            feedback_verify_result = registry.call("run_lean_verify", target_file)
+            feedback_exit = int(feedback_verify_result.get("exit_code", 1))
+            feedback_sorry = int(feedback_verify_result.get("sorry_count", 0))
+            feedback_current_code = (
+                load_file(target_file) if _tgt.exists() else ""
+            )
+
+            if feedback_exit == 0 and feedback_sorry == 0:
+                f_hash = _file_hash(target_file)
+                if _tgt.exists() and (not initial_exists or f_hash != initial_hash):
+                    full_build = lake_build(target="SGDAlgorithms")
+                    if full_build.returncode == 0:
+                        agent3_self_fixed = True
+                        console.print(
+                            f"  [Agent3] self-fix succeeded on feedback turn "
+                            f"{feedback_turn + 1}"
+                        )
+                        return True, attempts, "", {
+                            "execution_history": [r.__dict__ for r in execution_history],
+                            "attempt_failures": attempt_failures,
+                            "estimated_token_consumption": max(1, token_char_budget // 4),
+                            "retry_count": sum(
+                                1
+                                for r in execution_history
+                                if r.status_code in {"ERROR", "BLOCKED"}
+                            ),
+                        }
+            feedback_turn += 1
+
+        # Propagate Agent3 feedback loop's final state to outer loop variables
+        # so Agent2 receives the most up-to-date error info and file content.
+        if feedback_turn > 0:
+            exit_code = feedback_exit
+            last_sorry_count = feedback_sorry
+            verify_text = "\n".join(
+                feedback_verify_result.get("errors", [])
+                if isinstance(feedback_verify_result.get("errors"), list)
+                else [str(feedback_verify_result.get("errors", ""))]
+            )
+            current_code = feedback_current_code
+
+        # LOCAL_PROOF_ERROR fallback: if Agent3 could not self-fix, sorry-degrade.
+        if error_type == "LOCAL_PROOF_ERROR" and not agent3_self_fixed:
+            console.print(
+                f"  [Agent3] attempt {attempt}/{max_retries} — "
+                f"[yellow]LOCAL_PROOF_ERROR self-fix failed — falling back to sorry-degrade"
+            )
             err_summary_match = re.search(
                 r"error:(.+)", verify_text, re.IGNORECASE | re.DOTALL
             )
@@ -955,10 +1134,11 @@ def phase3_prove(
             guidance = agent2.call(
                 f"[LOCAL PROOF ERROR — SORRY DEGRADATION REQUIRED]\n"
                 f"Build exit code: {exit_code} | Sorry count: {last_sorry_count}\n"
-                f"Error at line {line_no_display}:\n```\n{verify_text[:1200]}\n```\n\n"
+                f"Error at line {line_no_display}:\n```\n{verify_text[:4000]}\n```\n\n"
                 f"\n=== AGENT3'S CURRENT FILE ({target_file}) ===\n"
                 f"```lean\n{current_code[:3000]}\n```\n\n"
                 f"The error is DEEP in the proof body (line {line_no_display}). "
+                f"Agent3 has already attempted self-repair but could not fix it.\n"
                 f"The theorem statement and imports are correct.\n\n"
                 f"STRICT RULES — violation causes automatic failure:\n"
                 f"1. Do NOT use write_new_file — the file must NOT be deleted or overwritten.\n"
@@ -971,10 +1151,7 @@ def phase3_prove(
             )
             continue
 
-        # Priority 4: Normal Surgeon Mode — proof body error.
-        # Use the line number already extracted above (err_line_no / line_no_display).
-
-        # Prepend patch-mismatch context when SEARCH block failed to match.
+        # Exhausted Agent3 self-fix turns — get new guidance from Agent2.
         mismatch_prefix = ""
         if patch_mismatch_detected:
             mismatch_prefix = (
@@ -1654,7 +1831,8 @@ def run(
             merged_phase3_audit.get("execution_history", []),
             merged_phase3_audit.get("attempt_failures", []),
         )
-        audit.finish_run(success, files_modified)
+        extra_snapshot = [target_file] if not success else []
+        audit.finish_run(success, files_modified, extra_files_to_snapshot=extra_snapshot)
         if files_modified:
             console.print(
                 f"[dim][Audit] Files modified: {', '.join(files_modified)}[/dim]"

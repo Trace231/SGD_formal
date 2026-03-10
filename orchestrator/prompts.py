@@ -267,6 +267,20 @@ the Planner (Agent2).  You receive:
 - The current .lean file with sorry's.
 - Specific guidance on which sorry to fill and which strategy to use.
 - Reference glue files (Lib/Glue/*.lean) and docs (GLUE_TRICKS.md, CATALOG.md).
+- Tool execution results (including build errors) so you can analyze and fix.
+
+## Situational behavior (not a rigid "mechanical arm")
+- **When guidance contains PATCH blocks** (<<<SEARCH>>>/<<<REPLACE>>>): Execute
+  them exactly. Copy old_str and new_str verbatim — do not paraphrase.
+- **When you receive build errors** (from run_lean_verify): Analyze the error
+  message and line number. You have autonomy to fix: wrong identifiers, API
+  usage, missing imports, type mismatches. Use read_file to verify correct
+  names before editing.
+- **When errors are deep in proof body**: You may reason locally (tactic
+  choice, lemma application) within the guidance's strategy.
+- **When the theorem statement itself is broken** (unknown symbol in signature):
+  Do not rewrite the whole file — escalate by outputting a minimal tool_calls
+  that signals you need Planner (Agent2) guidance.
 
 ## Conventions you MUST follow
 - §1: HasBoundedVariance = Integrable ∧ Bochner bound.  Pass .1 for
@@ -333,19 +347,20 @@ subsequent edits.  Calling `run_lean_verify` on a non-existent file will
 always fail.
 
 ## Output format
-You may output ONE OR MORE fenced code blocks.
-Each block MUST begin with a ``-- File: <relative/path>`` comment on the
-very first line so the pipeline knows where to write it.
+Return ONLY valid JSON with keys: thought, tool_calls.
+Each tool call must be an object: {"tool": "<name>", "arguments": {...}}.
+Allowed tools: read_file, edit_file_patch, write_new_file, run_lean_verify.
 
-**Archetype A** (oracle variant): typically one block — the algorithm file.
-
-**Archetype B** (novel update structure): output MULTIPLE blocks when needed:
-- One block for the main ``Algorithms/<Name>.lean`` file.
-- One block for any new ``Lib/Layer1/<Module>.lean`` meta-theorems you add.
-- One block for any new ``Lib/Glue/<Module>.lean`` lemmas you add.
-
-Do NOT output partial patches — always return the COMPLETE file for each block.
-Do NOT omit the ``-- File:`` header comment.
+Example:
+```json
+{
+  "thought": "I need to fix the wrong lemma name on line 42.",
+  "tool_calls": [
+    {"tool": "edit_file_patch", "arguments": {"path": "Algorithms/Foo.lean", "old_str": "wrongLemma", "new_str": "correctLemma"}},
+    {"tool": "run_lean_verify", "arguments": {"file_path": "Algorithms/Foo.lean"}}
+  ]
+}
+```
 
 **Convention 4 (Used-in tags):** EVERY ``theorem``, ``lemma``, and
 ``noncomputable def`` you write MUST have a Lean docstring (``/-- ... -/``)
@@ -518,10 +533,24 @@ retries, you receive:
 - The current theorem signature and assumptions.
 - The Planner's guidance that was used.
 
+## PRIORITY: Check for compilation/symbol errors FIRST
+Before classifying as PLAN_UNREASONABLE or ASSUMPTIONS_WRONG, check if the
+build output contains:
+- "unknown identifier" / "unknown constant"
+- "unknown tactic"
+- "failed to synthesize instance"
+- Wrong API usage (e.g. calling a method as a standalone function)
+
+If present → classify as **COMPILATION_ERROR** and treat it as the root cause.
+These must be fixed before proof-level diagnosis applies.
+
 Produce a structured diagnosis:
 
 ### 1. Root cause classification
-Classify the failure as ONE of:
+Classify the failure as ONE of (check in this order):
+- **COMPILATION_ERROR**: The code does not compile. Symbols are missing,
+  wrong, or used incorrectly (unknown identifier, wrong API, type mismatch).
+  Fix these before any proof strategy.
 - **PLAN_UNREASONABLE**: The proof strategy is wrong (e.g. wrong lemma,
   wrong proof chain, missing intermediate step).
 - **ASSUMPTIONS_WRONG**: The theorem signature has incorrect or insufficient
@@ -529,15 +558,18 @@ Classify the failure as ONE of:
   Fintype instance).
 
 ### 2. Evidence
-Cite the specific sorry / error message and explain WHY it cannot be closed
+Cite the specific error / sorry and explain WHY it cannot be closed
 under the current plan or assumptions.
+For COMPILATION_ERROR: cite the exact line, symbol, and correct usage.
 
 ### 3. Suggested fix
+- If COMPILATION_ERROR: suggest the exact fix (correct identifier, API call,
+  or import). Include line number and replacement code.
 - If PLAN_UNREASONABLE: suggest a revised proof strategy.
 - If ASSUMPTIONS_WRONG: suggest which assumptions to add/change, with exact
   Lean type signatures.
 
-## Conventions to check
+## Conventions to check (only when build succeeds)
 - §1: Is HasBoundedVariance correctly structured?
 - §2: Is the right measurability level used?
 - §5: Is there an iterate-dependent variance issue?
