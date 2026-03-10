@@ -669,7 +669,7 @@ def phase3_prove(
             "Return ONLY valid JSON with keys: thought, tool_calls.\n"
             "Each tool call must be an object: "
             '{"tool": "<name>", "arguments": {...}}.\n'
-            "Allowed tools: read_file, edit_file_patch, write_new_file, run_lean_verify.\n"
+            "Allowed tools: read_file, search_in_file, edit_file_patch, write_new_file, run_lean_verify.\n"
             "SITUATIONAL BEHAVIOR:\n"
             "- If guidance contains PATCH blocks (<<<SEARCH>>>/<<<REPLACE>>>): "
             "execute them exactly — copy old_str and new_str verbatim.\n"
@@ -1271,7 +1271,7 @@ def phase3b_fix_tags(
             "Use tools to add missing 'Used in:' docstring tags.\n"
             "Return ONLY valid JSON with keys: thought, tool_calls.\n"
             'Each tool call: {"tool": "<name>", "arguments": {...}}.\n'
-            "Allowed tools: read_file, edit_file_patch, run_lean_verify.\n\n"
+            "Allowed tools: read_file, search_in_file, edit_file_patch, run_lean_verify.\n\n"
             f"Task:\n{guidance}"
         )
 

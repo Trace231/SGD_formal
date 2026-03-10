@@ -319,7 +319,7 @@ Exception: declarations tagged `@[simp]` are exempt.
 ## Tool usage (MANDATORY ORDER for a new algorithm)
 You have access to the following tools.  Call them via JSON tool_calls.
 
-0. **read_file(path)** — READ FIRST, BEFORE WRITING ANYTHING
+0. **read_file(path, start_line?, end_line?, with_line_numbers?)** — READ FIRST, BEFORE WRITING ANYTHING
    - Before starting any proof or fix, call read_file on every Lib/Glue/*.lean
      and Lib/Layer0/*.lean file that may contain relevant lemmas.
      Use read_file to locate the exact lemma definition, then proceed.
@@ -327,6 +327,18 @@ You have access to the following tools.  Call them via JSON tool_calls.
    - FORBIDDEN: assume or guess any lemma name, API call, or type.
      If you have not read the file, you do not know the name.
    - Token note: one read_file call costs far less than one failed Attempt retry.
+   - Use start_line/end_line to read only the relevant portion of a large file
+     (e.g. read_file("Lib/Glue/Probability.lean", start_line=40, end_line=80)).
+
+0b. **search_in_file(path, pattern, context_lines?, max_matches?)** — SURGICAL LOOKUP
+   - Search for a regex pattern inside a file and get matching lines with context.
+   - Use this to locate a lemma by name, find all `sorry` occurrences, or check
+     whether a specific identifier exists before reading the full file.
+   - Returns matched lines with ± context_lines surrounding context and line numbers.
+   - If more than max_matches (default 20) results are found, a truncation note
+     prompts you to refine your pattern.
+   - Example: search_in_file("Lib/Glue/Probability.lean", "hasBoundedVariance")
+     before doing a full read_file, to pinpoint the exact line range.
 
 1. **write_new_file(path, content)**
    - Use this FIRST when the target file does not yet exist.
@@ -349,7 +361,7 @@ always fail.
 ## Output format
 Return ONLY valid JSON with keys: thought, tool_calls.
 Each tool call must be an object: {"tool": "<name>", "arguments": {...}}.
-Allowed tools: read_file, edit_file_patch, write_new_file, run_lean_verify.
+Allowed tools: read_file, search_in_file, edit_file_patch, write_new_file, run_lean_verify.
 
 Example:
 ```json

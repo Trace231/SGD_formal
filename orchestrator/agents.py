@@ -109,6 +109,16 @@ class Agent:
 
         self.messages.append({"role": "user", "content": full_msg})
 
+        # Token budget trimming: drop oldest exchange pairs (assistant + next user)
+        # keeping messages[0] (file context) intact.
+        # Estimate: total characters / 3 ≈ tokens (conservative for code/mixed content).
+        # Threshold 120_000 leaves ~11k token buffer for a 131_072-token model limit.
+        while len(self.messages) > 3:
+            estimated = sum(len(m["content"]) for m in self.messages) // 3
+            if estimated + self.max_tokens <= 120_000:
+                break
+            del self.messages[1:3]  # remove oldest (assistant, user) pair
+
         reply = call_llm(
             provider=self.provider,
             model=self.model,

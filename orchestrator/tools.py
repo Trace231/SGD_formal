@@ -270,6 +270,37 @@ def _path_to_lean_module(rel_path: str) -> str:
     return rel_path.removesuffix(".lean").replace("/", ".")
 
 
+def _extract_lean_error_lines(raw: str) -> list[str]:
+    """Extract Lean compiler error lines from lake build output.
+
+    Handles both Lake error formats:
+      Single-line: file.lean:L:C: error: message
+      Two-line:    file.lean:L:C: (alone)
+                   error: message         (next line)
+
+    Two-line entries are merged into a single line so that all downstream
+    regex consumers (lean_error_lines filter, _extract_first_error_line,
+    _classify_lean_error) work without modification.
+    """
+    result: list[str] = []
+    lines = raw.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        # Format 1: file.lean:L:C: error: message (everything on one line)
+        if re.search(r"\.lean:\d+:\d+:\s*error:", line):
+            result.append(line)
+        # Format 2: file.lean:L:C: alone, followed by error: ... on the next line
+        elif re.search(r"\.lean:\d+:\d+:\s*$", line) and i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            if next_line.startswith("error:"):
+                # Merge into a single line preserving the file:line:col: prefix
+                result.append(line.rstrip(": ") + ": " + next_line)
+                i += 1  # next line already consumed
+        i += 1
+    return result
+
+
 def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     """Run Lean verification and return a JSON-serializable result."""
     resolved = _resolve_allowed_path(file_path, _LEAN_VERIFY_ALLOWLIST)
@@ -298,9 +329,8 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     # are real Lean compiler errors.  Info/warning lines and the generic Lake
     # summary "error: build failed" are filtered into separate buckets so the
     # line-number extractor in main.py always sees the actionable errors first.
-    lean_error_lines = [
-        l for l in all_lines if re.search(r"\.lean:\d+:\d+:\s*error:", l)
-    ]
+    # _extract_lean_error_lines handles both single-line and two-line Lake formats.
+    lean_error_lines = _extract_lean_error_lines(build.errors)
     warning_lines = [
         l for l in all_lines if re.search(r"\.lean:\d+:\d+:\s*warning:", l)
     ]
