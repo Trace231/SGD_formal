@@ -728,6 +728,206 @@ def run_repo_verify() -> dict[str, Any]:
     }
 
 
+def search_codebase(
+    pattern: str,
+    file_glob: str = "*.lean",
+    max_matches: int = 40,
+    context_lines: int = 2,
+) -> dict[str, Any]:
+    """Search all project files matching *file_glob* for a regex pattern.
+
+    Unlike ``search_in_file``, this tool searches the **entire project tree**
+    without any path restriction.  It is read-only by nature.
+
+    Args:
+        pattern:       Python regex pattern to search for.
+        file_glob:     Glob pattern for filenames to search (default ``*.lean``).
+                       Examples: ``*.lean``, ``*.py``.
+        max_matches:   Maximum total matches returned (default 40).
+        context_lines: Lines of context around each match (default 2).
+
+    Returns:
+        dict with keys:
+          pattern, file_glob, total_matches, shown_matches, truncated,
+          formatted (human-readable string grouped by file),
+          matches (list of {file, line, content, context}).
+    """
+    import fnmatch
+    import subprocess
+
+    rg_result = None
+    try:
+        proc = subprocess.run(
+            [
+                "rg",
+                "--glob", file_glob,
+                "--line-number",
+                "--no-heading",
+                "--color", "never",
+                f"--context={context_lines}",
+                pattern,
+            ],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        rg_result = proc.stdout.splitlines()
+    except subprocess.TimeoutExpired:
+        return {
+            "pattern": pattern,
+            "file_glob": file_glob,
+            "total_matches": 0,
+            "shown_matches": 0,
+            "truncated": False,
+            "formatted": "search_codebase timed out after 30s",
+            "matches": [],
+            "error": "timeout",
+        }
+    except FileNotFoundError:
+        rg_result = None  # fall through to Python fallback
+
+    matches: list[dict[str, Any]] = []
+    formatted_blocks: dict[str, list[str]] = {}  # file → formatted lines
+
+    if rg_result is not None:
+        # Parse rg --no-heading --line-number output.
+        # Match lines: "path:lineno:content"
+        match_re = re.compile(r"^([^:]+):(\d+):(.*)")
+        for raw in rg_result:
+            m = match_re.match(raw)
+            if not m:
+                continue
+            file_rel, lineno_str, content = m.group(1), m.group(2), m.group(3)
+            lineno = int(lineno_str)
+            matches.append({"file": file_rel, "line": lineno, "content": content})
+            formatted_blocks.setdefault(file_rel, []).append(
+                f"  {lineno:5}| {content}"
+            )
+    else:
+        # Python fallback: walk project tree, filter by glob, search with re.
+        try:
+            compiled = re.compile(pattern)
+        except re.error as exc:
+            return {
+                "pattern": pattern,
+                "file_glob": file_glob,
+                "total_matches": 0,
+                "shown_matches": 0,
+                "truncated": False,
+                "formatted": f"Invalid regex pattern: {exc}",
+                "matches": [],
+                "error": "invalid_pattern",
+            }
+        for p in sorted(PROJECT_ROOT.rglob("*")):
+            if not p.is_file():
+                continue
+            if not fnmatch.fnmatch(p.name, file_glob):
+                continue
+            try:
+                text_lines = p.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeDecodeError):
+                continue
+            file_rel_str = str(p.relative_to(PROJECT_ROOT))
+            for idx, line in enumerate(text_lines):
+                if compiled.search(line):
+                    lineno = idx + 1
+                    ctx_start = max(0, idx - context_lines)
+                    ctx_end = min(len(text_lines), idx + context_lines + 1)
+                    matches.append({"file": file_rel_str, "line": lineno, "content": line})
+                    for j in range(ctx_start, ctx_end):
+                        marker = ">>>" if j == idx else "   "
+                        formatted_blocks.setdefault(file_rel_str, []).append(
+                            f"  {j + 1:5}|{marker} {text_lines[j]}"
+                        )
+
+    total = len(matches)
+    truncated = total > max_matches
+    shown = matches[:max_matches]
+
+    formatted_parts: list[str] = []
+    seen_count = 0
+    for file_rel, block_lines in formatted_blocks.items():
+        chunk: list[str] = []
+        for line in block_lines:
+            if seen_count >= max_matches:
+                break
+            chunk.append(line)
+            seen_count += 1
+        if chunk:
+            formatted_parts.append(f"{file_rel}:\n" + "\n".join(chunk))
+        if seen_count >= max_matches:
+            break
+
+    result: dict[str, Any] = {
+        "pattern": pattern,
+        "file_glob": file_glob,
+        "total_matches": total,
+        "shown_matches": len(shown),
+        "truncated": truncated,
+        "formatted": "\n\n".join(formatted_parts) if formatted_parts else "(no matches)",
+        "matches": shown,
+    }
+    if truncated:
+        result["truncation_note"] = (
+            f"Found {total} matches, showing first {max_matches}. "
+            "Use a more specific pattern or set max_matches higher."
+        )
+    return result
+
+
+def write_staging_lemma(
+    staging_path: str,
+    lean_code: str,
+    target_algo: str = "",
+) -> dict[str, Any]:
+    """Append a new Lean declaration (may contain sorry) to a staging file.
+
+    Only files under ``Lib/Glue/Staging/`` are permitted.  The staging file
+    serves as the extension point for Level-2 missing glue lemmas discovered
+    during a proof attempt.
+
+    Args:
+        staging_path: Path to the staging file (e.g.
+                      ``Lib/Glue/Staging/SVRGOuterLoop.lean``).
+        lean_code:    Complete Lean declaration(s) to append.  May contain
+                      ``sorry`` proof bodies; that is intentional.
+        target_algo:  Algorithm name (e.g. ``SVRGOuterLoop``) used to detect
+                      circular import attempts.  Leave empty to skip the check.
+
+    Returns:
+        ``{"success": True, "path": ..., "appended_chars": N}`` on success, or
+        ``{"success": False, "error": "..."}`` when a circular dependency is
+        detected.
+    """
+    _STAGING_ALLOWLIST = ("Lib/Glue/Staging",)
+
+    # --- Circular dependency guard (6a) ---
+    if target_algo:
+        import_pattern = rf"import\s+Algorithms\.{re.escape(target_algo)}"
+        if re.search(import_pattern, lean_code):
+            return {
+                "success": False,
+                "error": (
+                    f"Circular dependency rejected: lean_code contains "
+                    f"`import Algorithms.{target_algo}`. "
+                    "Staging lemmas must only import from Lib/ and Main, "
+                    "never from the target algorithm file."
+                ),
+            }
+
+    resolved = _resolve_allowed_path(staging_path, _STAGING_ALLOWLIST)
+    current = resolved.read_text(encoding="utf-8") if resolved.exists() else ""
+    separator = "\n" if current.endswith("\n") else "\n\n"
+    _atomic_write(resolved, current + separator + lean_code.strip() + "\n")
+
+    return {
+        "success": True,
+        "path": str(resolved.relative_to(PROJECT_ROOT)),
+        "appended_chars": len(lean_code),
+    }
+
+
 def apply_doc_patch(path: str | Path, anchor: str, new_content: str) -> dict[str, Any]:
     """Insert *new_content* near a regex *anchor* in a docs file.
 

@@ -49,6 +49,7 @@ class ToolRegistry:
             read_file_readonly,
             run_lean_verify,
             run_repo_verify,
+            search_codebase,
             search_in_file,
             search_in_file_readonly,
             write_new_file,
@@ -58,6 +59,7 @@ class ToolRegistry:
         self.register("read_file_readonly", read_file_readonly)
         self.register("search_in_file", search_in_file)
         self.register("search_in_file_readonly", search_in_file_readonly)
+        self.register("search_codebase", search_codebase)
         self.register("write_new_file", write_new_file)
         self.register("overwrite_file", overwrite_file)
         self.register("edit_file_patch", edit_file_patch)
@@ -72,6 +74,7 @@ class ToolRegistry:
         from orchestrator.tools import (
             read_file,
             read_file_readonly,
+            search_codebase,
             search_in_file,
             search_in_file_readonly,
         )
@@ -80,6 +83,22 @@ class ToolRegistry:
         self.register("read_file_readonly", read_file_readonly)
         self.register("search_in_file", search_in_file)
         self.register("search_in_file_readonly", search_in_file_readonly)
+        self.register("search_codebase", search_codebase)
+
+    def register_staging_tools(self, target_algo: str = "") -> None:
+        """Read-only tools + write_staging_lemma.  Used by Agent2 during mid-proof escalation."""
+        import functools
+
+        from orchestrator.tools import write_staging_lemma
+
+        self.register_readonly_tools()
+        if target_algo:
+            self.register(
+                "write_staging_lemma",
+                functools.partial(write_staging_lemma, target_algo=target_algo),
+            )
+        else:
+            self.register("write_staging_lemma", write_staging_lemma)
 
     def call(self, name: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke a registered tool by name."""

@@ -275,9 +275,12 @@ For each parameter, check explicitly:
 - Level 3: Correct theorem found, types match → give a direct PATCH block.
 - Level 2 (composition): Need to chain existing theorems → give a `have`-chain
   with every intermediate type written out.
-- Level 2 (missing glue): A needed lemma does not exist in Lib/Glue/ →
-  write its complete Lean signature first, instruct Agent3 to add it to
-  the appropriate Lib/Glue/*.lean file, THEN give the proof using it.
+- Level 2 (missing glue): A needed lemma does not exist anywhere in the project →
+  1. Call `search_codebase` first to confirm the lemma truly does not exist.
+  2. WRITE the complete Lean declaration (with `sorry` body) to the staging file
+     NOW using `write_staging_lemma`. Do NOT just describe it — materialize it.
+  3. Then give Agent3 guidance that references the new lemma by name.
+  Do NOT instruct Agent3 to write the glue. YOU write it. Agent3 proves with it.
 - Level 1: No Mathlib base exists → give a from-scratch proof outline.
 
 ### Step 3b: Write the full have-chain (MANDATORY for Level 2+ gaps)
@@ -295,31 +298,36 @@ Rules:
 - If a bridge lemma is needed because a theorem requires a fixed argument (e.g.
   `wTilde : E`) but the proof has a random variable (e.g. `w_k : Ω → E`):
     (a) Name the bridge lemma explicitly (e.g. `svrg_epoch_bridge`).
-    (b) Write its FULL Lean signature as a declaration with `sorry`.
-    (c) Instruct Agent3: "Add this lemma to Lib/Glue/Staging/X.lean with sorry
-        FIRST, then use it here."
+    (b) Write its FULL Lean declaration with `sorry` body using `write_staging_lemma`.
+    (c) Then reference it by name in your proof guidance for Agent3.
 - End with an `exact` or `linarith`/`ring` that combines the `have`s.
 
 Example — epoch contraction sorry:
   PROOF_SKETCH for svrg_epoch_contraction (line 52):
-    -- Step A: bridge lemma is missing → add to staging first
-    -- In Lib/Glue/Staging/SVRGOuterLoop.lean add:
-    --   lemma svrg_epoch_bridge (w_k : Ω → E) (hw_k : Measurable w_k)
-    --       (h_indep : ...) ... :
-    --       ∫ ω, ‖innerProcess (w_k ω) m ω - wStar‖^2 ∂P ≤
-    --         (1 - η * μ)^m * ∫ ω, ‖w_k ω - wStar‖^2 ∂P + η * σ^2 / μ := by sorry
-    -- Step B: in SVRGOuterLoop.lean:
-    --   have h_contr : ∫ ω, ‖outerProcess m (k+1) ω - wStar‖^2 ∂P ≤
-    --       (1 - η * μ)^m * ∫ ω, ‖outerProcess m k ω - wStar‖^2 ∂P + η * σ^2 / μ :=
-    --     svrg_epoch_bridge (outerProcess m k) (by measurability) ...
-    --   linarith [h_contr]
+    -- Step A: bridge lemma is missing → write to staging NOW via write_staging_lemma:
+    --   path: "Lib/Glue/Staging/SVRGOuterLoop.lean"
+    --   lean_code: (complete declaration, see Step 4 below)
+    --
+    -- /-- Joint measurability of svrgProcess with random snapshot.
+    -- Used in: svrgOuterProcess_measurable (Algorithms/SVRGOuterLoop.lean) -/
+    -- theorem svrgProcess_measurable_random_snapshot
+    --     (setup : SVRGSetup E S Ω) (w_fun g_fun : Ω → E)
+    --     (hw : Measurable w_fun) (hg : Measurable g_fun)
+    --     (hgL : Measurable (Function.uncurry setup.toSGDSetup.gradL))
+    --     (t : ℕ) :
+    --     Measurable (fun ω => setup.svrgProcess (w_fun ω) (g_fun ω) t ω) := by sorry
+    --
+    -- Step B: in SVRGOuterLoop.lean use svrgProcess_measurable_random_snapshot directly
 
-### Step 4: For Level 2 (missing glue), specify the new lemma explicitly
-Provide the full Lean declaration:
-  lemma <name> (<params>) : <statement> := by sorry
-Instruct Agent3: "Add this lemma to Lib/Glue/X.lean BEFORE filling the sorry
-in Algorithms/Y.lean." Do NOT skip this step — writing guidance that depends
-on a lemma that does not yet exist will cause Agent3 to fail immediately.
+### Step 4: For Level 2 (missing glue), the protocol is WRITE THEN GUIDE
+1. Issue a lookup to confirm the lemma does not exist (use `search_codebase`).
+2. Call `write_staging_lemma(path, lean_code)` with the complete declaration.
+   - `path`: the staging file path (e.g. `"Lib/Glue/Staging/SVRGOuterLoop.lean"`)
+   - `lean_code`: the full Lean block including docstring and `sorry` body.
+   - NEVER include `import Algorithms.*` in the lemma — this causes a build cycle.
+3. Only after writing the lemma, provide guidance for Agent3 that references it.
+Skipping step 2 will cause Agent3 to fail immediately when it tries to use a
+lemma that does not exist.
 
 ---
 
@@ -331,33 +339,42 @@ or type class, you MUST verify its exact signature.  Use a lookup request:
 ```json
 {"type": "lookup", "tool_calls": [
   {"tool": "read_file", "arguments": {"path": "Algorithms/SVRG.lean", "start_line": 35, "end_line": 55}},
-  {"tool": "search_in_file", "arguments": {"path": "Main.lean", "pattern": "svrgProcess"}}
+  {"tool": "search_in_file", "arguments": {"path": "Main.lean", "pattern": "svrgProcess"}},
+  {"tool": "search_codebase", "arguments": {"pattern": "Measurable.*fun.*ω", "file_glob": "*.lean"}}
 ]}
 ```
 
 Rules:
-- Available read-only tools: `read_file`, `search_in_file`.  No write tools.
-- Output the JSON above (with `"type": "lookup"`) to request a file lookup.
-  The system will execute the tools and return the results.
+- Available tools: `read_file`, `read_file_readonly`, `search_in_file`,
+  `search_in_file_readonly`, `search_codebase`, `write_staging_lemma`.
+- Output the JSON above (with `"type": "lookup"`) to request file lookups or
+  to invoke `write_staging_lemma`.  The system will execute the tools and
+  return the results.
 - After receiving results, continue planning or issue more lookups as needed.
 - When ready to provide final guidance for Agent3, output plain text (no
   `"type"` field needed — any non-lookup reply is treated as final guidance).
-- Use `search_in_file` first to locate a definition, then `read_file` with
-  `start_line`/`end_line` to fetch the exact signature.
+- Use `search_codebase` when you don't know which file contains a lemma.
+  Use `search_in_file` when you know the file; use `read_file` to read lines.
 - FORBIDDEN: naming a function or lemma without having read its definition.
   Invented signatures cause Agent3 failures that cost a full retry attempt.
 
-## Zero-Lookup Penalty (AUTOMATIC ENFORCEMENT)
+## Lookup Hard Gate (AUTOMATIC ENFORCEMENT — BLOCKING)
 
-The orchestrator tracks how many lookup rounds you perform before returning
-final guidance. If you return guidance without ANY lookups:
-- A WARNING is automatically prepended to your guidance text.
-- Agent3 is told all your lemma names are UNVERIFIED and must check every one.
-- This adds extra read_file turns and slows the attempt by 5–10 turns.
+The orchestrator enforces a minimum of **2 lookup rounds** before your guidance
+can be forwarded to Agent3.  If you return final guidance before completing 2
+lookup rounds:
+- The orchestrator automatically prompts you to issue additional lookups.
+- Your guidance is BLOCKED until the minimum is met.
+- If identifiers in your patch do not appear in your accumulated lookup results,
+  the orchestrator issues a Symbol Evidence Gate prompt requiring targeted lookups.
 
-RULE: Perform at least 1 lookup per sorry you give guidance on.
-If you are certain of a signature from prior context in this conversation,
-still do 1 confirmatory lookup — it costs 1 API call vs. a full 30-turn retry.
+RULE: Perform at least **2 lookup rounds** per guidance request.
+After 2+ lookups, any identifier in your guidance that was not found in the
+lookup results will be flagged and require a targeted search_codebase lookup
+before your guidance is accepted.
+
+Exception: the gate may be relaxed to 0 rounds only if `_MIN_AGENT2_LOOKUP_ROUNDS`
+is set to 0 in orchestrator configuration (not the default).
 """
 
 # -------------------------------------------------------------------
@@ -380,13 +397,39 @@ the Planner (Agent2).  You receive:
   them exactly. Copy old_str and new_str verbatim — do not paraphrase.
 - **When you receive build errors** (from run_lean_verify): Analyze the error
   message and line number. You have autonomy to fix: wrong identifiers, API
-  usage, missing imports, type mismatches. Use read_file to verify correct
-  names before editing.
+  usage, missing imports, type mismatches. **MUST call search_codebase or
+  search_in_file to verify the correct identifier/API before applying any patch.**
 - **When errors are deep in proof body**: You may reason locally (tactic
   choice, lemma application) within the guidance's strategy.
 - **When the theorem statement itself is broken** (unknown symbol in signature):
   Do not rewrite the whole file — escalate by outputting a minimal tool_calls
   that signals you need Planner (Agent2) guidance.
+
+## MANDATORY PRE-PATCH SYMBOL VERIFICATION (BLOCKING RULE)
+
+**BEFORE applying any `edit_file_patch` that introduces a new identifier** (a
+function name, lemma name, or type class name NOT already verified in this
+attempt), you MUST:
+
+1. Call `search_codebase(query="<identifier>")` or
+   `search_in_file(path="...", pattern="<identifier>")` to confirm the identifier
+   exists with the expected signature.
+2. Only after the search returns a non-empty result with the correct signature
+   may you use that identifier in a patch.
+
+**Unverified identifiers are FORBIDDEN in patches.** Patching with an
+unverified identifier causes an `unknown identifier` Lean error that wastes a
+full attempt. The orchestrator actively monitors for this violation.
+
+Exceptions (no lookup required):
+- Lean 4 / Mathlib built-in tactics: `simp`, `ring`, `linarith`, `exact`, etc.
+- Binder names and local variables introduced in the same proof block.
+- Names you defined earlier in THIS attempt (confirmed by write_new_file or a
+  prior successful edit_file_patch in this attempt).
+
+**When a dependency file (staging or import) has errors**: Do NOT rewrite the
+target algorithm file. Instead, fix the dependency file first using
+edit_file_patch, then call run_lean_verify.
 
 ## Conventions you MUST follow
 - §1: HasBoundedVariance = Integrable ∧ Bochner bound.  Pass .1 for
@@ -453,6 +496,17 @@ You have access to the following tools.  Call them via JSON tool_calls.
      prompts you to refine your pattern.
    - Example: search_in_file("Lib/Glue/Probability.lean", "hasBoundedVariance")
      before doing a full read_file, to pinpoint the exact line range.
+
+0b2. **search_codebase(pattern, file_glob?)** — CODEBASE-WIDE SEARCH
+   - Search ALL project files matching file_glob (default "*.lean") for a regex.
+   - Use when you know a proof pattern exists somewhere but NOT which file.
+   - Example: search_codebase("Measurable.*fun.*ω") to find ω-dependent measurability
+     proofs anywhere in the project without knowing the file path.
+   - Example: search_codebase("sgdProcess_measurable") to find all usages/definitions
+     of a lemma across all files.
+   - Returns matches grouped by file with surrounding context lines.
+   - WHEN TO USE: prefer this over read_file when exploring unfamiliar territory
+     or when searching for proof patterns to adapt for a new goal.
 
 0c. **request_agent2_help(stuck_at_line, error_message, diagnosis, attempts_tried)** — ESCALATE TO PLANNER
    - Use ONLY when you are stuck on a STRUCTURAL problem: the same architectural
@@ -560,8 +614,8 @@ output `"tool": "done"` and will tell you the real result.  Do NOT rely on
 your own belief that the build is clean — only `run_lean_verify` is authoritative.
 
 Allowed tools: read_file, read_file_readonly, search_in_file, search_in_file_readonly,
-edit_file_patch, write_new_file, get_lean_goal, check_lean_have, run_lean_verify,
-request_agent2_help.
+search_codebase, edit_file_patch, write_new_file, get_lean_goal, check_lean_have,
+run_lean_verify, request_agent2_help.
 
 **Convention 4 (Used-in tags):** EVERY ``theorem``, ``lemma``, and
 ``noncomputable def`` you write MUST have a Lean docstring (``/-- ... -/``)

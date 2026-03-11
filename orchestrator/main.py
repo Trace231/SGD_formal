@@ -72,29 +72,78 @@ _LIB_DECL_RE = re.compile(
 )
 
 # ---------------------------------------------------------------------------
-# Error classification — Signature Hallucination vs ordinary Proof Error
+# Error classification — four-way classifier with structured error parsing
 # ---------------------------------------------------------------------------
 
-_SIGNATURE_HALLUCINATION_RE = re.compile(
-    r"unknown identifier|unknown constant|unknown tactic|"
-    r"failed to synthesize instance",
+# "Unknown symbol" family — triggers SIGNATURE_HALLUCINATION only when the
+# error is in the declaration zone of the *target* file.
+# NOTE: 'failed to synthesize instance' is intentionally excluded; it is
+# always a proof-body problem (LOCAL_PROOF_ERROR).
+_UNKNOWN_SYMBOL_RE = re.compile(
+    r"unknown identifier|unknown constant|unknown tactic",
     re.IGNORECASE,
 )
 
-# Duplicate declarations must always trigger SIGNATURE_HALLUCINATION regardless
-# of line number — the file has grown corrupt and needs a full rewrite.
+# Type-class synthesis failures — always LOCAL_PROOF_ERROR, never hallucination.
+_TYPECLASS_FAIL_RE = re.compile(r"failed to synthesize instance", re.IGNORECASE)
+
+# Duplicate declarations always corrupt the target — full rewrite required.
 _DUPLICATE_DECL_RE = re.compile(r"has already been declared", re.IGNORECASE)
 
-# Lean standard error format: `SomeFile.lean:LINE:COL: error:`
+# Lean structured error format: file.lean:LINE:COL: error: message
+_LEAN_STRUCTURED_ERROR_RE = re.compile(
+    r"([\w./\\-]+\.lean):(\d+):(\d+):\s*error:\s*([^\n]+)",
+    re.IGNORECASE,
+)
+
+# Lake JSON error format: error: file.lean:LINE:COL: message
+_LEAN_JSON_ERROR_RE = re.compile(
+    r"^error:\s+([\w./\\-]+\.lean):(\d+):(\d+):\s*([^\n]*)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Legacy single-group line extractor — kept for callers that use it directly.
 _LEAN_ERROR_LINE_RE = re.compile(
     r"(?:[\w./\\-]+\.lean:(\d+):\d+:\s*error:"   # standard: file:line:col: error:
     r"|error:\s+[\w./\\-]+\.lean:(\d+):\d+:)",    # Lake JSON: error: file:line:col:
     re.IGNORECASE,
 )
 
-# Errors whose line number exceeds this threshold are considered proof-body
-# problems, not signature problems — file deletion is prohibited.
+# Fallback threshold used only when structured parsing yields no results.
 _PROOF_BODY_LINE_THRESHOLD = 50
+
+# Minimum Agent2 lookup rounds required before guidance is forwarded to Agent3.
+# Set to 0 to revert to the old warning-only behaviour.
+_MIN_AGENT2_LOOKUP_ROUNDS = 2
+
+# Known Lean 4 API misspellings in staging files: wrong_pattern → correct_name_hint.
+_STAGING_API_MISSPELLINGS: dict[str, str] = {
+    r"\bMeasurable\.prod_mk\b": "Measurable.prodMk",
+    r"\b\.prod_mk\b": ".prodMk",
+    r"\bsgdProcess_zero\b": "SVRGSetup.process_zero (dot notation)",
+    r"\bsgdProcess_succ\b": "SVRGSetup.process_succ (dot notation)",
+    r"\bsgdProcess_measurable\b": "SVRGSetup.svrgProcess_measurable",
+}
+
+# Snake_case identifiers that look like project-specific lemma names.
+_PROJECT_IDENT_RE = re.compile(r"\b([a-z][a-z0-9]*(?:_[a-z][a-z0-9]*){1,})\b")
+
+# Lean 4 / Mathlib tactics and keywords excluded from symbol existence checks.
+_LEAN_KEYWORDS: frozenset[str] = frozenset([
+    "linarith", "ring", "simp", "exact", "apply", "intro", "have", "show",
+    "refine", "constructor", "trivial", "decide", "norm_num", "positivity",
+    "fun", "let", "by", "do", "if", "then", "else", "match", "with", "at",
+    "mul_comm", "add_comm", "mul_one", "one_mul", "zero_mul", "mul_zero",
+    "sub_self", "add_zero", "zero_add", "neg_neg", "neg_zero",
+    "pow_succ", "pow_zero", "pow_one", "mul_pow", "add_pow",
+    "integral_const", "integral_add", "integral_sub", "integral_smul",
+    "measurable_const", "aemeasurable_const", "integral_mono",
+    "norm_nonneg", "norm_sq_nonneg", "inner_comm", "real_inner_comm",
+    "div_nonneg", "mul_nonneg", "add_nonneg", "pow_nonneg",
+    "ge_iff_le", "le_refl", "lt_irrefl", "field_simp", "push_neg",
+    "calc", "have", "suffices", "obtain", "rcases", "use", "rw", "rfl",
+    "simp_rw", "norm_cast", "push_cast", "ring_nf", "congr", "ext",
+])
 
 # Agent3 single-step interactive loop: maximum tool turns per attempt.
 # Archetype B gets a 1.5× multiplier applied in phase3_prove.
@@ -113,6 +162,176 @@ _TOP_LEVEL_KEYWORDS = re.compile(
 _DECL_START = re.compile(
     r"^(?:noncomputable\s+)?(?:def|theorem|lemma|abbrev)\s+\w",
 )
+
+
+def _parse_lean_errors(verify_text: str) -> list[dict]:
+    """Parse Lean build output into structured error records.
+
+    Returns a list of dicts with keys: file, line, col, message.
+    Handles both standard format (file:line:col: error: msg) and
+    Lake JSON format (error: file:line:col: msg).
+    """
+    errors: list[dict] = []
+    seen: set[tuple] = set()
+
+    for m in _LEAN_STRUCTURED_ERROR_RE.finditer(verify_text):
+        key = (m.group(1), m.group(2), m.group(3))
+        if key not in seen:
+            seen.add(key)
+            errors.append({
+                "file": m.group(1),
+                "line": int(m.group(2)),
+                "col": int(m.group(3)),
+                "message": m.group(4).strip(),
+            })
+
+    for m in _LEAN_JSON_ERROR_RE.finditer(verify_text):
+        key = (m.group(1), m.group(2), m.group(3))
+        if key not in seen:
+            seen.add(key)
+            errors.append({
+                "file": m.group(1),
+                "line": int(m.group(2)),
+                "col": int(m.group(3)),
+                "message": m.group(4).strip(),
+            })
+
+    return errors
+
+
+def _classify_lean_error_structured(
+    verify_text: str,
+    target_file: str,
+) -> tuple[str, list[dict]]:
+    """Four-way classifier of Lean build errors using structured error parsing.
+
+    Returns (classification, errors) where classification is one of:
+      SIGNATURE_HALLUCINATION  — unknown symbol in the *declaration zone* of target_file
+                                 (not proof body) → full rewrite allowed.
+      DEPENDENCY_COMPILE_ERROR — first/primary errors originate in a non-target file
+                                 (e.g. staging/import dep) → fix dep, do NOT rewrite target.
+      LOCAL_PROOF_ERROR        — errors are in target but in proof body, or typeclass
+                                 synthesis failures → patch only.
+      PROOF_ERROR              — all other errors (type mismatch, unsolved goals, etc.).
+    """
+    errors = _parse_lean_errors(verify_text)
+
+    # Duplicate declaration in target always corrupts the file.
+    if _DUPLICATE_DECL_RE.search(verify_text):
+        return "SIGNATURE_HALLUCINATION", errors
+
+    if not errors:
+        # No structured errors found — fall back to legacy line-threshold logic.
+        has_unknown = bool(_UNKNOWN_SYMBOL_RE.search(verify_text))
+        if not has_unknown:
+            return "PROOF_ERROR", errors
+        line_no = _extract_first_error_line(verify_text)
+        if line_no is not None and line_no <= _PROOF_BODY_LINE_THRESHOLD:
+            return "SIGNATURE_HALLUCINATION", errors
+        return "LOCAL_PROOF_ERROR", errors
+
+    # Normalise target path for comparison.  We use the full path to handle the
+    # case where staging file and target share the same basename
+    # (e.g. Lib/Glue/Staging/SVRGOuterLoop.lean vs Algorithms/SVRGOuterLoop.lean).
+    def _is_target_file(error_file: str) -> bool:
+        """True iff the error file refers to the target algorithm file."""
+        ep = Path(error_file)
+        tp = Path(target_file)
+        # Full path match (normalised).
+        if ep == tp:
+            return True
+        # Same name AND same directory-segment (Algorithms/).
+        if ep.name == tp.name and "Algorithms" in str(ep):
+            return True
+        # Relative comparison after anchoring to project root.
+        try:
+            ep_rel = ep.relative_to(PROJECT_ROOT) if ep.is_absolute() else ep
+            tp_rel = tp.relative_to(PROJECT_ROOT) if tp.is_absolute() else tp
+            return ep_rel == tp_rel
+        except ValueError:
+            return ep.name == tp.name and "Staging" not in str(ep)
+
+    target_errors = [e for e in errors if _is_target_file(e["file"])]
+    dep_errors = [e for e in errors if not _is_target_file(e["file"])]
+
+    # Primary errors come from a dependency/staging file — route to dep-fix branch.
+    if dep_errors and not target_errors:
+        return "DEPENDENCY_COMPILE_ERROR", errors
+
+    # Even if some target errors exist, if the primary (first) error is in a dep, treat
+    # as dependency compile error to avoid misrouting staging mistakes.
+    if dep_errors and errors[0]["file"] and not _is_target_file(errors[0]["file"]):
+        return "DEPENDENCY_COMPILE_ERROR", errors
+
+    # All errors are in target — classify by message content and location.
+    for e in target_errors:
+        msg = e["message"]
+        line = e["line"]
+
+        if _DUPLICATE_DECL_RE.search(msg):
+            return "SIGNATURE_HALLUCINATION", errors
+
+        # Typeclass failure — always a proof-body problem.
+        if _TYPECLASS_FAIL_RE.search(msg):
+            return "LOCAL_PROOF_ERROR", errors
+
+        if _UNKNOWN_SYMBOL_RE.search(msg):
+            # Only SIGNATURE_HALLUCINATION when error is in the declaration zone:
+            # use target file content to determine where declarations end.
+            tgt_path = PROJECT_ROOT / target_file
+            decl_zone_end = _get_decl_zone_end(tgt_path)
+            if line <= decl_zone_end:
+                return "SIGNATURE_HALLUCINATION", errors
+            return "LOCAL_PROOF_ERROR", errors
+
+    return "PROOF_ERROR", errors
+
+
+def _get_decl_zone_end(tgt_path: Path) -> int:
+    """Return the last line number of the declaration zone in a Lean file.
+
+    The declaration zone is everything up to (and including) the line where
+    the first proof body begins — i.e. the first ':= by' or ':= ' that starts
+    a proof.  Falls back to _PROOF_BODY_LINE_THRESHOLD if file is unreadable.
+    """
+    if not tgt_path.exists():
+        return _PROOF_BODY_LINE_THRESHOLD
+    try:
+        lines = tgt_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return _PROOF_BODY_LINE_THRESHOLD
+
+    # Find the first theorem/lemma/def declaration, then track until the proof body.
+    in_decl = False
+    for i, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if re.match(r"^(?:noncomputable\s+)?(?:theorem|lemma|def|abbrev)\s", stripped):
+            in_decl = True
+        if in_decl and re.search(r":=\s*by\b|:=\s*$", line):
+            return i
+    return _PROOF_BODY_LINE_THRESHOLD
+
+
+def _is_target_file_error(error_file: str, target_file: str) -> bool:
+    """Return True iff an error file path refers to the target algorithm file."""
+    ep = Path(error_file)
+    tp = Path(target_file)
+    if ep == tp:
+        return True
+    if ep.name == tp.name and "Algorithms" in str(ep):
+        return True
+    try:
+        ep_rel = ep.relative_to(PROJECT_ROOT) if ep.is_absolute() else ep
+        tp_rel = tp.relative_to(PROJECT_ROOT) if tp.is_absolute() else tp
+        return ep_rel == tp_rel
+    except ValueError:
+        return ep.name == tp.name and "Staging" not in str(ep)
+
+
+def _classify_lean_error(verify_text: str, target_file: str = "") -> str:
+    """Backwards-compatible wrapper around _classify_lean_error_structured."""
+    classification, _ = _classify_lean_error_structured(verify_text, target_file)
+    return classification
 
 
 def _extract_imported_algo_sigs(target_file: str) -> str:
@@ -255,36 +474,344 @@ def _format_agent3_tool_feedback(
     return "\n".join(parts)
 
 
-def _classify_lean_error(verify_text: str) -> str:
-    """Three-way classification of Lean build errors.
+def _lint_staging_content(staging_text: str) -> list[tuple[str, str]]:
+    """Run the staging API lint pass on staging file content.
 
-    SIGNATURE_HALLUCINATION  — unknown symbol detected within the first
-        _PROOF_BODY_LINE_THRESHOLD lines → theorem *statement* is broken →
-        full file rewrite is allowed.
-
-    LOCAL_PROOF_ERROR  — unknown symbol detected but error line is beyond the
-        threshold (deep in the proof body) → patching is the right response →
-        file deletion is PROHIBITED.
-
-    PROOF_ERROR  — all other errors (type mismatch, unsolved goals, etc.) →
-        normal Surgeon-Mode patch.
+    Returns a list of (wrong_pattern, correction_hint) pairs for each violation found.
+    An empty list means the content passed all lint checks.
     """
-    # Duplicate declarations corrupt the file regardless of where they appear —
-    # always trigger a full rewrite without checking the line threshold.
-    if _DUPLICATE_DECL_RE.search(verify_text):
-        return "SIGNATURE_HALLUCINATION"
+    violations: list[tuple[str, str]] = []
+    for pattern, hint in _STAGING_API_MISSPELLINGS.items():
+        if re.search(pattern, staging_text):
+            violations.append((pattern.strip(r"\b"), hint))
+    return violations
 
-    has_hallucination_pattern = bool(_SIGNATURE_HALLUCINATION_RE.search(verify_text))
-    if not has_hallucination_pattern:
-        return "PROOF_ERROR"
 
-    line_no = _extract_first_error_line(verify_text)
-    if line_no is not None and line_no <= _PROOF_BODY_LINE_THRESHOLD:
-        return "SIGNATURE_HALLUCINATION"
+def _format_staging_lint_feedback(
+    violations: list[tuple[str, str]],
+    staging_file: str,
+) -> str:
+    """Format staging lint violations into an actionable Agent3 feedback message."""
+    lines = [
+        "## ⚠ STAGING FILE API LINT VIOLATIONS",
+        f"The following known API misspellings were detected in {staging_file}:",
+        "",
+    ]
+    for wrong, hint in violations:
+        lines.append(f"  - `{wrong}` → correct form: `{hint}`")
+    lines += [
+        "",
+        "These misspellings WILL cause Lean compilation errors.",
+        "Fix each occurrence in the staging file BEFORE calling run_lean_verify.",
+        "Use edit_file_patch with <<<SEARCH>>>/<<<REPLACE>>> targeting the staging file.",
+    ]
+    return "\n".join(lines)
 
-    # Pattern matched but error is deep in the proof body (or no line number
-    # could be extracted — assume deep rather than nuke the file).
-    return "LOCAL_PROOF_ERROR"
+
+def _check_patch_symbols(
+    arguments: dict,
+    registry: "ToolRegistry",
+) -> str | None:
+    """Pre-flight check for identifiers in an edit_file_patch REPLACE block.
+
+    Extracts identifiers from the REPLACE text that look like external Lean API
+    names (dotted namespace.name or snake_case ≥2 segments).  For each name not
+    found in a local-variable whitelist, runs a search_codebase query.
+
+    Returns a warning string if any significant identifiers are unverifiable
+    (search returns empty), or None if all checks pass / no suspicious names found.
+    The return value is injected as a feedback message to Agent3 BEFORE the patch
+    is applied so Agent3 can self-correct.
+    """
+    # The argument key for the replace text varies: 'new_str', 'replace', 'content'.
+    replace_text = (
+        arguments.get("new_str")
+        or arguments.get("replace")
+        or arguments.get("content")
+        or ""
+    )
+    if not replace_text:
+        return None
+
+    # Collect identifiers from REPLACE blocks (<<<REPLACE>>> ... <<<END>>>).
+    replace_blocks = re.findall(
+        r"<<<REPLACE>>>(.*?)<<<END>>>", replace_text, re.DOTALL
+    )
+    search_text = "\n".join(replace_blocks) if replace_blocks else replace_text
+
+    # Dotted namespace.name identifiers.
+    dotted = re.findall(r"\b[\w]+(?:\.[\w]+)+\b", search_text)
+    # Snake_case project lemma names.
+    snake = [
+        m for m in _PROJECT_IDENT_RE.findall(search_text)
+        if m not in _LEAN_KEYWORDS
+    ]
+    candidates = list(dict.fromkeys(dotted + snake))  # deduplicate, preserve order
+
+    # Whitelist: names that are obviously local or Lean builtins.
+    _local_re = re.compile(r"^[a-z]$|^h\d*$|^ih\w*$|^x\w*$|^f\w*$|^n\w*$|^i\w*$")
+    candidates = [c for c in candidates if not _local_re.match(c)]
+
+    if not candidates:
+        return None
+
+    missing: list[str] = []
+    for name in candidates[:8]:  # limit to first 8 to avoid excessive API calls
+        try:
+            result = registry.call("search_codebase", query=name)
+            result_text = str(result)
+            if not result_text or result_text.strip() in ("", "[]", "null", "{}"):
+                missing.append(name)
+        except Exception:  # noqa: BLE001
+            pass  # search failure is not a blocker
+
+    if not missing:
+        return None
+
+    return (
+        "## ⚠ PATCH SYMBOL PRE-CHECK WARNING\n"
+        "The following identifiers in your REPLACE block could NOT be found "
+        f"in the codebase via search_codebase: {', '.join(missing)}\n\n"
+        "BEFORE applying this patch:\n"
+        "1. Call search_codebase for each name above to find the correct API.\n"
+        "2. Replace unverified names with the verified alternatives.\n"
+        "3. Then re-issue your edit_file_patch with the corrected REPLACE.\n\n"
+        "If these are local binders or names defined in the current file, "
+        "you may ignore this warning and proceed."
+    )
+
+
+def _prioritize_error_text(
+    structured_errors: list[dict],
+    raw_text: str,
+    last_edit_line: int | None,
+    target_file: str,
+    max_chars: int = 4000,
+) -> str:
+    """Return a compact, priority-sorted error string.
+
+    Replaces bare ``last_verify_text[:N]`` truncation with an ordered view:
+    1. Errors near the last edited line (±10 lines) — highest signal
+    2. Errors in the target file
+    3. Errors in the staging file
+    4. All other dependency errors
+
+    When structured_errors is empty, falls back to raw_text[:max_chars].
+    """
+    if not structured_errors:
+        return raw_text[:max_chars]
+
+    target_basename = Path(target_file).name
+
+    def _priority(e: dict) -> tuple[int, int]:
+        efile = Path(e["file"]).name
+        eline = e["line"]
+        near_edit = (
+            last_edit_line is not None
+            and abs(eline - last_edit_line) <= 10
+        )
+        is_target = efile == target_basename and "Staging" not in e["file"]
+        is_staging = "Staging" in e["file"]
+        tier = 0 if near_edit else (1 if is_target else (2 if is_staging else 3))
+        return (tier, eline)
+
+    sorted_errors = sorted(structured_errors, key=_priority)
+
+    lines: list[str] = []
+    for e in sorted_errors:
+        line = f"{e['file']}:{e['line']}:{e['col']}: error: {e['message']}"
+        lines.append(line)
+
+    combined = "\n".join(lines)
+    if len(combined) <= max_chars:
+        return combined
+
+    # Truncate: keep as many full error lines as fit within max_chars.
+    kept: list[str] = []
+    chars = 0
+    truncated = 0
+    for ln in lines:
+        if chars + len(ln) + 1 > max_chars - 40:
+            truncated += 1
+        else:
+            kept.append(ln)
+            chars += len(ln) + 1
+    result = "\n".join(kept)
+    if truncated:
+        result += f"\n... ({truncated} lower-priority errors truncated)"
+    return result
+
+
+def _infer_failure_class(error_type: str, message: str) -> str:
+    """Map an error type + message to a human-readable failure class for history."""
+    if error_type == "DEPENDENCY_COMPILE_ERROR":
+        return "SymbolMissing"
+    if error_type == "SIGNATURE_HALLUCINATION":
+        return "Structural"
+    msg = message.lower()
+    if "type mismatch" in msg:
+        return "TypeMismatch"
+    if "unsolved goals" in msg:
+        return "TacticFail"
+    if "no goals" in msg:
+        return "ExcessGoal"
+    if "unknown identifier" in msg or "unknown constant" in msg:
+        return "UnknownIdent"
+    return "Tactical"
+
+
+def _format_failed_approaches(approaches: list[dict]) -> str:
+    """Format failed_approaches list for injection into Agent2 prompts."""
+    if not approaches:
+        return ""
+    lines = [
+        "[FAILED APPROACHES HISTORY — do NOT repeat these strategies]\n"
+        "The following error signatures have already been seen in this run:"
+    ]
+    for a in approaches:
+        lines.append(
+            f"  Attempt {a['attempt']}: {a['failure_class']} @ "
+            f"{Path(a['file']).name}:{a['line']} — {a['message_summary']}"
+        )
+    lines.append(
+        "Choose a DIFFERENT approach. If you previously used a specific lemma or tactic "
+        "that produced one of the above errors, use search_codebase to find an alternative."
+    )
+    return "\n".join(lines) + "\n\n"
+
+
+def _prequery_sorry_goals(
+    registry: "ToolRegistry",
+    target_file: str,
+    guidance: str,
+    goal_cache: dict,
+    staging_has_errors: bool,
+) -> str:
+    """Query Lean LSP for proof goals at sorry lines mentioned in Agent2 guidance.
+
+    Extracts sorry line numbers from the guidance text, calls get_lean_goal for
+    each (with caching), and returns a formatted block to prepend to the
+    Agent3 prover_prompt.  Any line that cannot be resolved is silently skipped.
+
+    Degradation conditions (any one triggers a skip for that line):
+    - staging_has_errors is True (staging file broken → elaboration will fail)
+    - get_lean_goal returns error field non-None
+    - elapsed_s > 90
+
+    The cache key is (target_file, sorry_line, file_content_hash) so repeated
+    calls on an unchanged file cost 0 extra elaboration time.
+    """
+    if staging_has_errors:
+        return ""
+
+    # Extract line numbers from guidance.  Accept multiple patterns:
+    # "line 305", "Line 305:", "sorry at 305", "line numbers: 305, 307"
+    raw_lines = re.findall(
+        r"(?:line|sorry\s+at|sorry(?:\s+on)?)\s+(\d+)",
+        guidance,
+        re.IGNORECASE,
+    )
+    # Also pick up bare numbers preceded by context like "fill sorry #305"
+    raw_lines += re.findall(r"\bsorry\b.*?(\d{2,4})\b", guidance, re.IGNORECASE)
+    sorry_lines = list(dict.fromkeys(int(x) for x in raw_lines if 1 <= int(x) <= 9999))
+
+    if not sorry_lines:
+        return ""
+
+    current_hash = _file_hash(target_file)
+    tgt_path = PROJECT_ROOT / target_file
+    if not tgt_path.exists():
+        return ""
+
+    results: list[str] = []
+    for line in sorry_lines[:4]:  # cap at 4 lines to limit total LSP time
+        cache_key = (target_file, line, current_hash or "")
+        if cache_key in goal_cache:
+            cached = goal_cache[cache_key]
+        else:
+            try:
+                result = registry.call("get_lean_goal", file_path=target_file, sorry_line=line)
+            except Exception:  # noqa: BLE001
+                continue
+            goal_cache[cache_key] = result
+            cached = result
+
+        if cached.get("error") or not cached.get("goal"):
+            continue
+        if cached.get("elapsed_s", 0) > 90:
+            continue
+
+        goal_text = cached["goal"]
+        hyps = cached.get("hypotheses", [])
+        entry = f"Line {line}: {goal_text}"
+        if hyps:
+            hyp_str = "; ".join(hyps[:6])
+            entry += f"\n  Hypotheses: {hyp_str}"
+        results.append(entry)
+
+    if not results:
+        return ""
+
+    header = "## Pre-queried Lean Goal States (from LSP — authoritative)\n"
+    header += "Use these exact types when formulating `have` steps.\n"
+    body = "\n".join(results)
+    return header + body + "\n\n"
+
+
+def _retrieve_catalog_context(
+    query_terms: list[str],
+    catalog_path: Path | None = None,
+    max_entries: int = 3,
+    max_chars: int = 1200,
+) -> str:
+    """Retrieve the top-matching CATALOG.md lemma entries for query_terms.
+
+    Splits CATALOG.md on ``####`` headings, scores each entry by the sum of
+    term occurrence counts (case-insensitive), returns the top ``max_entries``
+    formatted entries concatenated and truncated to ``max_chars``.
+
+    Returns an empty string when CATALOG.md is missing, unreadable, or no
+    terms match any entry.
+    """
+    if catalog_path is None:
+        catalog_path = PROJECT_ROOT / "docs" / "CATALOG.md"
+    try:
+        content = catalog_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+    if not query_terms:
+        return ""
+
+    # Split into lemma entries by the `####` heading marker.
+    raw_entries = re.split(r"(?=^####\s)", content, flags=re.MULTILINE)
+    entries: list[tuple[int, str]] = []  # (score, text)
+    for entry in raw_entries:
+        if not entry.strip() or not entry.startswith("####"):
+            continue
+        score = sum(
+            len(re.findall(re.escape(term), entry, re.IGNORECASE))
+            for term in query_terms
+        )
+        if score > 0:
+            entries.append((score, entry.strip()))
+
+    if not entries:
+        return ""
+
+    entries.sort(key=lambda x: x[0], reverse=True)
+    top = entries[:max_entries]
+
+    block = "## Relevant CATALOG entries (auto-retrieved)\n"
+    remaining = max_chars - len(block)
+    for _, text in top:
+        chunk = text[:remaining]
+        block += chunk + "\n\n"
+        remaining -= len(chunk) + 2
+        if remaining <= 0:
+            break
+
+    return block.rstrip()
 
 
 def _extract_symbol_manifest(plan: str) -> list[dict]:
@@ -505,41 +1032,127 @@ def _parse_persister_json(raw: str) -> list:
 # Agent2 guided lookup helper
 # ---------------------------------------------------------------------------
 
+def _extract_new_identifiers_from_guidance(guidance: str) -> list[str]:
+    """Extract identifiers from a guidance/patch block that look like Lean API names.
+
+    Returns names that are likely external references (not local variables/binders):
+    - Contain a dot (namespace separator) or
+    - Are snake_case with ≥2 segments and not in _LEAN_KEYWORDS.
+    """
+    # Collect all identifiers from <<<REPLACE>>> sections first (highest signal).
+    replace_blocks: list[str] = re.findall(
+        r"<<<REPLACE>>>(.*?)<<<END>>>", guidance, re.DOTALL
+    )
+    search_space = "\n".join(replace_blocks) if replace_blocks else guidance
+
+    # Dotted names (Lean namespace.lemma style).
+    dotted = re.findall(r"\b[\w]+(?:\.[\w]+)+\b", search_space)
+    # Snake_case project lemma names (≥2 segments, not keywords).
+    snake = [
+        m for m in _PROJECT_IDENT_RE.findall(search_space)
+        if m not in _LEAN_KEYWORDS
+    ]
+    seen: set[str] = set()
+    result: list[str] = []
+    for name in dotted + snake:
+        if name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
+
+
 def _call_agent2_with_tools(
     agent2: "Agent",
     registry: "ToolRegistry",
     user_msg: str,
-    max_tool_rounds: int = 5,
+    max_tool_rounds: int = 8,
 ) -> str:
-    """Call Agent2 with optional read-only tool support.
+    """Call Agent2 with read-only tool support and a lookup hard gate.
 
     Agent2 may reply with a lookup request:
-        {"type": "lookup", "tool_calls": [{"tool": "read_file", "arguments": {...}}, ...]}
+        {"type": "lookup", "tool_calls": [{"tool": "search_codebase"|"read_file", ...}]}
     In that case the tools are executed against *registry* (read-only) and
     results are fed back to Agent2.  Any other reply format (plain text, or
-    JSON without ``"type": "lookup"``) is returned immediately as final guidance.
-    After *max_tool_rounds* the last reply is returned regardless.
+    JSON without ``"type": "lookup"``) is treated as final guidance.
 
-    When Agent2 returns final guidance without having performed any lookups,
-    a WARNING is prepended so Agent3 knows to verify lemma names before use.
+    Hard gate (P1): if Agent2 has performed fewer than _MIN_AGENT2_LOOKUP_ROUNDS
+    lookups when it declares final guidance, the orchestrator automatically
+    issues a lookup prompt and waits for at least one more lookup round before
+    accepting guidance.
+
+    Symbol evidence gate (P1): identifiers extracted from the final guidance/patch
+    are checked against the accumulated lookup results.  Any identifier that:
+      - looks like an external Lean API name (dotted or snake_case ≥2 segments)
+      - was not found in any lookup result text
+    triggers a targeted search_codebase round before guidance is forwarded.
     """
     reply = agent2.call(user_msg)
     _lookup_rounds_performed = 0
+    _accumulated_lookup_text = ""
 
-    for _ in range(max_tool_rounds):
+    for _round in range(max_tool_rounds):
         # Try to parse as JSON lookup request.
         try:
             payload = json.loads(reply)
         except (json.JSONDecodeError, ValueError):
-            break  # plain text → final guidance, exit loop to apply warning check
+            payload = None  # plain text → candidate for final guidance
 
-        if not isinstance(payload, dict) or payload.get("type") != "lookup":
-            break  # non-lookup JSON → final guidance
+        is_lookup = (
+            isinstance(payload, dict)
+            and payload.get("type") == "lookup"
+            and isinstance(payload.get("tool_calls"), list)
+            and len(payload["tool_calls"]) > 0
+        )
 
-        tool_calls = payload.get("tool_calls", [])
-        if not isinstance(tool_calls, list) or not tool_calls:
+        if not is_lookup:
+            # Agent2 declared final guidance.  Apply hard gate first.
+            if _lookup_rounds_performed < _MIN_AGENT2_LOOKUP_ROUNDS:
+                remaining = _MIN_AGENT2_LOOKUP_ROUNDS - _lookup_rounds_performed
+                forced_prompt = (
+                    f"[LOOKUP GATE] You have only performed {_lookup_rounds_performed} "
+                    f"lookup round(s). At least {_MIN_AGENT2_LOOKUP_ROUNDS} are required "
+                    "before guidance can be forwarded to Agent3.\n\n"
+                    f"You must perform {remaining} more lookup round(s). "
+                    "Issue a search_codebase or read_file lookup for each identifier "
+                    "appearing in your proposed patch that you have not yet verified. "
+                    "Reply with a lookup JSON block:\n"
+                    '{"type": "lookup", "tool_calls": [{"tool": "search_codebase", '
+                    '"arguments": {"query": "<identifier>"}}]}'
+                )
+                reply = agent2.call(forced_prompt)
+                continue  # re-enter loop to process the forced lookup
+
+            # Symbol evidence gate: verify patch identifiers against lookup results.
+            candidate_names = _extract_new_identifiers_from_guidance(reply)
+            unverified = [
+                name for name in candidate_names
+                if name not in _accumulated_lookup_text
+            ]
+            # Only demand re-check for names that really look like project/Mathlib APIs.
+            unverified_significant = [
+                n for n in unverified
+                if "." in n or (
+                    len(n.split("_")) >= 2 and n not in _LEAN_KEYWORDS
+                )
+            ]
+            if unverified_significant and _round < max_tool_rounds - 1:
+                sample = ", ".join(unverified_significant[:5])
+                evidence_prompt = (
+                    f"[SYMBOL EVIDENCE GATE] The following identifiers appear in your "
+                    f"guidance/patch but were NOT found in your lookup results: {sample}.\n\n"
+                    "You must search for each one before guidance can be forwarded. "
+                    "Issue lookup tool_calls now:\n"
+                    '{"type": "lookup", "tool_calls": [{"tool": "search_codebase", '
+                    '"arguments": {"query": "<name>"}}]}'
+                )
+                reply = agent2.call(evidence_prompt)
+                continue  # re-enter to process symbol evidence lookups
+
+            # All gates passed — return final guidance.
             break
 
+        # Execute the lookup round.
+        tool_calls: list[dict] = payload["tool_calls"]
         _lookup_rounds_performed += 1
         results: list[dict] = []
         for tc in tool_calls:
@@ -553,18 +1166,22 @@ def _call_agent2_with_tools(
                 result = {"error": str(exc)}
             results.append({"tool": tool_name, "arguments": args, "result": result})
 
+        results_text = json.dumps(results, indent=2, ensure_ascii=False)
+        _accumulated_lookup_text += results_text
+
         reply = agent2.call(
             "Lookup results:\n"
-            + json.dumps(results, indent=2, ensure_ascii=False)
+            + results_text
             + "\n\nContinue planning or issue more lookups if still needed."
         )
 
-    # Attach a warning when Agent2 produced guidance without any signature lookups.
-    # This surfaces in Agent3's context so it knows to verify names independently.
+    # If the loop ended without any lookups at all, attach an unverified warning
+    # (this can happen if the agent never produced a parseable lookup despite prompting).
     if _lookup_rounds_performed == 0:
         reply = (
-            "⚠ WARNING: Agent2 produced this guidance without performing any "
-            "signature lookups. All lemma/theorem names are UNVERIFIED. "
+            "⚠ WARNING: Agent2 produced guidance without performing any "
+            "signature lookups (hard gate was not enforced this round). "
+            "All lemma/theorem names are UNVERIFIED. "
             "Before applying any patch, call search_in_file to confirm each "
             "lemma exists with the expected signature.\n\n"
         ) + reply
@@ -926,6 +1543,96 @@ def phase2_plan_and_approve(
     return plan, agent1, agent2
 
 
+# ---------------------------------------------------------------------------
+# Escalation context helpers (Change 4 / 6b)
+# ---------------------------------------------------------------------------
+
+_ESCALATION_CHAR_LIMIT = 20_000
+
+
+def _extract_declaration_skeleton(lines: list[str]) -> str:
+    """Return a skeleton of *lines*: keep declaration headers, strip proof bodies.
+
+    A 'proof body' is everything between a line that ends with ':= by' (or
+    starts a ``:=`` assignment) and the next line at column 0 that starts a new
+    top-level declaration (``def``, ``theorem``, ``lemma``, ``noncomputable``,
+    ``structure``, ``namespace``, ``end``, ``--``, ``#``, blank).
+    """
+    DECL_KW = re.compile(r"^\s*(def |theorem |lemma |noncomputable |structure |namespace |end |@\[|--|\s*#)")
+    in_body = False
+    result: list[str] = []
+    for line in lines:
+        stripped = line.rstrip()
+        if DECL_KW.match(line):
+            in_body = False
+        if in_body:
+            continue
+        result.append(stripped)
+        if re.search(r":=\s*by\s*$", stripped) or re.search(r":=\s*$", stripped):
+            result.append("  sorry  -- (proof body omitted in skeleton)")
+            in_body = True
+    return "\n".join(result)
+
+
+def _build_escalation_file_context(target_file: str, stuck_line: int | None = None) -> str:
+    """Return file content for Agent2 escalation with a soft 20k-char cap.
+
+    If the file fits within *_ESCALATION_CHAR_LIMIT* characters it is returned
+    verbatim.  Otherwise a declaration skeleton plus a ±200-line window around
+    *stuck_line* (when provided) is returned instead.
+    """
+    try:
+        content = load_file(target_file)
+    except Exception:  # noqa: BLE001
+        return "(file missing or unreadable)"
+
+    if len(content) <= _ESCALATION_CHAR_LIMIT:
+        return content
+
+    lines = content.splitlines()
+    skeleton = _extract_declaration_skeleton(lines)
+
+    if stuck_line is not None:
+        window_start = max(0, stuck_line - 200)
+        window_end = min(len(lines), stuck_line + 200)
+        window = "\n".join(lines[window_start:window_end])
+        return (
+            f"-- SKELETON (proof bodies omitted for brevity)\n{skeleton}\n\n"
+            f"-- FULL CONTEXT around line {stuck_line} (±200 lines)\n{window}"
+        )
+    return f"-- SKELETON (proof bodies omitted; file exceeds {_ESCALATION_CHAR_LIMIT} chars)\n{skeleton}"
+
+
+def _audit_staging_usage(
+    target_file: str,
+    staging_path: "Path",
+    console_print: "Any",
+) -> dict[str, bool]:
+    """Return ``{lemma_name: used}`` for all declarations in the staging file.
+
+    Scans the final algorithm file for each declaration name found in the
+    staging file and reports whether it is referenced at least once.
+    """
+    if not staging_path.exists():
+        return {}
+    try:
+        target_content = load_file(target_file)
+    except Exception:  # noqa: BLE001
+        target_content = ""
+
+    staging_content = staging_path.read_text(encoding="utf-8")
+    decl_names = re.findall(r"(?:theorem|lemma|def)\s+(\w+)", staging_content)
+
+    usage: dict[str, bool] = {}
+    for name in decl_names:
+        used = bool(re.search(rf"\b{re.escape(name)}\b", target_content))
+        usage[name] = used
+        status = "USED" if used else "UNUSED (candidate for cleanup)"
+        console_print(f"  [Staging] {name} — {status}")
+
+    return usage
+
+
 def phase3_prove(
     agent2: Agent,
     target_file: str,
@@ -953,6 +1660,12 @@ def phase3_prove(
     # Read-only registry for Agent2 lookup rounds (no write tools exposed).
     readonly_registry = ToolRegistry()
     readonly_registry.register_readonly_tools()
+    # Staging registry: read tools + write_staging_lemma for Agent2 mid-proof escalation.
+    # target_algo is extracted from the target file stem and passed as a partial so that
+    # the circular-dependency guard in write_staging_lemma knows which algorithm to block.
+    _algo_name_for_staging = Path(target_file).stem  # e.g. "SVRGOuterLoop"
+    staging_registry = ToolRegistry()
+    staging_registry.register_staging_tools(target_algo=_algo_name_for_staging)
     diag_log: list[str] = []
 
     # Pre-check: if the target file already has 0 sorry and builds clean,
@@ -1077,6 +1790,21 @@ def phase3_prove(
     attempt_failures: list[dict] = []
     token_char_budget = 0
 
+    # Circuit breaker: track consecutive repeat error signatures.
+    # Key: normalized (file, line, message) hash of the primary error.
+    # If the same signature appears in two consecutive attempts, force Surgeon Mode.
+    _last_error_sig: str | None = None
+    _consecutive_repeat_count: int = 0
+
+    # Failed approaches history: accumulates structured failure records across attempts.
+    # Injected into Agent2 prompts so it avoids repeating strategies that already failed.
+    _failed_approaches: list[dict] = []
+
+    # get_lean_goal cache: avoids re-running expensive LSP elaboration when the
+    # file content and sorry line are identical across attempts.
+    # Key: (target_file_relative, sorry_line, file_content_hash)
+    _goal_cache: dict[tuple[str, int, str], dict] = {}
+
     # Snapshot target-file state before any Agent3 edits.
     # initial_hash: used for Phase-3 global success gate (file must change vs start of Phase 3).
     # attempt_start_hash: snapshotted at the start of each attempt for per-attempt no-op detection.
@@ -1130,7 +1858,8 @@ def phase3_prove(
             "To signal no further actions are needed: "
             '{"thought": "...", "tool": "done", "arguments": {}}\n'
             "Allowed tools: read_file, read_file_readonly, search_in_file, search_in_file_readonly, "
-            "edit_file_patch, write_new_file, check_lean_have, run_lean_verify, request_agent2_help.\n"
+            "search_codebase, edit_file_patch, write_new_file, get_lean_goal, check_lean_have, "
+            "run_lean_verify, request_agent2_help.\n"
             "SITUATIONAL BEHAVIOR:\n"
             "- If guidance contains PATCH blocks (<<<SEARCH>>>/<<<REPLACE>>>): "
             "execute them exactly — copy old_str and new_str verbatim.\n"
@@ -1138,12 +1867,12 @@ def phase3_prove(
             "- After any edit call run_lean_verify to confirm.\n\n"
             "GLUE STAGING RULE (non-negotiable):\n"
             f"- You may edit: {target_file}, {_staging_rel}\n"
-            "- All existing Lib/Glue/*.lean files are READ-ONLY. "
-            "Do not call edit_file_patch on Lib/Glue/Probability.lean, "
-            "Lib/Glue/Algebra.lean, Lib/Glue/Measurable.lean, or Lib/Glue/Calculus.lean.\n"
+            "- Lib/Glue/Probability.lean, Algebra.lean, Measurable.lean, Calculus.lean: READ-ONLY.\n"
             "- All Lib/Layer0/*.lean files (ConvexFOC.lean, IndepExpect.lean, GradientFTC.lean) "
             "are READ-ONLY. Use read_file_readonly to inspect them, never edit_file_patch.\n"
-            f"- When you need a new helper lemma, add it to {_staging_rel}.\n"
+            f"- NEW glue lemmas (Level 2 gaps) go to {_staging_rel}.\n"
+            f"  Agent2 may have already written them there — check the staging file section below.\n"
+            "  A staging lemma may have `sorry` body; that is intentional and not penalized.\n"
             f"- {_staging_rel} already imports all main Lib/Glue files.\n"
             "- BEFORE adding any new 'import X' statement to any file, call "
             "read_file_readonly(\"Main.lean\") or read_file_readonly(\"lakefile.lean\") "
@@ -1160,8 +1889,35 @@ def phase3_prove(
             + "\n"
             f"Target file: {target_file}\n"
             + (_imported_sigs_block.lstrip("\n") + "\n" if _imported_sigs_block else "")
+            + (
+                "\n## Staging file (writable — add new glue lemmas here)\n"
+                f"File: {_staging_rel}\n"
+                "```lean\n"
+                + (_staging_path.read_text(encoding="utf-8") if _staging_path.exists() else "")
+                + "\n```\n"
+                "If a lemma is NOT in Lib/Glue/*.lean but IS in this staging file, use it directly.\n"
+                f"To add a new lemma: edit_file_patch on {_staging_rel}.\n\n"
+            )
             + f"Guidance:\n{guidance}"
         )
+
+        # Pre-query Lean goal states for sorry lines mentioned in guidance.
+        # Skip when staging has errors (elaboration would fail / timeout).
+        _staging_has_errors = (
+            last_exit_code != 0
+            and last_verify_text
+            and any("Staging" in e.get("file", "") for e in _parse_lean_errors(last_verify_text))
+        ) if attempt > 1 else False  # no prior error on attempt 1
+        _goal_block = _prequery_sorry_goals(
+            registry, target_file, guidance, _goal_cache, _staging_has_errors
+        )
+        if _goal_block:
+            console.print(
+                f"  [GoalPreQuery] attempt {attempt} — injected goal states for "
+                f"{_goal_block.count('Line ')} sorry line(s)"
+            )
+            prover_prompt = prover_prompt + "\n\n" + _goal_block
+
         raw_reply = agent3.call(prover_prompt)
         token_char_budget += len(prover_prompt) + len(raw_reply)
 
@@ -1173,6 +1929,28 @@ def phase3_prove(
         last_sorry_in_attempt = 0
         last_verify_text = ""
         last_verify_result: dict | None = None
+        # Runtime trajectory check (P2): track whether Agent3 has done any
+        # symbol lookup since last edit, so we can warn when it patches blind.
+        _lookup_done_since_last_edit: bool = False
+        _patch_without_lookup_count: int = 0
+
+        # Staging file lint check at start of each attempt.
+        # If the staging file already has known API misspellings, alert Agent3
+        # immediately so it fixes them before the first verify.
+        if _staging_path.exists():
+            _staging_lint_violations = _lint_staging_content(
+                _staging_path.read_text(encoding="utf-8")
+            )
+            if _staging_lint_violations:
+                _lint_feedback = _format_staging_lint_feedback(
+                    _staging_lint_violations, _staging_rel
+                )
+                console.print(
+                    f"  [StagingLint] attempt {attempt} — "
+                    f"{len(_staging_lint_violations)} lint violation(s) found in staging file"
+                )
+                raw_reply = agent3.call(_lint_feedback)
+                token_char_budget += len(_lint_feedback) + len(raw_reply)
 
         # -------------------------------------------------------------------
         # Single-step interactive tool loop
@@ -1297,14 +2075,15 @@ def phase3_prove(
                     f"attempt={attempt} turn={tool_turn} "
                     f"Agent3 escalation: {diagnosis[:200]}"
                 )
-                current_file_snippet = ""
-                try:
-                    current_file_snippet = load_file(target_file)[:8000]
-                except Exception:  # noqa: BLE001
-                    current_file_snippet = "(file missing or unreadable)"
+                _stuck_line_int = int(stuck_at_line) if str(stuck_at_line).isdigit() else None
+                current_file_snippet = _build_escalation_file_context(target_file, _stuck_line_int)
+                _staging_snippet = (
+                    _staging_path.read_text(encoding="utf-8")
+                    if _staging_path.exists() else "(staging file is empty)"
+                )
                 new_guidance = _call_agent2_with_tools(
                     agent2,
-                    readonly_registry,
+                    staging_registry,
                     f"[AGENT3 ESCALATION — MID-ATTEMPT HELP REQUEST]\n"
                     f"Agent3 is stuck on line {stuck_at_line} after "
                     f"{attempts_tried} turns.\n\n"
@@ -1312,10 +2091,14 @@ def phase3_prove(
                     f"Agent3's diagnosis:\n{diagnosis}\n\n"
                     f"=== CURRENT FILE ({target_file}) ===\n"
                     f"```lean\n{current_file_snippet}\n```\n\n"
+                    f"=== STAGING FILE ({_staging_rel}) ===\n"
+                    f"```lean\n{_staging_snippet}\n```\n\n"
                     "Apply your Sorry-Fill Proof Path Protocol. "
                     "Classify the problem as structural (A) or tactical (B) "
                     "and provide revised, concrete guidance with exact Lean API "
-                    "calls. Agent3 will continue in the SAME attempt.",
+                    "calls. Agent3 will continue in the SAME attempt.\n"
+                    "If a Level-2 missing glue lemma is needed, use write_staging_lemma "
+                    f"to add it to {_staging_rel} NOW — do not just describe it.",
                 )
                 esc_result_msg = (
                     f"## Agent2 Revised Guidance (escalation #{_escalation_count})\n"
@@ -1334,6 +2117,49 @@ def phase3_prove(
                 token_char_budget += len(esc_result_msg) + len(raw_reply)
                 continue
 
+            # Track lookup activity for runtime trajectory check.
+            _is_lookup_tool = tool_name in (
+                "read_file", "read_file_readonly",
+                "search_in_file", "search_in_file_readonly", "search_codebase",
+            )
+            if _is_lookup_tool:
+                _lookup_done_since_last_edit = True
+
+            # Patch symbol pre-check: warn Agent3 about unverified identifiers
+            # before applying the patch (P1 - symbol existence gate).
+            if tool_name == "edit_file_patch":
+                # Runtime trajectory check (P2): warn if Agent3 patches without
+                # any preceding lookup in this attempt.
+                if not _lookup_done_since_last_edit and tool_turn > 0:
+                    _patch_without_lookup_count += 1
+                    if _patch_without_lookup_count <= 2:
+                        _traj_warning = (
+                            "## ⚠ TRAJECTORY VIOLATION — PATCH WITHOUT LOOKUP\n"
+                            "You are about to apply a patch without having called "
+                            "search_codebase, search_in_file, or read_file since the "
+                            "last edit in this attempt.\n\n"
+                            "Per the MANDATORY PRE-PATCH SYMBOL VERIFICATION rule, you MUST "
+                            "verify each new identifier before patching.\n\n"
+                            "Call search_codebase or search_in_file for the identifiers in "
+                            "your REPLACE block NOW, then re-issue your edit_file_patch.\n\n"
+                            "Exception: if these are Lean built-in tactics (simp, ring, etc.) "
+                            "or local binders, you may ignore this warning."
+                        )
+                        raw_reply = agent3.call(_traj_warning)
+                        token_char_budget += len(_traj_warning) + len(raw_reply)
+                        continue  # let Agent3 do a lookup before patching
+                _lookup_done_since_last_edit = False  # reset after edit
+
+                _patch_warning = _check_patch_symbols(arguments, registry)
+                if _patch_warning:
+                    console.print(
+                        f"  [PatchSymbolCheck] attempt {attempt} turn {tool_turn + 1} — "
+                        "unverified identifiers detected, feeding back to Agent3"
+                    )
+                    raw_reply = agent3.call(_patch_warning)
+                    token_char_budget += len(_patch_warning) + len(raw_reply)
+                    continue  # let Agent3 self-correct before applying patch
+
             # Execute single tool and format result for Agent3
             result_msg, verify_result, edited = _execute_single_tool_and_format(
                 registry, tool_name, arguments, target_file
@@ -1342,6 +2168,26 @@ def phase3_prove(
 
             if edited:
                 edited_this_attempt = True
+                # Post-edit staging lint: if the edited file is the staging file,
+                # run lint immediately and feed violations back to Agent3.
+                _edited_path_str = str(arguments.get("path", ""))
+                if (
+                    _edited_path_str
+                    and "Staging" in _edited_path_str
+                    and _staging_path.exists()
+                ):
+                    _post_lint = _lint_staging_content(
+                        _staging_path.read_text(encoding="utf-8")
+                    )
+                    if _post_lint:
+                        _post_lint_msg = _format_staging_lint_feedback(
+                            _post_lint, _staging_rel
+                        )
+                        console.print(
+                            f"  [StagingLint] post-edit — "
+                            f"{len(_post_lint)} violation(s) remain in staging file"
+                        )
+                        result_msg = result_msg + "\n\n" + _post_lint_msg
             if "PATCH MISMATCH" in result_msg:
                 patch_mismatch_in_attempt = True
 
@@ -1390,19 +2236,28 @@ def phase3_prove(
                 if last_exit_code != 0 and last_verify_text:
                     console.print(f"[dim]  {last_verify_text[:400]}[/dim]")
 
+                # Parse structured errors for inner loop (used by prioritize + routing).
+                _structured_errors_inner = _parse_lean_errors(last_verify_text)
+                _inner_err_line = _extract_first_error_line(last_verify_text)
+
                 if last_exit_code != 0:
                     attempt_failures.append({
                         "attempt": attempt,
                         "exit_code": last_exit_code,
                         "sorry_count": last_sorry_in_attempt,
-                        "lean_errors": last_verify_text[:4000],
+                        "lean_errors": _prioritize_error_text(
+                            _structured_errors_inner, last_verify_text,
+                            _inner_err_line, target_file
+                        ),
                         "target_file_content": (
                             load_file(target_file)[:50000] if _tgt.exists() else None
                         ),
                     })
 
-                # SIGNATURE_HALLUCINATION: break inner loop, delete file, replan
-                error_type = _classify_lean_error(last_verify_text)
+                # Classify error with structured parser, passing target_file for routing.
+                error_type, _structured_errors_inner = _classify_lean_error_structured(
+                    last_verify_text, target_file
+                )
                 err_line_no = _extract_first_error_line(last_verify_text)
                 line_no_display = str(err_line_no) if err_line_no is not None else "unknown"
 
@@ -1448,9 +2303,11 @@ def phase3_prove(
                         file_changed = False
                     guidance = _call_agent2_with_tools(
                         agent2,
-                        readonly_registry,
+                        staging_registry,
                         f"[STATEMENT ERROR — SIGNATURE HALLUCINATION]\n"
-                        f"Lean error excerpt:\n```\n{last_verify_text[:800]}\n```\n\n"
+                        f"Lean error excerpt:\n```\n"
+                        f"{_prioritize_error_text(_structured_errors_inner, last_verify_text, _inner_err_line, target_file, max_chars=800)}"
+                        f"\n```\n\n"
                         "The theorem STATEMENT itself is broken: it references a symbol "
                         "that does not exist in Lean or Lib/.\n"
                         "The old file has been DELETED. You MUST now rewrite it from scratch.\n\n"
@@ -1471,6 +2328,41 @@ def phase3_prove(
                         f"[yellow]LOCAL_PROOF_ERROR at line {line_no_display} "
                         f"(turn {tool_turn + 1}) — Agent3 continues self-fix"
                     )
+
+                if error_type == "DEPENDENCY_COMPILE_ERROR":
+                    # Errors originate from a staging/dependency file, not target.
+                    # Do NOT rewrite target — route to dependency fix via Agent2.
+                    _dep_only = [
+                        e for e in _structured_errors_inner
+                        if not _is_target_file_error(e["file"], target_file)
+                    ]
+                    _dep_errors_text = (
+                        _prioritize_error_text(_dep_only, last_verify_text, _inner_err_line, target_file, max_chars=1200)
+                        if _dep_only else last_verify_text[:800]
+                    )
+                    console.print(
+                        f"  [Agent3] attempt {attempt}/{max_retries} — "
+                        "[cyan]DEPENDENCY_COMPILE_ERROR — routing to dep-fix (staging fix)"
+                    )
+                    execution_history.extend(exec_results)
+                    guidance = _call_agent2_with_tools(
+                        agent2,
+                        staging_registry,
+                        f"[DEPENDENCY COMPILE ERROR — STAGING/IMPORT FILE BROKEN]\n"
+                        f"Errors are in a dependency or staging file, NOT in {target_file}.\n\n"
+                        f"Failing dependency errors:\n```\n{_dep_errors_text}\n```\n\n"
+                        f"Target file ({target_file}) is NOT the source of errors — "
+                        "do NOT rewrite or delete the target.\n\n"
+                        "REQUIRED ACTION:\n"
+                        "1. search_codebase to find the correct Lean 4 / Mathlib API names "
+                        "for any unknown identifiers.\n"
+                        "2. Use write_staging_lemma or edit_file_patch to fix the staging "
+                        f"file ({_staging_rel}) only.\n"
+                        "3. Output a PATCH block (<<<SEARCH>>>/<<<REPLACE>>>) with the "
+                        "exact fix. Reference verified API names only.",
+                    )
+                    _inner_break_reason = "dep_compile_error"
+                    break  # start next attempt with dep-fix guidance
 
             # Return tool result to Agent3 for next decision
             raw_reply = agent3.call(result_msg)
@@ -1513,14 +2405,20 @@ def phase3_prove(
 
         execution_history.extend(exec_results)
 
-        # If inner loop broke due to hallucination, continue outer loop (guidance already set)
-        if _inner_break_reason == "hallucination":
+        # If inner loop broke due to hallucination or dep error, continue outer loop
+        # (guidance already set by the break handler above)
+        if _inner_break_reason in ("hallucination", "dep_compile_error"):
             continue
 
         # Classify the final error state for this attempt
-        error_type_final = _classify_lean_error(last_verify_text) if last_verify_text else "PROOF_ERROR"
+        error_type_final, _structured_errors_final = (
+            _classify_lean_error_structured(last_verify_text, target_file)
+            if last_verify_text else ("PROOF_ERROR", [])
+        )
         err_line_no_final = _extract_first_error_line(last_verify_text)
         line_no_display_final = str(err_line_no_final) if err_line_no_final is not None else "unknown"
+        # Precompute int version of final error line for _build_escalation_file_context
+        _err_line_int = int(line_no_display_final) if line_no_display_final.isdigit() else None
 
         current_code = (
             load_file(target_file)
@@ -1535,7 +2433,7 @@ def phase3_prove(
         if not _tgt.exists():
             guidance = _call_agent2_with_tools(
                 agent2,
-                readonly_registry,
+                staging_registry,
                 f"Attempt {attempt} failed: Target file still does not exist.\n"
                 f"Agent3 did NOT call write_new_file. You MUST output the FULL Lean file content "
                 f'and explicitly instruct Agent3 to call write_new_file(path="{target_file}", '
@@ -1553,7 +2451,7 @@ def phase3_prove(
         if not attempt_file_changed and last_exit_code == 0 and last_sorry_in_attempt == 0:
             guidance = _call_agent2_with_tools(
                 agent2,
-                readonly_registry,
+                staging_registry,
                 f"Attempt {attempt} NOOP — Agent3 made no file changes.\n"
                 f"Target file: {target_file}\n"
                 "SURGEON MODE: Output a PATCH block (<<<SEARCH>>>/<<<REPLACE>>>) with the "
@@ -1562,6 +2460,43 @@ def phase3_prove(
             console.print(
                 f"  [Agent3] attempt {attempt}/{max_retries} — "
                 "build=NOOP (file unchanged)"
+            )
+            continue
+
+        # DEPENDENCY_COMPILE_ERROR: staging/dep broken — fix dep, never rewrite target
+        if error_type_final == "DEPENDENCY_COMPILE_ERROR":
+            _dep_only_final = [
+                e for e in _structured_errors_final
+                if not _is_target_file_error(e["file"], target_file)
+            ]
+            _dep_errors_final = (
+                _prioritize_error_text(_dep_only_final, last_verify_text, _err_line_int, target_file, max_chars=1200)
+                if _dep_only_final else last_verify_text[:800]
+            )
+            console.print(
+                f"  [Agent3] attempt {attempt}/{max_retries} — "
+                "[cyan]DEPENDENCY_COMPILE_ERROR (post-attempt) — routing to dep-fix"
+            )
+            _dep_staging_ctx = (
+                _staging_path.read_text(encoding="utf-8")
+                if _staging_path.exists() else "(staging file is empty)"
+            )
+            guidance = _call_agent2_with_tools(
+                agent2,
+                staging_registry,
+                _format_failed_approaches(_failed_approaches[-5:])
+                + f"[DEPENDENCY COMPILE ERROR — ATTEMPT {attempt} FAILED]\n"
+                f"Errors are in a dependency/staging file, NOT in {target_file}.\n\n"
+                f"Dependency errors:\n```\n{_dep_errors_final}\n```\n\n"
+                f"=== STAGING FILE ({_staging_rel}) ===\n"
+                f"```lean\n{_dep_staging_ctx}\n```\n\n"
+                "Do NOT rewrite or delete the target file.\n\n"
+                "REQUIRED:\n"
+                "1. search_codebase to find the correct Lean 4 / Mathlib API for each "
+                "unknown identifier shown above.\n"
+                "2. Fix the staging file using write_staging_lemma or edit_file_patch.\n"
+                "3. Output a PATCH block (<<<SEARCH>>>/<<<REPLACE>>>) with exact correct API.\n"
+                "Use only API names you have verified via search_codebase.",
             )
             continue
 
@@ -1580,21 +2515,32 @@ def phase3_prove(
                 if err_summary_match
                 else last_verify_text[:120].replace("\n", " ")
             )
+            _escalation_file_ctx = _build_escalation_file_context(target_file, _err_line_int)
+            _staging_content_ctx = (
+                _staging_path.read_text(encoding="utf-8")
+                if _staging_path.exists() else "(staging file is empty)"
+            )
             guidance = _call_agent2_with_tools(
                 agent2,
-                readonly_registry,
-                f"[LOCAL PROOF ERROR — DIAGNOSIS REQUIRED]\n"
+                staging_registry,
+                _format_failed_approaches(_failed_approaches[-5:])
+                + f"[LOCAL PROOF ERROR — DIAGNOSIS REQUIRED]\n"
                 f"Build exit code: {last_exit_code} | Sorry count: {last_sorry_in_attempt}\n"
-                f"Error at line {line_no_display_final}:\n```\n{last_verify_text[:4000]}\n```\n\n"
+                f"Error at line {line_no_display_final}:\n```\n"
+                f"{_prioritize_error_text(_structured_errors_final, last_verify_text, _err_line_int, target_file)}"
+                f"\n```\n\n"
                 f"\n=== AGENT3'S CURRENT FILE ({target_file}) ===\n"
-                f"```lean\n{current_code[:10000]}\n```\n\n"
+                f"```lean\n{_escalation_file_ctx}\n```\n\n"
+                f"=== STAGING FILE ({_staging_rel}) ===\n"
+                f"```lean\n{_staging_content_ctx}\n```\n\n"
                 f"Agent3 used all {max_tool_turns} turns on line {line_no_display_final} "
                 f"and could not fix the error.\n\n"
                 f"DIAGNOSE FIRST — apply your Sorry-Fill Proof Path Protocol:\n\n"
                 f"(A) STRUCTURAL error (type incompatibility, missing glue lemma, wrong proof\n"
                 f"    approach that cannot be fixed by patching the current code):\n"
                 f"    → Do NOT sorry-degrade. Provide a NEW proof strategy for the next attempt.\n"
-                f"    → If a Lib/Glue lemma is missing, output its complete Lean signature.\n"
+                f"    → If a Level-2 glue lemma is missing, use write_staging_lemma to add it\n"
+                f"      to {_staging_rel} NOW (with sorry body). Do not just describe it.\n"
                 f"    → Explain why the current approach fails at the type level.\n\n"
                 f"(B) TACTICAL error (wrong tactic name, wrong lemma identifier, minor\n"
                 f"    type mismatch fixable with a one-line rewrite):\n"
@@ -1606,8 +2552,11 @@ def phase3_prove(
                 f"1. Do NOT use write_new_file — the file must NOT be deleted or overwritten.\n"
                 f"2. Use edit_file_patch with <<<SEARCH>>>/<<<REPLACE>>> for any patch.\n"
                 f"3. SEARCH must be copied verbatim from the current file shown above.\n"
-                f"4. For case A with a missing Lib/Glue lemma: first do a lookup to confirm\n"
-                f"   the lemma truly does not exist, then write its full signature.",
+                f"4. For case A with a missing glue lemma: use write_staging_lemma first,\n"
+                f"   then reference it in your guidance for Agent3.\n\n"
+                + _retrieve_catalog_context(
+                    _extract_new_identifiers_from_guidance(last_verify_text + "\n" + err_summary)
+                ),
             )
             continue
 
@@ -1624,33 +2573,100 @@ def phase3_prove(
         if _inner_break_reason == "json_error":
             guidance = _call_agent2_with_tools(
                 agent2,
-                readonly_registry,
+                staging_registry,
                 f"Attempt {attempt} failed.\n"
                 "Agent3 returned invalid JSON. Last error: " + last_errors + "\n"
                 "Adjust your guidance so Agent3 outputs strict single-action JSON.",
             )
             continue
 
+        # Circuit breaker: detect repeat error signatures across consecutive attempts.
+        # Normalise primary error as (file, line, first 80 chars of message).
+        _primary_err = _structured_errors_final[0] if _structured_errors_final else None
+        if _primary_err:
+            _err_sig = hashlib.md5(
+                f"{_primary_err['file']}:{_primary_err['line']}:"
+                f"{_primary_err['message'][:80]}".encode()
+            ).hexdigest()
+        else:
+            _err_sig = hashlib.md5(last_verify_text[:200].encode()).hexdigest() if last_verify_text else ""
+
+        if _err_sig and _err_sig == _last_error_sig:
+            _consecutive_repeat_count += 1
+        else:
+            _consecutive_repeat_count = 0
+        _last_error_sig = _err_sig
+
+        # Append to failed approaches history.
+        if last_verify_text and _primary_err:
+            _failed_approaches.append({
+                "attempt": attempt,
+                "error_type": error_type_final,
+                "file": _primary_err["file"],
+                "line": _primary_err["line"],
+                "message_summary": _primary_err["message"][:100],
+                "failure_class": _infer_failure_class(error_type_final, _primary_err["message"]),
+            })
+
+        _surgeon_mode_forced = _consecutive_repeat_count >= 2
+        if _surgeon_mode_forced:
+            console.print(
+                f"  [CircuitBreaker] attempt {attempt}/{max_retries} — "
+                "[red]same error signature for 3+ consecutive attempts — forcing Surgeon Mode"
+            )
+            _consecutive_repeat_count = 0  # reset after intervention
+
+        _gen_file_ctx = _build_escalation_file_context(target_file, _err_line_int)
+        _gen_staging_ctx = (
+            _staging_path.read_text(encoding="utf-8")
+            if _staging_path.exists() else "(staging file is empty)"
+        )
+        _surgeon_prefix = (
+            "[CIRCUIT BREAKER — SURGEON MODE FORCED]\n"
+            "The same Lean error has occurred in 3 or more consecutive attempts.\n"
+            "Your previous patch approach is NOT working. You MUST change strategy:\n"
+            "1. Do NOT repeat the same patch.\n"
+            "2. search_codebase to find an alternative Lean 4 API or proof approach.\n"
+            "3. Output ONLY a single surgical <<<SEARCH>>>/<<<REPLACE>>> block.\n"
+            "4. Each identifier in REPLACE must be verified via lookup first.\n"
+            "5. Agent3 is forbidden from free exploration — patch only.\n\n"
+            if _surgeon_mode_forced else ""
+        )
+        _history_prefix = _format_failed_approaches(_failed_approaches[-5:])
         guidance = _call_agent2_with_tools(
             agent2,
-            readonly_registry,
-            mismatch_prefix
+            staging_registry,
+            _surgeon_prefix + _history_prefix + mismatch_prefix
             + f"Attempt {attempt} failed.\n"
             f"Build exit code: {last_exit_code} | Sorry count: {last_sorry_in_attempt}\n"
             f"Error first occurs at line {line_no_display_final}.\n"
-            f"=== FULL LEAN ERROR OUTPUT ===\n```\n{last_verify_text[:4000]}\n```\n"
+            f"=== FULL LEAN ERROR OUTPUT ===\n```\n"
+            f"{_prioritize_error_text(_structured_errors_final, last_verify_text, _err_line_int, target_file)}"
+            f"\n```\n"
             f"\n=== AGENT3'S CURRENT FILE ({target_file}) ===\n"
-            f"```lean\n{current_code[:10000]}\n```\n\n"
+            f"```lean\n{_gen_file_ctx}\n```\n\n"
+            f"=== STAGING FILE ({_staging_rel}) ===\n"
+            f"```lean\n{_gen_staging_ctx}\n```\n\n"
             f"SURGEON MODE: Diagnose the root cause of the Lean error above. "
             f"Focus on line {line_no_display_final} and its surrounding context. "
             "Then output one PATCH block per error in the <<<SEARCH>>>/<<<REPLACE>>> format. "
             "SEARCH must be copied verbatim from the current file (exact whitespace/indentation). "
             "Write the exact correct Mathlib 4 code in REPLACE — no vague suggestions. "
+            "If a Level-2 glue lemma is missing, use write_staging_lemma to add it to "
+            f"{_staging_rel} (with sorry body) before writing guidance for Agent3. "
             "If REPLACE uses a Lib/ lemma, add a comment above the patch: "
             "# Source: Lib/Glue/<File>.lean or Lib/Layer0/<File>.lean — <lemma name>. "
             "Do NOT name a lemma you have not verified in the file context provided. "
-            "Agent3 will apply your patches verbatim as edit_file_patch calls.",
+            "Agent3 will apply your patches verbatim as edit_file_patch calls.\n\n"
+            + _retrieve_catalog_context(
+                _extract_new_identifiers_from_guidance(last_verify_text)
+            ),
         )
+
+    # Staging lemma usage audit (6c): report which staging lemmas were referenced.
+    if _staging_path.exists() and _tgt.exists():
+        console.rule("[dim]Staging usage audit")
+        _audit_staging_usage(target_file, _staging_path, console.print)
 
     # Restore any shared Glue/Layer0 files Agent3 may have edited before exiting Phase 3.
     for _gp, _goriginal in _glue_snapshot.items():
