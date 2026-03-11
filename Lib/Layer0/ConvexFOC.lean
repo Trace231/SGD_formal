@@ -173,13 +173,23 @@ Used in: SVRG outer loop convergence (Algorithms/SVRGOuterLoop.lean, Step 3 — 
 theorem strongly_convex_gradient_norm_bound
     {f : E → ℝ} {gradF : E → E} {L : NNReal} {wStar : E}
     (hsmooth : LipschitzWith L gradF)
-    (hmin : Main.IsMinimizer f wStar)
+    (hmin : ∀ w, f wStar ≤ f w)
     (hgrad : ∀ w, HasGradientAt f (gradF w) w)
     (w : E) :
     ‖gradF w‖ ≤ (L : ℝ) * ‖w - wStar‖ := by
-  -- Fermat's theorem: minimizer of differentiable convex function has zero gradient
   have h_grad_wStar : gradF wStar = 0 := by
-    have h_convex := (hsmooth.convexOn univ).mpr (by simp)
-    exact subgradient_of_is_min h_convex hmin hgrad wStar
+    -- Global minimizer → local minimizer: f wStar ≤ f y holds for all y,
+    -- so it holds eventually in any filter, in particular 𝓝 wStar.
+    have hloc : IsLocalMin f wStar := Filter.Eventually.of_forall hmin
+    -- Fermat: fderiv at local minimizer is zero
+    have hzero : innerSL ℝ (gradF wStar) = 0 :=
+      hloc.hasFDerivAt_eq_zero (hgrad wStar).hasFDerivAt
+    -- innerSL v = 0 as CLM ⟹ ⟪v, v⟫ = 0 ⟹ v = 0
+    have hself : ⟪gradF wStar, gradF wStar⟫_ℝ = 0 := by
+      have := congr_fun (congrArg DFunLike.coe hzero) (gradF wStar)
+      simpa [innerSL_apply] using this
+    exact inner_self_eq_zero.mp hself
   calc ‖gradF w‖ = ‖gradF w - gradF wStar‖ := by rw [h_grad_wStar, sub_zero]
-    _ ≤ L * ‖w - wStar‖ := hsmooth.dist_le_mul w wStar
+    _ ≤ (L : ℝ) * ‖w - wStar‖ := by
+        have h := hsmooth.dist_le_mul w wStar
+        rwa [dist_eq_norm, dist_eq_norm] at h

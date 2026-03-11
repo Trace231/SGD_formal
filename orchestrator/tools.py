@@ -13,12 +13,15 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from orchestrator.config import LEAN_VERIFY_PATHS, PROJECT_ROOT, WHITELIST_PATHS
+from orchestrator.config import LEAN_VERIFY_PATHS, PROJECT_ROOT, READ_ONLY_PATHS, WHITELIST_PATHS
 from orchestrator.verify import count_sorrys, lake_build
 
 _READ_WRITE_ALLOWLIST = tuple(p.rstrip("/") for p in WHITELIST_PATHS)
 _LEAN_VERIFY_ALLOWLIST = tuple(p.rstrip("/") for p in LEAN_VERIFY_PATHS)
 _DOC_ALLOWLIST = tuple(p for p in _READ_WRITE_ALLOWLIST if p == "docs")
+# Extended read-only allowlist — includes root infrastructure files (Main.lean, lakefile.lean)
+# so agents can inspect the import graph without write access.
+_READ_ONLY_ALLOWLIST = tuple(p.rstrip("/") for p in READ_ONLY_PATHS)
 
 
 def _is_under(path: Path, root: Path) -> bool:
@@ -192,6 +195,122 @@ def search_in_file(
     return result
 
 
+def read_file_readonly(
+    path: str | Path,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    with_line_numbers: bool = True,
+) -> str:
+    """Read any file under Algorithms/, Lib/, docs/, Main.lean, or lakefile.lean.
+
+    Identical to read_file but uses an extended read-only allowlist that also
+    covers root-level Lean infrastructure files.  Use this to inspect the project
+    import graph (e.g. read_file_readonly("Main.lean")) before adding new imports,
+    to detect potential circular dependency issues.
+
+    Args:
+        path: File path (relative to project root or absolute).
+        start_line: First line to return, 1-indexed (default: 1).
+        end_line: Last line to return, inclusive, 1-indexed (default: last line).
+        with_line_numbers: Prefix each line with its line number (default: True).
+    """
+    resolved = _resolve_allowed_path(path, _READ_ONLY_ALLOWLIST)
+    lines = resolved.read_text(encoding="utf-8").splitlines(keepends=True)
+    total = len(lines)
+
+    s = max(0, (start_line or 1) - 1)
+    e = min(total, end_line or total)
+
+    if start_line is not None and start_line > total:
+        return (
+            f"Error: start_line ({start_line}) exceeds total lines ({total}) "
+            f"in {path}"
+        )
+    if start_line is not None and end_line is not None and start_line > end_line:
+        return (
+            f"Error: start_line ({start_line}) is greater than end_line ({end_line})"
+        )
+
+    slice_ = lines[s:e]
+    first_num = s + 1
+
+    if not with_line_numbers:
+        content = "".join(slice_)
+    else:
+        content = "".join(f"{first_num + i:6}|{line}" for i, line in enumerate(slice_))
+
+    if start_line is not None or end_line is not None:
+        header = (
+            f"# Lines {first_num}–{first_num + len(slice_) - 1} "
+            f"of {total} ({path})\n"
+        )
+        return header + content
+
+    return content
+
+
+def search_in_file_readonly(
+    path: str | Path,
+    pattern: str,
+    context_lines: int = 3,
+    max_matches: int = 20,
+) -> dict[str, Any]:
+    """Search any file under Algorithms/, Lib/, docs/, Main.lean, or lakefile.lean.
+
+    Identical to search_in_file but uses an extended read-only allowlist that also
+    covers root-level Lean infrastructure files.
+
+    Args:
+        path: File path under the extended read-only allowlist.
+        pattern: Python regex pattern to search for.
+        context_lines: Number of lines of context around each match.
+        max_matches: Maximum number of matches to return (default 20).
+    """
+    resolved = _resolve_allowed_path(path, _READ_ONLY_ALLOWLIST)
+    lines = resolved.read_text(encoding="utf-8").splitlines()
+
+    all_match_indices: list[int] = [
+        i for i, line in enumerate(lines) if re.search(pattern, line)
+    ]
+    total = len(all_match_indices)
+    truncated = total > max_matches
+    shown_indices = all_match_indices[:max_matches]
+
+    matches: list[dict[str, Any]] = []
+    formatted_parts: list[str] = []
+
+    for idx in shown_indices:
+        ctx_start = max(0, idx - context_lines)
+        ctx_end = min(len(lines), idx + context_lines + 1)
+        context = [
+            {"line": j + 1, "content": lines[j]}
+            for j in range(ctx_start, ctx_end)
+        ]
+        matches.append({"line": idx + 1, "content": lines[idx], "context": context})
+
+        block: list[str] = []
+        for j in range(ctx_start, ctx_end):
+            marker = ">>>" if j == idx else "   "
+            block.append(f"{j + 1:6}|{marker} {lines[j]}")
+        formatted_parts.append("\n".join(block))
+
+    result: dict[str, Any] = {
+        "path": str(resolved.relative_to(PROJECT_ROOT)),
+        "pattern": pattern,
+        "total_matches": total,
+        "shown_matches": len(shown_indices),
+        "truncated": truncated,
+        "formatted": "\n---\n".join(formatted_parts) if formatted_parts else "(no matches)",
+        "matches": matches,
+    }
+    if truncated:
+        result["truncation_note"] = (
+            f"Found {total} matches, showing first {max_matches}. "
+            "Please use a more specific pattern."
+        )
+    return result
+
+
 def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, Any]:
     """Apply an exact single-string replacement instead of full overwrite.
 
@@ -291,24 +410,33 @@ def _path_to_lean_module(rel_path: str) -> str:
 def _extract_lean_error_lines(raw: str) -> list[str]:
     """Extract Lean compiler error lines from lake build output.
 
-    Handles both Lake error formats:
-      Single-line: file.lean:L:C: error: message
-      Two-line:    file.lean:L:C: (alone)
-                   error: message         (next line)
+    Uses a two-pass approach:
 
-    Two-line entries are merged into a single line so that all downstream
-    regex consumers (lean_error_lines filter, _extract_first_error_line,
-    _classify_lean_error) work without modification.
+    Pass 1 — standard file:line:col formats (preferred, most actionable):
+      Tier 1 (single-line): file.lean:L:C: error: message
+      Tier 2 (two-line):    file.lean:L:C: (alone)
+                             error: message  (next line, merged)
+
+    Pass 2 — fallback for non-standard formats (only when Pass 1 is empty):
+      Tier 3: file.lean: error: message  (no line/col — parse errors)
+      Tier 4: error: message             (bare Lake-level error, no file context)
+
+    Two-line (Tier 2) entries are merged so all downstream regex consumers
+    (_extract_first_error_line, _classify_lean_error) work without modification.
     """
+    # Pass 1: standard file:line:col formats
     result: list[str] = []
     lines = raw.splitlines()
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        # Format 1: file.lean:L:C: error: message (everything on one line)
+        # Tier 1: file.lean:L:C: error: message (everything on one line)
         if re.search(r"\.lean:\d+:\d+:\s*error:", line):
             result.append(line)
-        # Format 2: file.lean:L:C: alone, followed by error: ... on the next line
+        # Tier 1b: Lake JSON format — error: file.lean:L:C: message
+        elif re.search(r"^error:\s+[\w./\\-]+\.lean:\d+:\d+:", line):
+            result.append(line)
+        # Tier 2: file.lean:L:C: alone, followed by error: ... on the next line
         elif re.search(r"\.lean:\d+:\d+:\s*$", line) and i + 1 < len(lines):
             next_line = lines[i + 1].strip()
             if next_line.startswith("error:"):
@@ -316,7 +444,20 @@ def _extract_lean_error_lines(raw: str) -> list[str]:
                 result.append(line.rstrip(": ") + ": " + next_line)
                 i += 1  # next line already consumed
         i += 1
-    return result
+    if result:
+        return result
+
+    # Pass 2: non-standard formats — parse errors and bare Lake errors
+    fallback: list[str] = []
+    for line in lines:
+        line = line.strip()
+        # Tier 3: file.lean: error: message (no line/col — typical parse error)
+        if re.search(r"\.lean:\s*error:", line, re.IGNORECASE):
+            fallback.append(line)
+        # Tier 4: bare "error: ..." lines (Lake-level build failure messages)
+        elif re.search(r"^\s*error:\s+\S", line):
+            fallback.append(line)
+    return fallback
 
 
 def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
@@ -356,9 +497,15 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     warning_lines = [
         l for l in all_lines if re.search(r"\.lean:\d+:\d+:\s*warning:", l)
     ]
-    # Fall back to the full output when no specific error lines were found
-    # (e.g. a top-level "error: build failed" with no per-file location).
-    error_lines = lean_error_lines if lean_error_lines else all_lines
+    # Fall back to error-keyword-filtered lines when no file:line:col errors found.
+    # This avoids flooding Agent3 with noisy [N/M] Building ... progress lines.
+    if lean_error_lines:
+        error_lines = lean_error_lines
+    else:
+        error_lines = (
+            [l for l in all_lines if re.search(r"\berror\b", l, re.IGNORECASE)]
+            or all_lines
+        )
 
     return {
         "target": rel,

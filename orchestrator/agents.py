@@ -44,14 +44,18 @@ class ToolRegistry:
             edit_file_patch,
             overwrite_file,
             read_file,
+            read_file_readonly,
             run_lean_verify,
             run_repo_verify,
             search_in_file,
+            search_in_file_readonly,
             write_new_file,
         )
 
         self.register("read_file", read_file)
+        self.register("read_file_readonly", read_file_readonly)
         self.register("search_in_file", search_in_file)
+        self.register("search_in_file_readonly", search_in_file_readonly)
         self.register("write_new_file", write_new_file)
         self.register("overwrite_file", overwrite_file)
         self.register("edit_file_patch", edit_file_patch)
@@ -61,10 +65,17 @@ class ToolRegistry:
 
     def register_readonly_tools(self) -> None:
         """Register read-only tools for agents that may only inspect files."""
-        from orchestrator.tools import read_file, search_in_file
+        from orchestrator.tools import (
+            read_file,
+            read_file_readonly,
+            search_in_file,
+            search_in_file_readonly,
+        )
 
         self.register("read_file", read_file)
+        self.register("read_file_readonly", read_file_readonly)
         self.register("search_in_file", search_in_file)
+        self.register("search_in_file_readonly", search_in_file_readonly)
 
     def call(self, name: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke a registered tool by name."""
@@ -128,10 +139,10 @@ class Agent:
         # Token budget trimming: drop oldest exchange pairs (assistant + next user)
         # keeping messages[0] (file context) intact.
         # Estimate: total characters / 3 ≈ tokens (conservative for code/mixed content).
-        # Threshold 120_000 leaves ~11k token buffer for a 131_072-token model limit.
+        # qwen3-max: max input 252K, max output 32K → safe message budget ~200K tokens.
         while len(self.messages) > 3:
             estimated = sum(len(m["content"]) for m in self.messages) // 3
-            if estimated + self.max_tokens <= 120_000:
+            if estimated + self.max_tokens <= 200_000:
                 break
             del self.messages[1:3]  # remove oldest (assistant, user) pair
 

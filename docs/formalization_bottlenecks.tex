@@ -1,0 +1,444 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage[UTF8]{ctex}
+\geometry{margin=1in}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!8},
+}
+
+\newtheorem{theorem}{定理}[section]
+\newtheorem{lemma}[theorem]{引理}
+\newtheorem{corollary}[theorem]{推论}
+\theoremstyle{remark}
+\newtheorem*{leanremark}{Lean 卡点}
+
+\title{随机优化算法的形式化验证：\\
+主要数学卡点与难点记录\\[0.5em]
+\large 以 SVRG 外层循环收敛性为例（Lean~4 / Mathlib~4）}
+\author{Thomas Wang}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{背景：我们在做什么}
+% ============================================================
+
+这个项目的目标是用 Lean 4（配合 Mathlib 数学库）把随机优化算法的收敛性证明
+全部机器验证一遍——也就是让计算机确认每一步推导都是对的，不只是"看起来对"。
+
+目前已经形式化或正在形式化的算法包括：
+SGD、SubgradientMethod、WeightDecaySGD、ProjectedGD、SVRG、SVRGOuterLoop。
+
+\subsection{代码的三层结构}
+
+为了方便复用，代码被分成三层：
+
+\begin{description}
+  \item[Layer 0（\texttt{Lib/Layer0/}）]
+    最底层的纯数学事实，比如凸函数的一阶条件、梯度范数估计等。
+    这些定理跟"随机"完全没关系，只是 Lean 里还缺的基础凸分析工具。
+
+  \item[Layer 1（\texttt{Lib/Layer1/}）]
+    抽象的随机下降元定理。只要一个更新规则满足
+    "无偏性 + 有界方差 + 迭代点与当前样本独立"这三条，
+    就可以直接调用这里的定理得到收敛率。
+
+  \item[Layer 2（\texttt{Algorithms/}）]
+    具体算法文件。把算法的具体设置"桥接"到 Layer 1 的抽象框架里，
+    然后调用 Layer 1 的定理得到结论。
+\end{description}
+
+还有一个\textbf{胶水层}（\texttt{Lib/Glue/}），
+专门存放连接 Mathlib 和算法证明之间的"桥接引理"——
+可积性包装器、方差缩减不等式、独立性组合引理等。
+
+\subsection{Gap 的三种类型}
+
+每次证明卡住，先判断是哪类 Gap：
+
+\begin{description}
+  \item[Level 1] Mathlib 完全没有这个结论，需要从头证。
+  \item[Level 2] Mathlib 有相关的零件，但没有把它们组合起来的引理，
+    需要写一个桥接引理。
+  \item[Level 3] Mathlib 有这个定理，但类型签名或形式跟目标不完全匹配，
+    需要写一个薄封装。
+\end{description}
+
+随机优化证明里 \textbf{Level 2 最常见}，Level 3 最高频但个个都很小。
+
+% ============================================================
+\section{Layer 0：Hilbert 空间的一阶条件}
+% ============================================================
+
+这是整个证明体系的地基。Mathlib 4 有标量版的一阶条件
+（\texttt{ConvexOn.le\_slope\_of\_hasDerivAt}），
+但完全没有 Hilbert 空间的多元版本。
+下面四个定理都是 Level 1 Gap，
+全部在 \texttt{Lib/Layer0/ConvexFOC.lean} 里手工证明。
+
+\begin{theorem}[凸函数一阶条件]
+  \label{thm:convex-foc}
+  设 $E$ 是实 Hilbert 空间，$f : E \to \mathbb{R}$ 在全空间凸且处处可微，梯度为 $\nabla f$。
+  则对所有 $x, y \in E$：
+  \[
+    f(y) \;\geq\; f(x) + \langle \nabla f(x),\, y - x \rangle.
+  \]
+\end{theorem}
+
+\begin{leanremark}
+  证明思路是把多元问题降到一维：令 $g(t) = f(x + t(y-x))$，
+  证 $g'(0) = \langle \nabla f(x), y-x \rangle$，
+  再用 Mathlib 的标量 FOC 得到 $g(1) \geq g(0) + g'(0)$。
+
+  主要麻烦在于 Lean 里描述这条线段需要用 \texttt{AffineMap.lineMap}，
+  而它展开的形式和直接写 $x + t(y-x)$ 不一样，
+  需要一个 \texttt{ext + simp + abel} 来对齐——看起来很小，但容易卡住。
+\end{leanremark}
+
+\begin{theorem}[强凸一阶条件]
+  \label{thm:sc-foc}
+  设 $f$ 是 $\mu$-强凸且处处可微。则对所有 $x, y \in E$：
+  \[
+    f(y) \;\geq\; f(x) + \langle \nabla f(x),\, y - x \rangle
+           + \frac{\mu}{2}\,\|y - x\|^2.
+  \]
+\end{theorem}
+
+\begin{leanremark}
+  关键想法：令 $h = f - \frac{\mu}{2}\|\cdot\|^2$，
+  那么 $h$ 是普通凸函数，对 $h$ 用定理~\ref{thm:convex-foc}，
+  再加回减掉的那项就行。
+
+  卡点在于计算 $\nabla h = \nabla f - \mu\,\mathrm{id}$。
+  Mathlib 里 $\|\cdot\|^2$ 的导数由
+  \texttt{hasStrictFDerivAt\_norm\_sq} 给出，
+  但它返回的是 $2 \cdot \mathrm{innerSL}_{\mathbb{R}}\, w$
+  这种连续线性映射形式，需要手动算 smul 再用 \texttt{convert} 对齐类型，
+  非常容易出类型不匹配的错误。
+\end{leanremark}
+
+\begin{corollary}[凸函数极小值点的内积下界]
+  \label{cor:convex-inner-lb}
+  设 $f$ 凸，$w^*$ 是极小值点，则：
+  \[
+    f(w) - f(w^*) \;\leq\; \langle \nabla f(w),\, w - w^* \rangle.
+  \]
+\end{corollary}
+
+\begin{corollary}[强凸极小值点的内积下界]
+  \label{cor:sc-inner-lb}
+  设 $f$ 是 $\mu$-强凸，$w^*$ 是极小值点，则：
+  \[
+    \langle \nabla f(w),\, w - w^* \rangle
+    \;\geq\; \frac{\mu}{2}\,\|w - w^*\|^2.
+  \]
+\end{corollary}
+
+推论~\ref{cor:sc-inner-lb} 是所有强凸收敛证明里出现收缩因子
+$(1-\eta\mu)$ 的直接来源。
+
+\begin{theorem}[梯度范数估计]
+  \label{thm:grad-norm}
+  设 $f$ 是 $L$-光滑的，极小值点为 $w^*$，则：
+  \[
+    \|\nabla f(w)\| \;\leq\; L\,\|w - w^*\|.
+  \]
+\end{theorem}
+
+\begin{leanremark}
+  这个定理本身很直接，但 Lean 里有\textbf{两个独立的 API 错位}（Level 3 Gap）：
+
+  \textbf{问题一：全局极小 $\to$ 局部极小的类型不匹配。}
+  想用 \texttt{IsMinFilter.filter\_mono} 把全局极小转成局部极小，
+  需要证 \texttt{nhds wStar $\leq$ Filter.principal univ}。
+  但 Lean 不会自动把 \texttt{Filter.principal univ} 和 \texttt{$\top$} 等同，
+  所以直接写 \texttt{le\_top} 类型不对。
+  解法：绕过去，直接用 \texttt{Filter.Eventually.of\_forall hmin}——
+  因为 $f(w^*) \leq f(y)$ 对所有 $y$ 成立，所以在任何 filter 下都"eventually"成立，
+  自然就是 \texttt{IsLocalMin}。
+
+  \textbf{问题二：dist 版本 vs. 范数版本。}
+  \texttt{LipschitzWith.dist\_le\_mul w wStar} 给出的是
+  $\mathrm{dist}(\nabla f(w), \nabla f(w^*)) \leq L \cdot \mathrm{dist}(w, w^*)$，
+  但目标要的是 $\|\nabla f(w) - \nabla f(w^*)\| \leq L\|w - w^*\|$。
+  解法：
+\begin{lstlisting}[language={}]
+have h := hsmooth.dist_le_mul w wStar
+rwa [dist_eq_norm, dist_eq_norm] at h
+\end{lstlisting}
+  看起来只是两行，但如果不知道 \texttt{dist\_eq\_norm} 这个引理，
+  会在这里卡很久。
+\end{leanremark}
+
+% ============================================================
+\section{胶水层：SVRG 方差缩减}
+% ============================================================
+
+SVRG 相对于普通 SGD 的核心优势是"方差缩减"——
+通过使用快照梯度 $\nabla F(\tilde{w})$，
+把每步更新的方差从 $O(\sigma^2)$ 降到跟 $\|\tilde{w} - w^*\|$ 相关的量，
+从而实现线性收敛。下面的定理把这个直觉精确化。
+
+\begin{theorem}[SVRG 方差缩减，\texttt{svrg\_variance\_reduction}]
+  \label{thm:svrg-var}
+  设样本集 $S$ 是有限的，均匀采样分布为 $\nu$，
+  快照点为 $\tilde{w}$，SVRG oracle 的梯度估计为：
+  \[
+    v(w, s) \;=\; \nabla_s l(w) - \nabla_s l(\tilde{w}) + \nabla F(\tilde{w}).
+  \]
+  若对所有 $s \in S$，$w \in E$ 有逐点界：
+  \[
+    \|v(w,s)\|^2
+    \;\leq\; 4L\bigl(F(w) - F^*\bigr) + 2\|\nabla F(\tilde{w}) - \nabla F(w^*)\|^2,
+  \]
+  则取 $\nu$-期望后同样成立：
+  \[
+    \mathbb{E}_{s \sim \nu}\bigl[\|v(w,s)\|^2\bigr]
+    \;\leq\; 4L\bigl(F(w) - F^*\bigr) + 2\|\nabla F(\tilde{w}) - \nabla F(w^*)\|^2.
+  \]
+\end{theorem}
+
+\begin{leanremark}
+  \textbf{为什么需要 \texttt{[Fintype S]}？}
+  Lean 里的 Bochner 积分默认是连续测度上的。
+  要把期望转成有限平均，必须有一个引理说
+  "在有限集上的均匀测度下，积分 $=$ 算术平均"。
+  这需要 \texttt{[Fintype S]} 类型类实例。
+
+  \textbf{证明路线：}
+  先用 \texttt{h\_unif} 把积分转成 $\frac{1}{|S|}\sum_s$，
+  再用 \texttt{Finset.sum\_le\_sum} 逐点应用已有的界，
+  最后 \texttt{field\_simp} 约掉 $\frac{1}{|S|} \cdot |S| = 1$。
+  整体不难，但需要注意 \texttt{Fintype.card} 转 $\mathbb{R}$ 时要显式 cast。
+
+  \textbf{意义：}
+  这个不等式的右边当 $\tilde{w} \to w^*$ 时趋于零，
+  这正是 SVRG 能达到线性收敛而不是 SGD 的次线性收敛的根本原因。
+\end{leanremark}
+
+% ============================================================
+\section{算法层：最难的卡点——独立性与多轮结构}
+% ============================================================
+
+\subsection{过程定义}
+
+SVRG 外层循环定义两个递归过程：
+
+\textbf{内层过程}（epoch $k$ 的 $m$ 步 SGD）：
+\[
+  \texttt{svrgInnerProcess}(w_k, \nabla F(w_k), k, m)(t, \omega)
+  \;=\; \texttt{sgdProcess}\bigl(w_k, \eta,
+      \underbrace{\nabla_s l(\cdot) - \nabla_s l(w_k) + \nabla F(w_k)}_{\text{SVRG oracle}},
+      \xi_{km+\cdot}\bigr)(t, \omega).
+\]
+
+\textbf{外层过程}（每个 epoch 的起始点序列）：
+\[
+  w_0 = w_{\text{init}}, \qquad
+  w_{k+1}(\omega) \;=\; \text{（第 $k$ 个 epoch 跑完 $m$ 步后的终点）}.
+\]
+
+\subsection{最关键的引理：epoch 独立性}
+
+\begin{lemma}[Epoch 独立性，\texttt{outerProcess\_indepFun\_epoch}]
+  \label{lem:epoch-indep}
+  对每个 epoch 索引 $k$ 和偏移 $t < m$：
+  \[
+    w_k \;\perp_P\; \xi_{km+t}.
+  \]
+  即：第 $k$ 个 epoch 的起始点 $w_k$ 与该 epoch 内部用到的样本 $\xi_{km+t}$ 相互独立。
+\end{lemma}
+
+\textbf{为什么这个引理是整个证明的关键？}
+因为要对内层循环用 Layer 1 的元定理，就需要对条件期望做分解：
+$\mathbb{E}[f(w_{k+1}, \xi)] = \mathbb{E}[\mathbb{E}[f(w_{k+1}, \xi) \mid w_k]]$，
+而这一步需要 $w_k \perp \xi_{km+t}$ 才成立。
+没有这个独立性，epoch 收缩那步就走不下去。
+
+\textbf{证明的数学直觉：}
+$w_k$ 是 $\xi_0, \ldots, \xi_{km-1}$ 的函数，
+而 $\xi_{km+t}$（$t < m$）的下标 $\geq km$，
+由样本流的互独立性，它们应该是独立的。
+
+\textbf{为什么 Lean 里卡住了？}
+直觉上"$w_k$ 依赖的样本下标 $< km$，而 $\xi_{km+t}$ 的下标 $\geq km$，所以独立"——
+这个推理在 Lean 里需要如下引理：
+
+\begin{lemma}[独立性组合，Mathlib 缺失]
+  \label{lem:indep-comp}
+  设 $X : \Omega \to E$ 可测，$Y : \Omega \to F$ 可测。
+  若存在一族可测随机变量 $\{Z_s\}_{s \in I}$ 使得：
+  \begin{itemize}
+    \item $X$ 关于 $\sigma(Z_s : s \in I)$ 可测（即 $X$ 是这些 $Z_s$ 的函数），
+    \item $Z_s \perp_P Y$ 对所有 $s \in I$ 成立，
+  \end{itemize}
+  则 $X \perp_P Y$。
+\end{lemma}
+
+这个引理在数学上是显然的，但 \textbf{Mathlib 4 里没有}。
+它的严格证明需要 Dynkin $\pi$-系统定理：
+从"每个生成元独立"到"整个 $\sigma$-代数上独立"需要经过 $\pi$-$\lambda$ 系统的论证。
+这个引理目前在代码里标为 \texttt{indepFun\_of\_forall\_indep\_generators}（sorry 状态），
+是整个 SVRGOuterLoop 证明的最大瓶颈。
+解决它需要单独向 Mathlib 贡献一个非平凡的测度论引理。
+
+\subsection{Epoch 收缩定理}
+
+\begin{theorem}[Epoch 收缩，\texttt{svrg\_epoch\_contraction}]
+  \label{thm:epoch-contraction}
+  在 $L$-光滑、$\mu$-强凸、$\eta\mu < 1$ 的条件下，
+  令 $\rho = (1-\eta\mu)^m + 4\eta L^2/\mu$，则：
+  \[
+    \mathbb{E}\bigl[\|w_{k+1} - w^*\|^2\bigr]
+    \;\leq\;
+    \rho \cdot \mathbb{E}\bigl[\|w_k - w^*\|^2\bigr]
+    + \frac{\eta\sigma^2}{\mu}.
+  \]
+\end{theorem}
+
+\begin{leanremark}
+  \textbf{双重可积性侧条件（Archetype B 特有的痛点）。}
+  每次用 \texttt{integral\_mono} 对期望做放缩，
+  都需要显式证明被积函数 $\omega \mapsto \|w_{k+1}(\omega) - w^*\|^2$ 在 $P$ 下可积。
+  Lean 不会自动从"过程结构"推出可积性，必须把它作为假设
+  \texttt{h\_int\_inner} 和 \texttt{h\_int\_outer} 显式传进来。
+
+  单步算法（Archetype A）不用这么麻烦，因为方差有界直接给出可积性。
+  但多轮算法（Archetype B）的迭代点是递归定义的，
+  每一步的可积性都要单独处理——
+  这导致每个定理签名里都多出两个假设，也让代码显得很冗长。
+\end{leanremark}
+
+\subsection{最终收敛率}
+
+\begin{theorem}[SVRG 外层循环强凸收敛]
+  \label{thm:outer-convergence}
+  在定理~\ref{thm:epoch-contraction} 的条件下，经过 $K$ 个 epoch（每 epoch $m$ 步）后：
+  \[
+    \mathbb{E}\bigl[\|w_K - w^*\|^2\bigr]
+    \;\leq\;
+    (1-\eta\mu)^{mK}\,\|w_0 - w^*\|^2
+    + \frac{\eta\sigma^2}{\mu\bigl(1 - (1-\eta\mu)^m\bigr)}.
+  \]
+\end{theorem}
+
+\noindent\textbf{证明思路：}
+对定理~\ref{thm:epoch-contraction} 连用 $K$ 次，展开得到：
+\[
+  \mathbb{E}[\|w_K - w^*\|^2]
+  \;\leq\;
+  \rho^K \|w_0 - w^*\|^2
+  + \frac{\eta\sigma^2}{\mu} \sum_{j=0}^{K-1} \rho^j
+  \;\leq\;
+  \rho^K \|w_0 - w^*\|^2
+  + \frac{\eta\sigma^2}{\mu(1-\rho)}.
+\]
+把 $\rho$ 的表达式代入化简即得。
+Lean 里需要用 \texttt{Finset.geom\_sum\_le} 或者手动处理有限几何级数。
+
+% ============================================================
+\section{卡点总结与关键路径}
+% ============================================================
+
+\begin{center}
+\begin{tabular}{lllr}
+\toprule
+\textbf{定理} & \textbf{Gap 类型} & \textbf{状态} & \textbf{预计工时} \\
+\midrule
+凸函数一阶条件（定理~\ref{thm:convex-foc}）         & L1：Mathlib 缺失      & 已证          & 3h \\
+强凸一阶条件（定理~\ref{thm:sc-foc}）               & L1：Mathlib 缺失      & 已证          & 4h \\
+凸内积下界（推论~\ref{cor:convex-inner-lb}）         & L1 推论               & 已证          & 0.5h \\
+强凸内积下界（推论~\ref{cor:sc-inner-lb}）           & L1 推论               & 已证          & 0.5h \\
+梯度范数估计（定理~\ref{thm:grad-norm}）             & L3：类型签名不匹配    & 已证          & 2h \\
+SVRG 方差缩减（定理~\ref{thm:svrg-var}）            & L2：组合缺失          & 已证          & 3h \\
+独立性组合（引理~\ref{lem:indep-comp}）              & \textbf{L2：Mathlib 缺失} & \textbf{Sorry} & $>$8h \\
+Epoch 独立性（引理~\ref{lem:epoch-indep}）           & L2：依赖上述引理      & \textbf{Sorry} & 4h \\
+Epoch 收缩（定理~\ref{thm:epoch-contraction}）       & L2：双重可积性侧条件  & \textbf{Sorry} & 4h \\
+外层收敛（定理~\ref{thm:outer-convergence}）         & L2：几何级数          & \textbf{Sorry} & 2h \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+从 sorry 到完全证明的关键路径是：
+
+\[
+  \underbrace{\text{引理~\ref{lem:indep-comp}}}_{\text{Dynkin $\pi$-系统，最难}}
+  \;\Longrightarrow\;
+  \text{引理~\ref{lem:epoch-indep}}
+  \;\Longrightarrow\;
+  \underbrace{\text{定理~\ref{thm:epoch-contraction}}}_{\text{+ 显式可积性假设}}
+  \;\Longrightarrow\;
+  \text{定理~\ref{thm:outer-convergence}}.
+\]
+
+引理~\ref{lem:indep-comp}（独立性组合）是唯一的"硬卡点"——
+其余 sorry 在它解决之后都是直接的，
+预计总工时 $\approx 10$h。
+
+% ============================================================
+\section{难度与价值评估}
+% ============================================================
+
+\subsection{难度分析}
+
+\textbf{数学形式化本身：中高难度。}
+每个算法大约需要 200--400 行 Lean 算法层代码，
+加上 50--150 行自定义胶水引理。
+Level 3 Gap（类型签名不匹配）数量多但每个都小，
+主要是需要熟悉 Mathlib 的具体 API，花时间但不需要新想法。
+Level 2 Gap（独立性组合）属于真正的研究级障碍，
+需要独立的测度论论证，不是查 Mathlib 能解决的。
+
+\textbf{API 学习成本：前期高，快速递减。}
+第一个算法（SGD）需要大量探索 Mathlib 命名约定。
+到第三个算法（SVRG），已积累 30+ 可复用胶水引理，
+新引理的需求量降低了约 60\%。
+
+\textbf{自动化可靠性：中等。}
+目前多智能体编排系统（5 个 Agent 协作）
+在 Archetype A（单步）算法上能稳定让 sorry 数量单调减少。
+Archetype B（多 epoch）算法在遇到 Level 2 Gap 时需要人工介入。
+
+\subsection{价值评估}
+
+\textbf{首创性：明确的"第一"。}
+目前没有任何工作在任何交互式定理证明器里机器验证了
+SGD、SVRG 或相关算法的收敛性定理。
+这是一个清晰的学术空白。
+
+\textbf{可复用性：胶水层越积越厚。}
+\texttt{Lib/Glue/} 和 \texttt{Lib/Layer0/} 里的引理和算法无关。
+一旦建好，每个新算法只需要写桥接代码，不需要重新发展测度论基础。
+
+\textbf{自动化流水线：额外亮点。}
+多智能体系统在非平凡数学证明上能取得可测量的进展，
+展示了 LLM 驱动的形式化验证的可行性，
+是论文的额外贡献点。
+
+\textbf{发表方向：}
+\begin{itemize}
+  \item 形式化验证方向：ITP、CPP、FMCAD——强匹配，"首次形式化随机优化"足够新颖。
+  \item 机器学习方向：NeurIPS、ICML——可行，需要把自动化流水线作为主要贡献来写。
+  \item 核心风险：sorry 全部填完需要时间，
+    尤其是引理~\ref{lem:indep-comp} 的 Dynkin 论证。
+    如果以 "sorry-free proof" 为卖点，这是主要时间风险点。
+\end{itemize}
+
+\end{document}

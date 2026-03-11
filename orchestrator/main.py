@@ -77,13 +77,18 @@ _LIB_DECL_RE = re.compile(
 
 _SIGNATURE_HALLUCINATION_RE = re.compile(
     r"unknown identifier|unknown constant|unknown tactic|"
-    r"failed to synthesize instance|has already been declared",
+    r"failed to synthesize instance",
     re.IGNORECASE,
 )
 
+# Duplicate declarations must always trigger SIGNATURE_HALLUCINATION regardless
+# of line number — the file has grown corrupt and needs a full rewrite.
+_DUPLICATE_DECL_RE = re.compile(r"has already been declared", re.IGNORECASE)
+
 # Lean standard error format: `SomeFile.lean:LINE:COL: error:`
 _LEAN_ERROR_LINE_RE = re.compile(
-    r"[\w./\\-]+\.lean:(\d+):\d+:\s*error:",
+    r"(?:[\w./\\-]+\.lean:(\d+):\d+:\s*error:"   # standard: file:line:col: error:
+    r"|error:\s+[\w./\\-]+\.lean:(\d+):\d+:)",    # Lake JSON: error: file:line:col:
     re.IGNORECASE,
 )
 
@@ -91,15 +96,106 @@ _LEAN_ERROR_LINE_RE = re.compile(
 # problems, not signature problems — file deletion is prohibited.
 _PROOF_BODY_LINE_THRESHOLD = 50
 
-# Agent3 can receive tool results and self-fix up to this many times per attempt
-# before escalating to Agent2 for new guidance.
-MAX_AGENT3_FEEDBACK_TURNS = 3
+# Agent3 single-step interactive loop: maximum tool turns per attempt.
+# Archetype B gets a 1.5× multiplier applied in phase3_prove.
+MAX_AGENT3_TOOL_TURNS = 20
+
+# ---------------------------------------------------------------------------
+# Imported algorithm API signature injection
+# ---------------------------------------------------------------------------
+
+_TOP_LEVEL_KEYWORDS = re.compile(
+    r"^(?:noncomputable\s+)?(?:def|theorem|lemma|abbrev|structure|class|instance"
+    r"|namespace|section|end|open|variable|attribute|@\[|--)",
+    re.MULTILINE,
+)
+
+_DECL_START = re.compile(
+    r"^(?:noncomputable\s+)?(?:def|theorem|lemma|abbrev)\s+\w",
+)
+
+
+def _extract_imported_algo_sigs(target_file: str) -> str:
+    """Return a compact API-signature block for every Algorithms/*.lean file
+    imported by *target_file*.
+
+    Strategy: for each top-level declaration (def/theorem/lemma/abbrev) collect
+    lines until the first blank line **or** the start of a new top-level keyword.
+    Proof bodies are stripped by stopping before any line that begins (after
+    optional leading spaces) with ``| `` (pattern-match arm) or ``by`` at the
+    same indentation as ``:=``.  This is robust to multi-line signatures and
+    one-liner ``:= expr`` forms alike.
+    """
+    tgt_path = PROJECT_ROOT / target_file
+    if not tgt_path.exists():
+        return ""
+
+    content = tgt_path.read_text(encoding="utf-8")
+    imported_algos = re.findall(r"^import Algorithms\.(\w+)", content, re.MULTILINE)
+    if not imported_algos:
+        return ""
+
+    sections: list[str] = []
+    for algo in imported_algos:
+        algo_path = PROJECT_ROOT / f"Algorithms/{algo}.lean"
+        if not algo_path.exists():
+            continue
+        algo_lines = algo_path.read_text(encoding="utf-8").splitlines()
+        sigs: list[str] = []
+        i = 0
+        while i < len(algo_lines):
+            line = algo_lines[i]
+            if not _DECL_START.match(line):
+                i += 1
+                continue
+            # Start of a declaration — collect signature lines.
+            sig: list[str] = [line]
+            j = i + 1
+            while j < len(algo_lines):
+                next_line = algo_lines[j]
+                # Stop at blank line or new top-level keyword.
+                if next_line.strip() == "" or _TOP_LEVEL_KEYWORDS.match(next_line):
+                    break
+                # Stop before proof body lines (by / := by / pattern arms).
+                stripped = next_line.lstrip()
+                if stripped.startswith("| ") or re.match(r"^\s*by\b", next_line):
+                    break
+                sig.append(next_line)
+                j += 1
+            # Drop trailing `:= ...` one-liner body if present.
+            sig_text = "\n".join(sig)
+            # Keep only up to `:=` to drop trivial proof bodies.
+            if ":=" in sig_text:
+                sig_text = sig_text[: sig_text.index(":=")].rstrip()
+            if sig_text.strip():
+                sigs.append(sig_text)
+            i = j
+
+        if sigs:
+            sections.append(
+                f"-- Algorithms/{algo}.lean --\n" + "\n\n".join(sigs)
+            )
+
+    if not sections:
+        return ""
+    return (
+        "## Auto-injected API signatures from imported algorithm files\n\n"
+        + "\n\n".join(sections)
+    )
 
 
 def _extract_first_error_line(verify_text: str) -> int | None:
-    """Return the line number of the first Lean compiler error, or None."""
+    """Return the line number of the first Lean compiler error, or None.
+
+    Handles both standard format (file:line:col: error:) and
+    Lake JSON format (error: file:line:col:) via two capture groups.
+    """
     m = _LEAN_ERROR_LINE_RE.search(verify_text)
-    return int(m.group(1)) if m else None
+    if not m:
+        return None
+    # group(1): standard format, group(2): Lake JSON format
+    raw = m.group(1) or m.group(2)
+    return int(raw) if raw else None
 
 
 def _format_agent3_tool_feedback(
@@ -173,6 +269,11 @@ def _classify_lean_error(verify_text: str) -> str:
     PROOF_ERROR  — all other errors (type mismatch, unsolved goals, etc.) →
         normal Surgeon-Mode patch.
     """
+    # Duplicate declarations corrupt the file regardless of where they appear —
+    # always trigger a full rewrite without checking the line threshold.
+    if _DUPLICATE_DECL_RE.search(verify_text):
+        return "SIGNATURE_HALLUCINATION"
+
     has_hallucination_pattern = bool(_SIGNATURE_HALLUCINATION_RE.search(verify_text))
     if not has_hallucination_pattern:
         return "PROOF_ERROR"
@@ -457,6 +558,177 @@ def _call_agent2_with_tools(
 
 
 # ---------------------------------------------------------------------------
+# Agent3 single-step tool execution helpers
+# ---------------------------------------------------------------------------
+
+def _execute_single_tool_and_format(
+    registry: "ToolRegistry",
+    tool_name: str,
+    arguments: dict,
+    target_file: str,
+) -> tuple[str, dict | None, bool]:
+    """Execute one Agent3 tool call and return a formatted result string.
+
+    Returns (result_msg, verify_result_or_None, edited_flag).
+    - result_msg   : the string to feed back to Agent3.
+    - verify_result: the raw dict from run_lean_verify, or None.
+    - edited_flag  : True when a write/patch tool was called.
+
+    Error handling:
+    - PermissionError → BLOCKED message; edited_flag=False.
+    - ValueError (patch mismatch, etc.) → detailed error; edited_flag=False.
+    - Unknown tool name → error string; edited_flag=False.
+    - Any other exception → error string; edited_flag=False.
+    """
+    verify_result: dict | None = None
+    edited = False
+
+    try:
+        result = registry.call(tool_name, **arguments)
+    except KeyError as exc:
+        return (
+            f"## Tool error\ntool `{tool_name}` is not registered. "
+            f"Available: read_file, search_in_file, edit_file_patch, "
+            f"write_new_file, run_lean_verify.\nError: {exc}\n"
+            "Choose a valid tool.",
+            None,
+            False,
+        )
+    except PermissionError as exc:
+        return (
+            f"## Tool error — BLOCKED\n"
+            f"Security violation: {exc}\n"
+            "You may only edit files inside Algorithms/ or Lib/.",
+            None,
+            False,
+        )
+    except ValueError as exc:
+        err_str = str(exc)
+        # Surface patch-mismatch clearly so Agent3 knows to re-read the file.
+        if tool_name == "edit_file_patch" and (
+            "not found in target file" in err_str or "old_str not found" in err_str
+        ):
+            from orchestrator.file_io import load_file
+            tgt_content = ""
+            try:
+                tgt_content = load_file(target_file)[:6000]
+            except Exception:  # noqa: BLE001
+                pass
+            return (
+                f"## Tool error — PATCH MISMATCH\n"
+                f"edit_file_patch failed: the SEARCH string was not found in the file.\n"
+                f"You MUST copy SEARCH verbatim from the current file (exact whitespace).\n\n"
+                f"### Current file content\n```lean\n{tgt_content}\n```\n"
+                "Read the file again if needed, then retry with the exact matching string.",
+                None,
+                False,
+            )
+        return (f"## Tool error\n{tool_name} failed: {err_str}", None, False)
+    except Exception as exc:  # noqa: BLE001
+        return (f"## Tool error\n{tool_name} raised: {exc}", None, False)
+
+    # Success path
+    if tool_name == "run_lean_verify":
+        verify_result = result
+        exit_code = int(result.get("exit_code", 1))
+        sorry_count = int(result.get("sorry_count", 0))
+        errors = result.get("errors", [])
+        err_text = "\n".join(errors) if isinstance(errors, list) else str(errors)
+        warnings = result.get("warnings", [])
+        warn_text = "\n".join(warnings) if isinstance(warnings, list) else str(warnings)
+
+        from orchestrator.file_io import load_file
+        tgt_content = ""
+        try:
+            tgt_path = Path(target_file) if Path(target_file).is_absolute() else PROJECT_ROOT / target_file
+            if tgt_path.exists():
+                tgt_content = load_file(target_file)[:6000]
+        except Exception:  # noqa: BLE001
+            pass
+
+        parts = [
+            f"## run_lean_verify result",
+            f"exit_code: {exit_code}  |  sorry_count: {sorry_count}",
+            "",
+            "### Build errors",
+            "```",
+            err_text[:3000] if err_text else "(none)",
+            "```",
+        ]
+        if warn_text:
+            parts += [
+                "",
+                "### Warnings (informational only)",
+                "```",
+                warn_text[:1000],
+                "```",
+            ]
+        parts += [
+            "",
+            f"### Current file ({target_file})",
+            "```lean",
+            tgt_content or "(file does not exist)",
+            "```",
+        ]
+        if exit_code == 0 and sorry_count == 0:
+            parts += ["", "Build is CLEAN and sorry_count=0. Output done if finished."]
+        result_msg = "\n".join(parts)
+    elif tool_name in ("edit_file_patch", "write_new_file"):
+        edited = True
+        result_msg = (
+            f"## {tool_name} result\n"
+            f"SUCCESS. File updated.\n"
+            "Call run_lean_verify to check the build."
+        )
+    else:
+        # read_file, search_in_file, overwrite_file, etc.
+        if isinstance(result, dict):
+            result_msg = f"## {tool_name} result\n" + "\n".join(
+                f"{k}: {v}" for k, v in result.items()
+            )
+        elif isinstance(result, str):
+            result_msg = f"## {tool_name} result\n{result}"
+        else:
+            result_msg = f"## {tool_name} result\n{result!r}"
+
+    return result_msg, verify_result, edited
+
+
+def _format_done_rejection(verify_result: dict, target_file: str) -> str:
+    """Return feedback for when Agent3 signals done but verification is not clean."""
+    exit_code = int(verify_result.get("exit_code", 1))
+    sorry_count = int(verify_result.get("sorry_count", 0))
+    errors = verify_result.get("errors", [])
+    err_text = "\n".join(errors) if isinstance(errors, list) else str(errors)
+
+    from orchestrator.file_io import load_file
+    tgt_content = ""
+    try:
+        tgt_path = Path(target_file) if Path(target_file).is_absolute() else PROJECT_ROOT / target_file
+        if tgt_path.exists():
+            tgt_content = load_file(target_file)[:6000]
+    except Exception:  # noqa: BLE001
+        pass
+
+    return "\n".join([
+        "## done signal rejected — build is NOT clean",
+        f"exit_code: {exit_code}  |  sorry_count: {sorry_count}",
+        "",
+        "### Build errors",
+        "```",
+        err_text[:3000] if err_text else "(none)",
+        "```",
+        "",
+        f"### Current file ({target_file})",
+        "```lean",
+        tgt_content or "(file does not exist)",
+        "```",
+        "",
+        "You signalled done but the build is not clean. Continue fixing.",
+    ])
+
+
+# ---------------------------------------------------------------------------
 # Phase implementations
 # ---------------------------------------------------------------------------
 
@@ -550,15 +822,30 @@ def phase2_plan_and_approve(
             "- APPROVED: Plan meets all criteria.\n\n"
             f"Plan to review:\n{plan}"
         )
-        review_raw = agent1.call(review_prompt)
-
-        try:
-            review = json.loads(review_raw)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "[Phase 2] Reviewer returned invalid JSON. "
-                f"line={exc.lineno}, col={exc.colno}, msg={exc.msg}"
-            ) from exc
+        review: dict = {}
+        for _retry in range(3):
+            review_raw = agent1.call(review_prompt)
+            if not review_raw.strip():
+                logger.warning(
+                    "[Phase 2] Reviewer returned empty response (attempt %d/3)", _retry + 1
+                )
+                continue
+            try:
+                review = json.loads(review_raw)
+                break
+            except json.JSONDecodeError as exc:
+                if _retry < 2:
+                    logger.warning(
+                        "[Phase 2] Reviewer returned invalid JSON (attempt %d/3): %s",
+                        _retry + 1, exc.msg,
+                    )
+                    continue
+                raise RuntimeError(
+                    "[Phase 2] Reviewer returned invalid JSON after 3 attempts. "
+                    f"line={exc.lineno}, col={exc.colno}, msg={exc.msg}"
+                ) from exc
+        else:
+            raise RuntimeError("[Phase 2] Reviewer returned empty response after 3 attempts.")
 
         if not isinstance(review, dict):
             raise RuntimeError("[Phase 2] Reviewer response must be a JSON object.")
@@ -630,11 +917,18 @@ def phase3_prove(
     *,
     max_retries: int = MAX_PHASE3_RETRIES,
     archetype: str = "A",
+    max_tool_turns: int | None = None,
 ) -> tuple[bool, int, str, dict]:
     """Phase 3: Agent2 ↔ Agent3 proving loop + Agent5 escalation.
 
     Returns (success, attempts, errors_or_empty, audit).
     """
+    # Compute per-attempt tool-turn budget.  Archetype B proofs are structurally
+    # more complex and get a 1.5× multiplier.  Callers may override via max_tool_turns.
+    if max_tool_turns is None:
+        max_tool_turns = MAX_AGENT3_TOOL_TURNS
+    if archetype.upper() == "B":
+        max_tool_turns = int(max_tool_turns * 1.5)
     console.rule("[bold cyan]Phase 3/5 — Prove (fill sorry)")
 
     agent3 = Agent("sorry_closer", extra_files=[target_file])
@@ -672,6 +966,58 @@ def phase3_prove(
         if archetype.upper() == "B" else ""
     )
     _tgt = Path(target_file) if Path(target_file).is_absolute() else PROJECT_ROOT / target_file
+
+    # --- Glue Staging setup (Fix B1) ---
+    # Create a per-algorithm staging file under Lib/Glue/Staging/ so Agent3
+    # never needs to touch the shared Lib/Glue/*.lean infrastructure.
+    _algo_name = Path(target_file).stem  # e.g. "SVRGOuterLoop"
+    _staging_path = PROJECT_ROOT / "Lib" / "Glue" / "Staging" / f"{_algo_name}.lean"
+    _staging_path.parent.mkdir(parents=True, exist_ok=True)
+    _staging_rel = str(_staging_path.relative_to(PROJECT_ROOT))
+
+    if not _staging_path.exists():
+        _staging_path.write_text(
+            f"-- Staging lemmas for {_algo_name} formalization.\n"
+            "-- Add new helper lemmas here. Do NOT modify existing Lib/Glue files.\n"
+            "import Lib.Glue.Probability\n"
+            "import Lib.Glue.Algebra\n"
+            "import Lib.Glue.Measurable\n"
+            "import Lib.Glue.Calculus\n",
+            encoding="utf-8",
+        )
+        console.print(f"  [Staging] Created {_staging_rel}")
+
+    # Inject staging import into algorithm file if not already present.
+    if _tgt.exists():
+        _tgt_content = _tgt.read_text(encoding="utf-8")
+        _staging_import = f"import Lib.Glue.Staging.{_algo_name}"
+        if _staging_import not in _tgt_content:
+            _lines = _tgt_content.splitlines()
+            last_import_idx = max(
+                (i for i, l in enumerate(_lines) if l.startswith("import")), default=-1
+            )
+            _lines.insert(last_import_idx + 1, _staging_import)
+            _tgt.write_text("\n".join(_lines) + "\n", encoding="utf-8")
+            console.print(f"  [Staging] Injected import into {target_file}")
+
+    # --- Glue pollution guard (Fix B2) ---
+    # Snapshot all existing Lib/Glue/*.lean files (excluding Staging/) so we
+    # can detect and revert any direct edits Agent3 makes to shared infrastructure.
+    _glue_dir = PROJECT_ROOT / "Lib" / "Glue"
+    _glue_snapshot: dict[Path, str] = {
+        p: p.read_text(encoding="utf-8")
+        for p in _glue_dir.glob("*.lean")
+    }
+
+    # --- Layer0 pollution guard ---
+    # Snapshot all existing Lib/Layer0/*.lean files so Agent3 can never
+    # permanently corrupt foundational library code (ConvexFOC, IndepExpect, etc.).
+    _layer0_dir = PROJECT_ROOT / "Lib" / "Layer0"
+    _layer0_snapshot: dict[Path, str] = {
+        p: p.read_text(encoding="utf-8")
+        for p in _layer0_dir.glob("*.lean")
+    }
+
     initial_exists: bool = _tgt.exists()
     _file_absent_suffix = (
         "\n\nCRITICAL: The target file does NOT exist yet. Your guidance MUST instruct "
@@ -681,6 +1027,12 @@ def phase3_prove(
         "must be created first."
         if not initial_exists
         else ""
+    )
+    # Pre-compute imported API signatures once; reused for every Agent2 + Agent3 call.
+    _imported_sigs = _extract_imported_algo_sigs(target_file)
+    _imported_sigs_block = (
+        f"\n\n{_imported_sigs}"
+        if _imported_sigs else ""
     )
     guidance = _call_agent2_with_tools(
         agent2,
@@ -694,7 +1046,8 @@ def phase3_prove(
         "guidance MUST instruct Agent3 to complete BOTH in a single attempt, "
         "or verification will fail."
         + _archetype_b_warning
-        + _file_absent_suffix,
+        + _file_absent_suffix
+        + _imported_sigs_block,
     )
     console.print(Panel(
         guidance[:400] + "..." if len(guidance) > 400 else guidance,
@@ -714,6 +1067,20 @@ def phase3_prove(
     initial_hash: str | None = _file_hash(target_file)
     file_changed: bool = False  # updated each attempt
 
+    # Sorry-count checkpoint: tracks the best verified state seen during this
+    # Phase 3 run.  Updated after every run_lean_verify that reduces sorry count.
+    # Used in SIGNATURE_HALLUCINATION to restore partial progress instead of
+    # nuking all work.  Only verified (compilable) states are checkpointed.
+    _initial_sorry_for_ckpt = int(
+        registry.call("run_lean_verify", target_file).get("sorry_count", 999)
+        if _tgt.exists() else 999
+    )
+    best_checkpoint: dict = {
+        "sorry_count": _initial_sorry_for_ckpt,
+        "content": load_file(target_file) if _tgt.exists() else None,
+        "staging_content": _staging_path.read_text(encoding="utf-8") if _staging_path.exists() else None,
+    }
+
     for attempt in range(1, max_retries + 1):
         attempts = attempt
         attempt_start_hash: str | None = _file_hash(target_file)
@@ -728,299 +1095,407 @@ def phase3_prove(
         prover_prompt = (
             _file_absent_prefix
             + "Use tools to close sorry placeholders.\n"
-            "Return ONLY valid JSON with keys: thought, tool_calls.\n"
-            "Each tool call must be an object: "
-            '{"tool": "<name>", "arguments": {...}}.\n'
-            "Allowed tools: read_file, search_in_file, edit_file_patch, write_new_file, run_lean_verify.\n"
+            "Return ONLY valid JSON with exactly three keys: thought, tool, arguments.\n"
+            "Output ONE action per response. After each action you will receive its "
+            "result before deciding the next action.\n"
+            'Example: {"thought": "...", "tool": "read_file", "arguments": {"path": "..."}}\n'
+            "To signal no further actions are needed: "
+            '{"thought": "...", "tool": "done", "arguments": {}}\n'
+            "Allowed tools: read_file, read_file_readonly, search_in_file, search_in_file_readonly, "
+            "edit_file_patch, write_new_file, run_lean_verify, request_agent2_help.\n"
             "SITUATIONAL BEHAVIOR:\n"
             "- If guidance contains PATCH blocks (<<<SEARCH>>>/<<<REPLACE>>>): "
             "execute them exactly — copy old_str and new_str verbatim.\n"
-            "- If you receive build errors in a follow-up: analyze the error "
-            "and line number, then fix (wrong identifier, API usage, etc.). "
-            "You have autonomy to reason and repair.\n"
-            "After edits call run_lean_verify. You will receive tool results "
-            "and can output more tool_calls to fix any errors.\n\n"
+            "- When you receive a tool result: analyze it and decide your next action.\n"
+            "- After any edit call run_lean_verify to confirm.\n\n"
+            "GLUE STAGING RULE (non-negotiable):\n"
+            f"- You may edit: {target_file}, {_staging_rel}\n"
+            "- All existing Lib/Glue/*.lean files are READ-ONLY. "
+            "Do not call edit_file_patch on Lib/Glue/Probability.lean, "
+            "Lib/Glue/Algebra.lean, Lib/Glue/Measurable.lean, or Lib/Glue/Calculus.lean.\n"
+            "- All Lib/Layer0/*.lean files (ConvexFOC.lean, IndepExpect.lean, GradientFTC.lean) "
+            "are READ-ONLY. Use read_file_readonly to inspect them, never edit_file_patch.\n"
+            f"- When you need a new helper lemma, add it to {_staging_rel}.\n"
+            f"- {_staging_rel} already imports all main Lib/Glue files.\n"
+            "- BEFORE adding any new 'import X' statement to any file, call "
+            "read_file_readonly(\"Main.lean\") or read_file_readonly(\"lakefile.lean\") "
+            "to verify that X does not already import the file you are editing "
+            "(which would create a circular dependency).\n\n"
             f"Target file: {target_file}\n"
-            f"Guidance:\n{guidance}"
+            + (_imported_sigs_block.lstrip("\n") + "\n" if _imported_sigs_block else "")
+            + f"Guidance:\n{guidance}"
         )
         raw_reply = agent3.call(prover_prompt)
         token_char_budget += len(prover_prompt) + len(raw_reply)
 
-        try:
-            payload = json.loads(raw_reply)
-        except json.JSONDecodeError as exc:
-            err_msg = (
-                "RETRY_ERROR: Invalid JSON format "
-                f"(line {exc.lineno}, col {exc.colno}): {exc.msg}"
-            )
-            last_errors = err_msg
-            diag_log.append(f"attempt={attempt} {err_msg}")
-            execution_history.append(ExecutionResult(
-                status_code="ERROR",
-                message=err_msg,
-                attempt=attempt,
-            ))
-            guidance = _call_agent2_with_tools(
-                agent2,
-                readonly_registry,
-                f"Attempt {attempt} failed.\n"
-                "Invalid JSON format from Agent3.\n"
-                "Adjust your guidance so Agent3 returns strict JSON tool calls.",
-            )
-            console.print(
-                f"  [Agent3] attempt {attempt}/{max_retries} — "
-                f"build=FAIL, sorry=unknown"
-            )
-            continue
-
-        if not isinstance(payload, dict):
-            last_errors = "RETRY_ERROR: Agent3 JSON top-level must be an object."
-            diag_log.append(f"attempt={attempt} {last_errors}")
-            execution_history.append(ExecutionResult(
-                status_code="ERROR",
-                message=last_errors,
-                attempt=attempt,
-            ))
-            guidance = _call_agent2_with_tools(
-                agent2,
-                readonly_registry,
-                f"Attempt {attempt} failed.\n"
-                "Agent3 JSON top-level was not an object.\n"
-                "Adjust your guidance for strict output schema.",
-            )
-            console.print(
-                f"  [Agent3] attempt {attempt}/{max_retries} — "
-                f"build=FAIL, sorry=unknown"
-            )
-            continue
-
-        tool_calls = payload.get("tool_calls", [])
-        if not isinstance(tool_calls, list):
-            last_errors = "RETRY_ERROR: 'tool_calls' must be a JSON list."
-            diag_log.append(f"attempt={attempt} {last_errors}")
-            execution_history.append(ExecutionResult(
-                status_code="ERROR",
-                message=last_errors,
-                attempt=attempt,
-            ))
-            guidance = _call_agent2_with_tools(
-                agent2,
-                readonly_registry,
-                f"Attempt {attempt} failed.\n"
-                "Agent3 output schema invalid: tool_calls is not a list.\n"
-                "Adjust your guidance for strict output schema.",
-            )
-            console.print(
-                f"  [Agent3] attempt {attempt}/{max_retries} — "
-                f"build=FAIL, sorry=unknown"
-            )
-            continue
-
+        # Per-attempt state tracking
         exec_results: list[ExecutionResult] = []
         edited_this_attempt = False
-        blocked_path: str | None = None
-        verify_result: dict | None = None
-        patch_mismatch_detected: bool = False
+        patch_mismatch_in_attempt = False
+        last_exit_code = 1
+        last_sorry_in_attempt = 0
+        last_verify_text = ""
+        last_verify_result: dict | None = None
 
-        for idx, call in enumerate(tool_calls, start=1):
-            if not isinstance(call, dict):
-                exec_results.append(ExecutionResult(
-                    status_code="ERROR",
-                    message=f"tool_calls[{idx}] must be an object.",
-                    attempt=attempt,
-                ))
-                continue
-
-            tool_name = call.get("tool")
-            arguments = call.get("arguments", {})
-            if not isinstance(tool_name, str) or not isinstance(arguments, dict):
-                exec_results.append(ExecutionResult(
-                    status_code="ERROR",
-                    message=f"tool_calls[{idx}] invalid tool/arguments.",
-                    attempt=attempt,
-                ))
-                continue
-
+        # -------------------------------------------------------------------
+        # Single-step interactive tool loop
+        # Each iteration: parse one action, execute it, return result to Agent3.
+        # -------------------------------------------------------------------
+        _inner_break_reason = ""
+        _escalation_count = 0  # limit Agent3→Agent2 escalations per attempt
+        for tool_turn in range(max_tool_turns):
+            # Parse Agent3's single action
             try:
-                outcome = registry.call(tool_name, **arguments)
+                payload = json.loads(raw_reply)
+            except json.JSONDecodeError as exc:
+                err_msg = (
+                    f"Invalid JSON (line {exc.lineno}, col {exc.colno}): {exc.msg}. "
+                    "Return valid JSON with keys: thought, tool, arguments."
+                )
+                diag_log.append(f"attempt={attempt} turn={tool_turn} {err_msg}")
+                exec_results.append(ExecutionResult(
+                    status_code="ERROR", message=err_msg, attempt=attempt,
+                ))
+                last_errors = err_msg
+                _inner_break_reason = "json_error"
+                break
+
+            if not isinstance(payload, dict):
+                err_msg = "Agent3 JSON must be an object with keys: thought, tool, arguments."
+                diag_log.append(f"attempt={attempt} turn={tool_turn} {err_msg}")
+                exec_results.append(ExecutionResult(
+                    status_code="ERROR", message=err_msg, attempt=attempt,
+                ))
+                last_errors = err_msg
+                _inner_break_reason = "json_error"
+                break
+
+            tool_name = str(payload.get("tool", ""))
+            arguments = payload.get("arguments", {})
+            if not isinstance(arguments, dict):
+                arguments = {}
+
+            # "done" signal: force verify, NEVER trust Agent3's self-report
+            if tool_name == "done":
+                forced_verify = registry.call("run_lean_verify", target_file)
+                forced_exit = int(forced_verify.get("exit_code", 1))
+                forced_sorry = int(forced_verify.get("sorry_count", 0))
+                current_hash = _file_hash(target_file)
+                file_changed = _tgt.exists() and (
+                    not initial_exists or current_hash != initial_hash
+                )
+                if forced_exit == 0 and forced_sorry == 0 and file_changed:
+                    # Full-library gate
+                    full_build = lake_build(target="SGDAlgorithms")
+                    if full_build.returncode == 0:
+                        execution_history.extend(exec_results)
+                        console.print(
+                            f"  [Agent3] attempt {attempt}/{max_retries} — "
+                            f"build=OK, sorry=0 (done at turn {tool_turn + 1})"
+                        )
+                        # Success: restore any shared Glue/Layer0 files Agent3 may have edited.
+                        for _gp, _goriginal in _glue_snapshot.items():
+                            if _gp.exists() and _gp.read_text(encoding="utf-8") != _goriginal:
+                                _gp.write_text(_goriginal, encoding="utf-8")
+                                console.print(f"  [Staging] Restored {_gp.name} (was modified)")
+                        for _lp, _loriginal in _layer0_snapshot.items():
+                            if _lp.exists() and _lp.read_text(encoding="utf-8") != _loriginal:
+                                _lp.write_text(_loriginal, encoding="utf-8")
+                                console.print(f"  [Layer0] Restored {_lp.name} (was modified by Agent3)")
+                        return True, attempts, "", {
+                            "execution_history": [r.__dict__ for r in execution_history],
+                            "attempt_failures": attempt_failures,
+                            "estimated_token_consumption": max(1, token_char_budget // 4),
+                            "retry_count": sum(
+                                1 for r in execution_history
+                                if r.status_code in {"ERROR", "BLOCKED"}
+                            ),
+                        }
+                    else:
+                        full_errors = full_build.errors or "SGDAlgorithms full build failed"
+                        last_errors = full_errors
+                        exec_results.append(ExecutionResult(
+                            status_code="ERROR",
+                            message=f"[Full-Build Gate] SGDAlgorithms failed:\n{full_errors[:800]}",
+                            attempt=attempt,
+                        ))
+                        raw_reply = agent3.call(
+                            f"## done rejected — full library build failed\n"
+                            f"```\n{full_errors[:2000]}\n```\n"
+                            "Fix the cascade failure, then signal done again."
+                        )
+                        token_char_budget += len(raw_reply)
+                        continue
+                else:
+                    # Not actually done — tell Agent3 the real state
+                    rejection = _format_done_rejection(forced_verify, target_file)
+                    raw_reply = agent3.call(rejection)
+                    token_char_budget += len(raw_reply)
+                    continue
+
+            # ---------------------------------------------------------------
+            # Agent3 → Agent2 escalation: mid-attempt help request
+            # ---------------------------------------------------------------
+            if tool_name == "request_agent2_help":
+                _escalation_count += 1
+                if _escalation_count > 3:
+                    esc_msg = (
+                        "## Escalation limit reached\n"
+                        "You have already escalated 3 times this attempt. "
+                        "Use your existing tools to make progress or call done."
+                    )
+                    raw_reply = agent3.call(esc_msg)
+                    token_char_budget += len(esc_msg) + len(raw_reply)
+                    continue
+
+                stuck_at_line = arguments.get("stuck_at_line", "unknown")
+                error_message = str(arguments.get("error_message", ""))[:600]
+                diagnosis = str(arguments.get("diagnosis", ""))[:800]
+                attempts_tried = int(arguments.get("attempts_tried", tool_turn + 1))
+                console.print(
+                    f"  [Agent3→Agent2] Escalation #{_escalation_count} at turn "
+                    f"{tool_turn + 1}: stuck at line {stuck_at_line}"
+                )
+                diag_log.append(
+                    f"attempt={attempt} turn={tool_turn} "
+                    f"Agent3 escalation: {diagnosis[:200]}"
+                )
+                current_file_snippet = ""
+                try:
+                    current_file_snippet = load_file(target_file)[:8000]
+                except Exception:  # noqa: BLE001
+                    current_file_snippet = "(file missing or unreadable)"
+                new_guidance = _call_agent2_with_tools(
+                    agent2,
+                    readonly_registry,
+                    f"[AGENT3 ESCALATION — MID-ATTEMPT HELP REQUEST]\n"
+                    f"Agent3 is stuck on line {stuck_at_line} after "
+                    f"{attempts_tried} turns.\n\n"
+                    f"Agent3's error:\n```\n{error_message}\n```\n\n"
+                    f"Agent3's diagnosis:\n{diagnosis}\n\n"
+                    f"=== CURRENT FILE ({target_file}) ===\n"
+                    f"```lean\n{current_file_snippet}\n```\n\n"
+                    "Apply your Sorry-Fill Proof Path Protocol. "
+                    "Classify the problem as structural (A) or tactical (B) "
+                    "and provide revised, concrete guidance with exact Lean API "
+                    "calls. Agent3 will continue in the SAME attempt.",
+                )
+                esc_result_msg = (
+                    f"## Agent2 Revised Guidance (escalation #{_escalation_count})\n"
+                    f"{new_guidance}\n\n"
+                    "Apply this guidance now. Continue with tool calls."
+                )
                 exec_results.append(ExecutionResult(
                     status_code="SUCCESS",
-                    message=f"{tool_name} executed.",
+                    message=(
+                        f"request_agent2_help: escalation #{_escalation_count} "
+                        f"processed (turn {tool_turn + 1})"
+                    ),
                     attempt=attempt,
                 ))
-                if tool_name in ("edit_file_patch", "write_new_file"):
-                    edited_this_attempt = True
-                if tool_name == "run_lean_verify":
-                    verify_result = outcome
-            except PermissionError as exc:
-                blocked_path = str(arguments.get("path") or arguments.get("file_path") or "?")
-                exec_results.append(ExecutionResult(
-                    status_code="BLOCKED",
-                    message=f"Security violation on path {blocked_path}: {exc}",
-                    attempt=attempt,
-                ))
-            except ValueError as exc:
-                err_str = str(exc)
-                # Detect edit_file_patch SEARCH mismatch specifically so we
-                # can ask Agent2 to re-generate from the raw file text.
-                if tool_name == "edit_file_patch" and (
-                    "not found in target file" in err_str
-                    or "old_str not found" in err_str
+                raw_reply = agent3.call(esc_result_msg)
+                token_char_budget += len(esc_result_msg) + len(raw_reply)
+                continue
+
+            # Execute single tool and format result for Agent3
+            result_msg, verify_result, edited = _execute_single_tool_and_format(
+                registry, tool_name, arguments, target_file
+            )
+            token_char_budget += len(result_msg)
+
+            if edited:
+                edited_this_attempt = True
+            if "PATCH MISMATCH" in result_msg:
+                patch_mismatch_in_attempt = True
+
+            exec_results.append(ExecutionResult(
+                status_code="SUCCESS" if not result_msg.startswith("## Tool error") else "ERROR",
+                message=f"{tool_name}: {result_msg[:120]}",
+                attempt=attempt,
+            ))
+
+            # Process run_lean_verify results inline
+            if tool_name == "run_lean_verify" and verify_result is not None:
+                last_verify_result = verify_result
+                last_exit_code = int(verify_result.get("exit_code", 1))
+                last_sorry_in_attempt = int(verify_result.get("sorry_count", 0))
+                verify_errors = verify_result.get("errors", [])
+                last_verify_text = (
+                    "\n".join(verify_errors)
+                    if isinstance(verify_errors, list) else str(verify_errors)
+                )
+                last_sorry_count = last_sorry_in_attempt
+                last_errors = last_verify_text
+
+                # Checkpoint: save verified state whenever sorry count improves.
+                # Only verified (compilable) states are checkpointed.
+                if (
+                    last_sorry_in_attempt < best_checkpoint["sorry_count"]
+                    and _tgt.exists()
                 ):
-                    patch_mismatch_detected = True
-                    exec_results.append(ExecutionResult(
-                        status_code="PATCH_MISMATCH",
-                        message=f"edit_file_patch SEARCH not found in file: {err_str}",
-                        attempt=attempt,
-                    ))
-                else:
-                    exec_results.append(ExecutionResult(
-                        status_code="ERROR",
-                        message=f"{tool_name} failed: {err_str}",
-                        attempt=attempt,
-                    ))
-            except Exception as exc:  # noqa: BLE001
-                exec_results.append(ExecutionResult(
-                    status_code="ERROR",
-                    message=f"{tool_name} failed: {exc}",
-                    attempt=attempt,
-                ))
+                    best_checkpoint = {
+                        "sorry_count": last_sorry_in_attempt,
+                        "content": load_file(target_file),
+                        "staging_content": (
+                            _staging_path.read_text(encoding="utf-8")
+                            if _staging_path.exists() else None
+                        ),
+                    }
+                    console.print(
+                        f"  [Checkpoint] Updated: sorry={last_sorry_in_attempt}"
+                    )
 
-        # Strong verification loop: any edit must trigger verify.
-        if edited_this_attempt and verify_result is None:
-            verify_result = registry.call("run_lean_verify", target_file)
-            exec_results.append(ExecutionResult(
-                status_code="SUCCESS",
-                message="Auto-triggered run_lean_verify after edit_file_patch.",
-                attempt=attempt,
-            ))
+                console.print(
+                    f"  [Agent3] attempt {attempt}/{max_retries} "
+                    f"turn {tool_turn + 1}/{max_tool_turns} — "
+                    f"exit={last_exit_code}, sorry={last_sorry_in_attempt}"
+                )
+                if last_exit_code != 0 and last_verify_text:
+                    console.print(f"[dim]  {last_verify_text[:400]}[/dim]")
 
-        if verify_result is None:
-            verify_result = registry.call("run_lean_verify", target_file)
+                if last_exit_code != 0:
+                    attempt_failures.append({
+                        "attempt": attempt,
+                        "exit_code": last_exit_code,
+                        "sorry_count": last_sorry_in_attempt,
+                        "lean_errors": last_verify_text[:4000],
+                        "target_file_content": (
+                            load_file(target_file)[:50000] if _tgt.exists() else None
+                        ),
+                    })
 
-        exit_code = int(verify_result.get("exit_code", 1))
-        last_sorry_count = int(verify_result.get("sorry_count", 0))
-        verify_errors = verify_result.get("errors", [])
-        verify_text = "\n".join(verify_errors) if isinstance(verify_errors, list) else str(verify_errors)
-        last_errors = verify_text
+                # SIGNATURE_HALLUCINATION: break inner loop, delete file, replan
+                error_type = _classify_lean_error(last_verify_text)
+                err_line_no = _extract_first_error_line(last_verify_text)
+                line_no_display = str(err_line_no) if err_line_no is not None else "unknown"
 
-        # 4-condition success gate:
-        #   1. exit_code == 0   (compiler clean)
-        #   2. sorry_count == 0 (no sorry placeholders)
-        #   3. target file exists
-        #   4. target file content changed since Phase 3 started
-        current_hash = _file_hash(target_file)
-        file_changed = _tgt.exists() and (not initial_exists or current_hash != initial_hash)
-        # Per-attempt change detection: did Agent3 touch the file THIS attempt?
-        attempt_file_changed = _tgt.exists() and (current_hash != attempt_start_hash)
+                if error_type == "SIGNATURE_HALLUCINATION":
+                    console.print(
+                        f"  [Agent3] attempt {attempt}/{max_retries} — "
+                        "[red]SIGNATURE_HALLUCINATION detected"
+                    )
+                    execution_history.extend(exec_results)
+                    # Restore checkpoint if one exists; otherwise wipe.
+                    # Note: do NOT gate on sorry_count < _initial_sorry_for_ckpt —
+                    # that condition fails when the run started from a sorry=0 file,
+                    # causing the checkpoint to be skipped and the file deleted.
+                    if best_checkpoint["content"] is not None:
+                        _tgt.write_text(best_checkpoint["content"], encoding="utf-8")
+                        initial_hash = hashlib.md5(_tgt.read_bytes()).hexdigest()
+                        initial_exists = True
+                        file_changed = True
+                        # Also restore staging file to its checkpointed state.
+                        if best_checkpoint.get("staging_content") is not None:
+                            _staging_path.write_text(
+                                best_checkpoint["staging_content"], encoding="utf-8"
+                            )
+                        # Restore any Glue files Agent3 may have corrupted.
+                        for _gp, _goriginal in _glue_snapshot.items():
+                            if _gp.exists() and _gp.read_text(encoding="utf-8") != _goriginal:
+                                _gp.write_text(_goriginal, encoding="utf-8")
+                                console.print(f"  [Staging] Restored {_gp.name} (SIGNATURE_HALLUCINATION rollback)")
+                        # Restore any Layer0 files Agent3 may have corrupted.
+                        for _lp, _loriginal in _layer0_snapshot.items():
+                            if _lp.exists() and _lp.read_text(encoding="utf-8") != _loriginal:
+                                _lp.write_text(_loriginal, encoding="utf-8")
+                                console.print(f"  [Layer0] Restored {_lp.name} (SIGNATURE_HALLUCINATION rollback)")
+                        console.print(
+                            f"  [Checkpoint] Restored (sorry={best_checkpoint['sorry_count']}) "
+                            "instead of full wipe"
+                        )
+                    else:
+                        if _tgt.exists():
+                            _tgt.unlink()
+                        initial_exists = False
+                        initial_hash = None
+                        file_changed = False
+                    guidance = _call_agent2_with_tools(
+                        agent2,
+                        readonly_registry,
+                        f"[STATEMENT ERROR — SIGNATURE HALLUCINATION]\n"
+                        f"Lean error excerpt:\n```\n{last_verify_text[:800]}\n```\n\n"
+                        "The theorem STATEMENT itself is broken: it references a symbol "
+                        "that does not exist in Lean or Lib/.\n"
+                        "The old file has been DELETED. You MUST now rewrite it from scratch.\n\n"
+                        "CONSTRAINT (non-negotiable — Principle A):\n"
+                        "Use ONLY mathematical primitives in the new theorem signature.\n"
+                        "Do NOT invent any new abstract type, set constructor, or class name —\n"
+                        "including any name resembling the one that just failed.\n"
+                        "Express every property as a direct inequality, ∀/∃ quantifier,\n"
+                        "or inner-product expression (e.g. ∀ y, f y ≥ f x + ⟪g, y-x⟫_ℝ).\n\n"
+                        "Output a complete corrected file. Agent3 will use write_new_file.",
+                    )
+                    _inner_break_reason = "hallucination"
+                    break  # start next attempt with fresh guidance
 
-        if exit_code == 0 and last_sorry_count == 0 and file_changed:
-            # Full-library gate: verify no cascade breakage across SGDAlgorithms.
-            full_build = lake_build(target="SGDAlgorithms")
-            if full_build.returncode != 0:
-                full_errors = full_build.errors or "SGDAlgorithms full build failed"
-                last_errors = full_errors
-                exec_results.append(ExecutionResult(
-                    status_code="ERROR",
-                    message=f"[Full-Build Gate] SGDAlgorithms failed:\n{full_errors[:800]}",
-                    attempt=attempt,
-                ))
-                prove_state = "PROVE_RETRY"
-            else:
-                prove_state = "PROVE_SUCCESS"
-        elif exit_code == 0 and last_sorry_count == 0 and not attempt_file_changed:
-            # Build looks green but Agent3 never touched the file this attempt — no-op trap.
-            no_change_msg = (
-                "FAILURE: No changes detected in the target file. "
-                "You must use 'edit_file_patch' to implement the proof "
-                "before calling verification."
-            )
-            exec_results.append(ExecutionResult(
-                status_code="ERROR",
-                message=no_change_msg,
-                attempt=attempt,
-            ))
-            last_errors = no_change_msg
-            prove_state = "PROVE_RETRY"
+                if error_type == "LOCAL_PROOF_ERROR":
+                    console.print(
+                        f"  [Agent3] attempt {attempt}/{max_retries} — "
+                        f"[yellow]LOCAL_PROOF_ERROR at line {line_no_display} "
+                        f"(turn {tool_turn + 1}) — Agent3 continues self-fix"
+                    )
+
+            # Return tool result to Agent3 for next decision
+            raw_reply = agent3.call(result_msg)
+            token_char_budget += len(raw_reply)
+
         else:
-            prove_state = "PROVE_RETRY"
-
-        blocked_msgs = [r.message for r in exec_results if r.status_code == "BLOCKED"]
-        error_msgs = [r.message for r in exec_results if r.status_code == "ERROR"]
-        execution_history.extend(exec_results)
-
-        if exit_code != 0 and verify_result is not None:
-            attempt_failures.append({
-                "attempt": attempt,
-                "exit_code": exit_code,
-                "sorry_count": last_sorry_count,
-                "lean_errors": verify_text[:4000] if verify_text else "",
-                "target_file_content": (
-                    load_file(target_file)[:50000] if _tgt.exists() else None
-                ),
-            })
-
-        build_ok = prove_state == "PROVE_SUCCESS"
-        status = "OK" if build_ok else "FAIL"
-        console.print(
-            f"  [Agent3] attempt {attempt}/{max_retries} — "
-            f"build={status}, sorry={last_sorry_count}"
-        )
-        if exit_code != 0 and verify_text:
-            console.print(f"[dim]Lean errors:\n{verify_text[:1500]}[/dim]")
-
-        if prove_state == "PROVE_SUCCESS":
-            return True, attempts, "", {
-                "execution_history": [r.__dict__ for r in execution_history],
-                "attempt_failures": attempt_failures,
-                "estimated_token_consumption": max(1, token_char_budget // 4),
-                "retry_count": sum(
-                    1
-                    for r in execution_history
-                    if r.status_code in {"ERROR", "BLOCKED"}
-                ),
-            }
-
-        # Intelligent retry prompts.
-        # Priority 1: no-op trap — Agent3 never touched the file THIS attempt.
-        if prove_state == "PROVE_RETRY" and not attempt_file_changed and exit_code == 0:
-            guidance = _call_agent2_with_tools(
-                agent2,
-                readonly_registry,
-                f"Attempt {attempt} NOOP — Agent3 made no file changes.\n"
-                f"Target file: {target_file}\n"
-                "SURGEON MODE: Agent3 called run_lean_verify without editing the file first. "
-                "Output a PATCH block (<<<SEARCH>>>/<<<REPLACE>>>) with the exact Lean code "
-                "Agent3 must write, or a write_new_file instruction if the file does not exist. "
-                "Be specific — no natural language advice. Agent3 will execute your patch verbatim.",
-            )
+            # for-loop completed without break: turn limit exhausted
             console.print(
                 f"  [Agent3] attempt {attempt}/{max_retries} — "
-                "build=NOOP (file unchanged)"
+                f"turn limit ({max_tool_turns}) reached without success"
             )
+            _inner_break_reason = "turn_limit"
+            # Force a final verify if no verify was done this attempt
+            if last_verify_result is None:
+                final_verify = registry.call("run_lean_verify", target_file)
+                last_exit_code = int(final_verify.get("exit_code", 1))
+                last_sorry_in_attempt = int(final_verify.get("sorry_count", 0))
+                verify_errors = final_verify.get("errors", [])
+                last_verify_text = (
+                    "\n".join(verify_errors)
+                    if isinstance(verify_errors, list) else str(verify_errors)
+                )
+                last_sorry_count = last_sorry_in_attempt
+                last_errors = last_verify_text
+                if (
+                    last_sorry_in_attempt < best_checkpoint["sorry_count"]
+                    and _tgt.exists()
+                ):
+                    best_checkpoint = {
+                        "sorry_count": last_sorry_in_attempt,
+                        "content": load_file(target_file),
+                        "staging_content": (
+                            _staging_path.read_text(encoding="utf-8")
+                            if _staging_path.exists() else None
+                        ),
+                    }
+                    console.print(
+                        f"  [Checkpoint] Updated at turn limit: sorry={last_sorry_in_attempt}"
+                    )
+
+        execution_history.extend(exec_results)
+
+        # If inner loop broke due to hallucination, continue outer loop (guidance already set)
+        if _inner_break_reason == "hallucination":
             continue
 
-        # Priority 2: security violation.
-        if blocked_msgs:
-            blocked_hint = (
-                f"Security violation: You cannot edit path {blocked_path or '?'}."
-                " Stay within Algorithms/ or Lib/."
-            )
-            diag_log.extend([f"attempt={attempt} {m}" for m in blocked_msgs])
-            guidance = _call_agent2_with_tools(
-                agent2,
-                readonly_registry,
-                f"Attempt {attempt} failed.\n"
-                f"{blocked_hint}\n"
-                "Adjust your guidance for safe path usage.",
-            )
-            continue
+        # Classify the final error state for this attempt
+        error_type_final = _classify_lean_error(last_verify_text) if last_verify_text else "PROOF_ERROR"
+        err_line_no_final = _extract_first_error_line(last_verify_text)
+        line_no_display_final = str(err_line_no_final) if err_line_no_final is not None else "unknown"
 
-        if error_msgs:
-            diag_log.extend([f"attempt={attempt} {m}" for m in error_msgs])
+        current_code = (
+            load_file(target_file)
+            if _tgt.exists()
+            else "(Agent3 has not created the file yet.)"
+        )
 
-        # Priority 2.5: File still does not exist — Agent3 never called write_new_file.
-        if not _tgt.exists() and "Target file does not exist" in (verify_text or ""):
+        current_hash_end = _file_hash(target_file)
+        attempt_file_changed = _tgt.exists() and (current_hash_end != attempt_start_hash)
+
+        # File-not-created check
+        if not _tgt.exists():
             guidance = _call_agent2_with_tools(
                 agent2,
                 readonly_registry,
@@ -1037,201 +1512,71 @@ def phase3_prove(
             )
             continue
 
-        current_code = (
-            load_file(target_file)
-            if _tgt.exists()
-            else "(Agent3 has not created the file yet.)"
-        )
-
-        # Priority 3: Signature Hallucination — the theorem statement is broken.
-        # Patching the proof body cannot fix this; the file must be rewritten.
-        error_type = _classify_lean_error(verify_text)
-        err_line_no = _extract_first_error_line(verify_text)
-        line_no_display = str(err_line_no) if err_line_no is not None else "unknown"
-
-        if error_type == "SIGNATURE_HALLUCINATION":
-            console.print(
-                f"  [Agent3] attempt {attempt}/{max_retries} — "
-                "[red]SIGNATURE_HALLUCINATION detected — deleting broken file"
-            )
-            if _tgt.exists():
-                _tgt.unlink()
-            # Reset the snapshot so the next write_new_file counts as a change.
-            initial_exists = False
-            initial_hash = None
-            file_changed = False
+        # No-op trap: file unchanged but build was already clean (no progress made)
+        if not attempt_file_changed and last_exit_code == 0 and last_sorry_in_attempt == 0:
             guidance = _call_agent2_with_tools(
                 agent2,
                 readonly_registry,
-                f"[STATEMENT ERROR — SIGNATURE HALLUCINATION]\n"
-                f"Lean error excerpt:\n```\n{verify_text[:800]}\n```\n\n"
-                f"The theorem STATEMENT itself is broken: it references a symbol "
-                f"that does not exist in Lean or Lib/.\n"
-                f"The old file has been DELETED. You MUST now rewrite it from scratch.\n\n"
-                f"CONSTRAINT (non-negotiable — Principle A):\n"
-                f"Use ONLY mathematical primitives in the new theorem signature.\n"
-                f"Do NOT invent any new abstract type, set constructor, or class name —\n"
-                f"including any name resembling the one that just failed.\n"
-                f"Express every property as a direct inequality, ∀/∃ quantifier,\n"
-                f"or inner-product expression (e.g. ∀ y, f y ≥ f x + ⟪g, y-x⟫_ℝ).\n\n"
-                f"Output a complete corrected file. Agent3 will use write_new_file.",
+                f"Attempt {attempt} NOOP — Agent3 made no file changes.\n"
+                f"Target file: {target_file}\n"
+                "SURGEON MODE: Output a PATCH block (<<<SEARCH>>>/<<<REPLACE>>>) with the "
+                "exact Lean code Agent3 must write. Be specific — no natural language.",
+            )
+            console.print(
+                f"  [Agent3] attempt {attempt}/{max_retries} — "
+                "build=NOOP (file unchanged)"
             )
             continue
 
-        # Priority 3b / Priority 4: Proof body error (LOCAL_PROOF_ERROR or PROOF_ERROR).
-        # For both cases: give Agent3 a chance to self-fix using feedback before
-        # escalating.  For LOCAL_PROOF_ERROR, fallback to sorry-degrade if
-        # Agent3 cannot fix within MAX_AGENT3_FEEDBACK_TURNS.
-        # File deletion is ABSOLUTELY PROHIBITED for both cases.
-        if error_type == "LOCAL_PROOF_ERROR":
+        # LOCAL_PROOF_ERROR: try sorry-degrade to keep the file compilable
+        if error_type_final == "LOCAL_PROOF_ERROR":
             console.print(
                 f"  [Agent3] attempt {attempt}/{max_retries} — "
-                f"[yellow]LOCAL_PROOF_ERROR at line {line_no_display} — "
-                "giving Agent3 self-fix opportunity first"
-            )
-
-        feedback_turn = 0
-        feedback_exec_results = exec_results
-        feedback_verify_result = verify_result
-        feedback_current_code = current_code
-        agent3_self_fixed = False
-
-        while feedback_turn < MAX_AGENT3_FEEDBACK_TURNS:
-            feedback_msg = _format_agent3_tool_feedback(
-                feedback_exec_results,
-                feedback_verify_result,
-                target_file,
-                feedback_current_code,
-            )
-            raw_reply = agent3.call(feedback_msg)
-            token_char_budget += len(feedback_msg) + len(raw_reply)
-            console.print(
-                f"  [Agent3] feedback turn {feedback_turn + 1}/{MAX_AGENT3_FEEDBACK_TURNS} — "
-                "analyzing errors, attempting fix"
-            )
-            try:
-                payload = json.loads(raw_reply)
-            except json.JSONDecodeError:
-                break
-            if not isinstance(payload, dict):
-                break
-            tool_calls = payload.get("tool_calls", [])
-            if not isinstance(tool_calls, list) or not tool_calls:
-                break
-
-            # Execute Agent3's fix
-            feedback_exec_results = []
-            for idx, call in enumerate(tool_calls, start=1):
-                if not isinstance(call, dict):
-                    feedback_exec_results.append(ExecutionResult(
-                        status_code="ERROR",
-                        message=f"tool_calls[{idx}] must be an object.",
-                        attempt=attempt,
-                    ))
-                    continue
-                tool_name = call.get("tool")
-                arguments = call.get("arguments", {})
-                if not isinstance(tool_name, str) or not isinstance(arguments, dict):
-                    feedback_exec_results.append(ExecutionResult(
-                        status_code="ERROR",
-                        message=f"tool_calls[{idx}] invalid tool/arguments.",
-                        attempt=attempt,
-                    ))
-                    continue
-                try:
-                    registry.call(tool_name, **arguments)
-                    feedback_exec_results.append(ExecutionResult(
-                        status_code="SUCCESS",
-                        message=f"{tool_name} executed.",
-                        attempt=attempt,
-                    ))
-                except (PermissionError, ValueError, Exception) as exc:
-                    feedback_exec_results.append(ExecutionResult(
-                        status_code="ERROR",
-                        message=f"{tool_name} failed: {exc}",
-                        attempt=attempt,
-                    ))
-
-            feedback_verify_result = registry.call("run_lean_verify", target_file)
-            feedback_exit = int(feedback_verify_result.get("exit_code", 1))
-            feedback_sorry = int(feedback_verify_result.get("sorry_count", 0))
-            feedback_current_code = (
-                load_file(target_file) if _tgt.exists() else ""
-            )
-
-            if feedback_exit == 0 and feedback_sorry == 0:
-                f_hash = _file_hash(target_file)
-                if _tgt.exists() and (not initial_exists or f_hash != initial_hash):
-                    full_build = lake_build(target="SGDAlgorithms")
-                    if full_build.returncode == 0:
-                        agent3_self_fixed = True
-                        console.print(
-                            f"  [Agent3] self-fix succeeded on feedback turn "
-                            f"{feedback_turn + 1}"
-                        )
-                        return True, attempts, "", {
-                            "execution_history": [r.__dict__ for r in execution_history],
-                            "attempt_failures": attempt_failures,
-                            "estimated_token_consumption": max(1, token_char_budget // 4),
-                            "retry_count": sum(
-                                1
-                                for r in execution_history
-                                if r.status_code in {"ERROR", "BLOCKED"}
-                            ),
-                        }
-            feedback_turn += 1
-
-        # Propagate Agent3 feedback loop's final state to outer loop variables
-        # so Agent2 receives the most up-to-date error info and file content.
-        if feedback_turn > 0:
-            exit_code = feedback_exit
-            last_sorry_count = feedback_sorry
-            verify_text = "\n".join(
-                feedback_verify_result.get("errors", [])
-                if isinstance(feedback_verify_result.get("errors"), list)
-                else [str(feedback_verify_result.get("errors", ""))]
-            )
-            current_code = feedback_current_code
-
-        # LOCAL_PROOF_ERROR fallback: if Agent3 could not self-fix, sorry-degrade.
-        if error_type == "LOCAL_PROOF_ERROR" and not agent3_self_fixed:
-            console.print(
-                f"  [Agent3] attempt {attempt}/{max_retries} — "
-                f"[yellow]LOCAL_PROOF_ERROR self-fix failed — falling back to sorry-degrade"
+                f"[yellow]LOCAL_PROOF_ERROR at line {line_no_display_final} — "
+                "requesting sorry-degrade from Agent2"
             )
             err_summary_match = re.search(
-                r"error:(.+)", verify_text, re.IGNORECASE | re.DOTALL
+                r"error:(.+)", last_verify_text, re.IGNORECASE | re.DOTALL
             )
             err_summary = (
                 err_summary_match.group(1).strip()[:120].replace("\n", " ")
                 if err_summary_match
-                else verify_text[:120].replace("\n", " ")
+                else last_verify_text[:120].replace("\n", " ")
             )
             guidance = _call_agent2_with_tools(
                 agent2,
                 readonly_registry,
-                f"[LOCAL PROOF ERROR — SORRY DEGRADATION REQUIRED]\n"
-                f"Build exit code: {exit_code} | Sorry count: {last_sorry_count}\n"
-                f"Error at line {line_no_display}:\n```\n{verify_text[:4000]}\n```\n\n"
+                f"[LOCAL PROOF ERROR — DIAGNOSIS REQUIRED]\n"
+                f"Build exit code: {last_exit_code} | Sorry count: {last_sorry_in_attempt}\n"
+                f"Error at line {line_no_display_final}:\n```\n{last_verify_text[:4000]}\n```\n\n"
                 f"\n=== AGENT3'S CURRENT FILE ({target_file}) ===\n"
-                f"```lean\n{current_code[:3000]}\n```\n\n"
-                f"The error is DEEP in the proof body (line {line_no_display}). "
-                f"Agent3 has already attempted self-repair but could not fix it.\n"
-                f"The theorem statement and imports are correct.\n\n"
-                f"STRICT RULES — violation causes automatic failure:\n"
+                f"```lean\n{current_code[:10000]}\n```\n\n"
+                f"Agent3 used all {max_tool_turns} turns on line {line_no_display_final} "
+                f"and could not fix the error.\n\n"
+                f"DIAGNOSE FIRST — apply your Sorry-Fill Proof Path Protocol:\n\n"
+                f"(A) STRUCTURAL error (type incompatibility, missing glue lemma, wrong proof\n"
+                f"    approach that cannot be fixed by patching the current code):\n"
+                f"    → Do NOT sorry-degrade. Provide a NEW proof strategy for the next attempt.\n"
+                f"    → If a Lib/Glue lemma is missing, output its complete Lean signature.\n"
+                f"    → Explain why the current approach fails at the type level.\n\n"
+                f"(B) TACTICAL error (wrong tactic name, wrong lemma identifier, minor\n"
+                f"    type mismatch fixable with a one-line rewrite):\n"
+                f"    → Sorry-degrade line {line_no_display_final} using:\n"
+                f"        sorry -- LOCAL_ERROR: {err_summary}\n"
+                f"    → Provide the corrected tactic in your next-attempt guidance.\n\n"
+                f"STATE YOUR CLASSIFICATION (A or B) EXPLICITLY before any patch or strategy.\n\n"
+                f"STRICT RULES (both cases):\n"
                 f"1. Do NOT use write_new_file — the file must NOT be deleted or overwritten.\n"
-                f"2. Use edit_file_patch with a <<<SEARCH>>>/<<<REPLACE>>> block to replace "
-                f"   the broken tactic/term at line {line_no_display} with:\n"
-                f"     sorry -- LOCAL_ERROR: {err_summary}\n"
-                f"   This keeps the file compilable so the next attempt can close this sorry.\n"
+                f"2. Use edit_file_patch with <<<SEARCH>>>/<<<REPLACE>>> for any patch.\n"
                 f"3. SEARCH must be copied verbatim from the current file shown above.\n"
-                f"4. Output ONLY the patch block — no prose explanation needed.",
+                f"4. For case A with a missing Lib/Glue lemma: first do a lookup to confirm\n"
+                f"   the lemma truly does not exist, then write its full signature.",
             )
             continue
 
-        # Exhausted Agent3 self-fix turns — get new guidance from Agent2.
+        # General failure: give Agent2 full context for new guidance
         mismatch_prefix = ""
-        if patch_mismatch_detected:
+        if patch_mismatch_in_attempt:
             mismatch_prefix = (
                 "PATCH MISMATCH: Your previous SEARCH block did not match the file on disk.\n"
                 "You MUST copy the SEARCH string VERBATIM from the raw file shown below.\n"
@@ -1239,18 +1584,28 @@ def phase3_prove(
                 "will cause edit_file_patch to fail again.\n\n"
             )
 
+        if _inner_break_reason == "json_error":
+            guidance = _call_agent2_with_tools(
+                agent2,
+                readonly_registry,
+                f"Attempt {attempt} failed.\n"
+                "Agent3 returned invalid JSON. Last error: " + last_errors + "\n"
+                "Adjust your guidance so Agent3 outputs strict single-action JSON.",
+            )
+            continue
+
         guidance = _call_agent2_with_tools(
             agent2,
             readonly_registry,
             mismatch_prefix
             + f"Attempt {attempt} failed.\n"
-            f"Build exit code: {exit_code} | Sorry count: {last_sorry_count}\n"
-            f"Error first occurs at line {line_no_display}.\n"
-            f"=== FULL LEAN ERROR OUTPUT ===\n```\n{verify_text[:4000]}\n```\n"
+            f"Build exit code: {last_exit_code} | Sorry count: {last_sorry_in_attempt}\n"
+            f"Error first occurs at line {line_no_display_final}.\n"
+            f"=== FULL LEAN ERROR OUTPUT ===\n```\n{last_verify_text[:4000]}\n```\n"
             f"\n=== AGENT3'S CURRENT FILE ({target_file}) ===\n"
-            f"```lean\n{current_code[:3000]}\n```\n\n"
+            f"```lean\n{current_code[:10000]}\n```\n\n"
             f"SURGEON MODE: Diagnose the root cause of the Lean error above. "
-            f"Focus on line {line_no_display} and its surrounding context. "
+            f"Focus on line {line_no_display_final} and its surrounding context. "
             "Then output one PATCH block per error in the <<<SEARCH>>>/<<<REPLACE>>> format. "
             "SEARCH must be copied verbatim from the current file (exact whitespace/indentation). "
             "Write the exact correct Mathlib 4 code in REPLACE — no vague suggestions. "
@@ -1259,6 +1614,16 @@ def phase3_prove(
             "Do NOT name a lemma you have not verified in the file context provided. "
             "Agent3 will apply your patches verbatim as edit_file_patch calls.",
         )
+
+    # Restore any shared Glue/Layer0 files Agent3 may have edited before exiting Phase 3.
+    for _gp, _goriginal in _glue_snapshot.items():
+        if _gp.exists() and _gp.read_text(encoding="utf-8") != _goriginal:
+            _gp.write_text(_goriginal, encoding="utf-8")
+            console.print(f"  [Staging] Restored {_gp.name} (was modified by Agent3)")
+    for _lp, _loriginal in _layer0_snapshot.items():
+        if _lp.exists() and _lp.read_text(encoding="utf-8") != _loriginal:
+            _lp.write_text(_loriginal, encoding="utf-8")
+            console.print(f"  [Layer0] Restored {_lp.name} (was modified by Agent3)")
 
     console.print("[red bold]Max retries exhausted — escalating to Agent5.")
     if diag_log:
@@ -1780,6 +2145,7 @@ def run(
     archetype: str,
     target_file: str | None = None,
     max_retries: int = MAX_PHASE3_RETRIES,
+    max_tool_turns: int | None = None,
     force_low_leverage: bool = False,
 ) -> None:
     """Execute the full 5-phase pipeline."""
@@ -1839,7 +2205,10 @@ def run(
                 audit.set_phase(3)
                 progress.update(task, description="Phase 3/5: Proving (fill sorry)...")
                 success, attempts, _, phase3_audit = phase3_prove(
-                    agent2, target_file, plan, max_retries=max_retries, archetype=archetype
+                    agent2, target_file, plan,
+                    max_retries=max_retries,
+                    archetype=archetype,
+                    max_tool_turns=max_tool_turns,
                 )
                 total_attempts += attempts
                 merged_phase3_audit["execution_history"].extend(
@@ -1948,6 +2317,12 @@ def main() -> None:
                         help="Target .lean file (default: Algorithms/<algorithm>.lean)")
     parser.add_argument("--max-retries", type=int, default=MAX_PHASE3_RETRIES,
                         help="Max sorry-closing retries (default: 5)")
+    parser.add_argument("--max-tool-turns", type=int, default=None,
+                        help=(
+                            f"Max single-step tool turns per attempt "
+                            f"(default: {MAX_AGENT3_TOOL_TURNS}, "
+                            f"x1.5 for Archetype B). Override with this flag."
+                        ))
     parser.add_argument("--force-low-leverage", action="store_true",
                         help="Override the ≥50%% leverage gate")
     parser.add_argument("--interactive", action="store_true",
@@ -1977,6 +2352,7 @@ def main() -> None:
         archetype=fields["archetype"],
         target_file=args.target_file,
         max_retries=args.max_retries,
+        max_tool_turns=args.max_tool_turns,
         force_low_leverage=args.force_low_leverage,
     )
 

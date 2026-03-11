@@ -50,12 +50,12 @@ PROVIDER_URLS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 AGENT_CONFIGS: dict[str, dict] = {
-    "orchestrator":  {"provider": "qwen",     "model": "qwen3-max-2026-01-23"  ,  "max_tokens": 32768},
-    "planner":       {"provider": "qwen",     "model": "qwen3-max-2026-01-23",  "max_tokens": 32768},
+    "orchestrator":  {"provider": "qwen",     "model": "qwen3.5-plus"  ,  "max_tokens": 32768},
+    "planner":       {"provider": "qwen",     "model": "qwen3.5-plus",  "max_tokens": 32768},
     #"sorry_closer":  {"provider": "deepseek", "model": "deepseek-reasoner", "temperature": 0.0,   "max_tokens": 8192, "use_manifest": True},
-    "sorry_closer":  {"provider": "qwen",     "model": "qwen3-max-2026-01-23", "max_tokens": 32768, "use_manifest": True},
-    "persister":     {"provider": "qwen",     "model": "qwen3-max-2026-01-23", "max_tokens": 32768},
-    "diagnostician": {"provider": "qwen",     "model": "qwen3-max-2026-01-23",  "max_tokens": 16384},
+    "sorry_closer":  {"provider": "qwen",     "model": "qwen3.5-plus", "max_tokens": 32768, "use_manifest": True},
+    "persister":     {"provider": "qwen",     "model": "qwen3.5-plus", "max_tokens": 32768},
+    "diagnostician": {"provider": "qwen",     "model": "qwen3.5-plus",  "max_tokens": 16384},
 }
 
 # ---------------------------------------------------------------------------
@@ -64,6 +64,10 @@ AGENT_CONFIGS: dict[str, dict] = {
 
 WHITELIST_PATHS = ["Algorithms/", "Lib/", "docs/"]
 LEAN_VERIFY_PATHS = ["Algorithms/", "Lib/"]
+
+# Root-level Lean files that agents may read (but never write) to inspect
+# the project import graph and detect circular dependencies before adding imports.
+READ_ONLY_PATHS = ["Algorithms/", "Lib/", "docs/", "Main.lean", "lakefile.lean"]
 
 DOC_ANCHORS_BY_FILE: dict[str, list[str]] = {
     "docs/CATALOG.md": ["CATALOG_ALGO_LAYER", "CATALOG_ROADMAP"],
