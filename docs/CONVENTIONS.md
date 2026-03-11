@@ -229,3 +229,73 @@ effective variance `σ_eff² = 2σ² + 2K²R²`.
 
 See [`docs/GLUE_TRICKS.md`](GLUE_TRICKS.md) Section 5 for the full derivation,
 Lean code templates, and the algorithm impact table.
+
+---
+
+## Convention 6: Dot Notation for Namespace-Local Parameterized Functions
+
+**Severity:** Critical — violating this causes `Application type mismatch` that
+agents cannot self-repair, because the error message gives no hint about the fix.
+
+### Rule
+
+Any `def` or `noncomputable def` defined inside `namespace FooSetup` under a
+`variable (setup : FooSetup ...)` declaration that takes **additional explicit
+parameters** (e.g., a step index `m : ℕ`) MUST be called everywhere using dot
+notation: `setup.funcName args`.
+
+Writing `funcName args` (without `setup.`) will fail with a misleading error:
+```
+Application type mismatch: The argument
+  m
+has type
+  ℕ
+but is expected to have type
+  FooSetup ...
+```
+This happens because `variable (setup : ...)` with **round brackets** inserts
+`setup` as an **explicit** parameter in the definition. Lean will never
+auto-insert explicit parameters at a call site, so you must always provide
+`setup` explicitly — the most ergonomic way is dot notation.
+
+### Bad
+
+```lean
+namespace SVRGSetup
+variable (setup : SVRGSetup E S Ω)
+
+noncomputable def outerProcess (m : ℕ) : ℕ → Ω → E := ...
+
+-- WRONG: Lean sees `outerProcess m` as applying `outerProcess` to `m : ℕ`
+-- but the first explicit argument is `setup : SVRGSetup`, not `m`.
+theorem foo (m k : ℕ) : ... ‖outerProcess m k ω - wStar‖ ... := ...
+```
+
+### Good
+
+```lean
+-- CORRECT: dot notation provides `setup` explicitly.
+theorem foo (m k : ℕ) : ... ‖setup.outerProcess m k ω - wStar‖ ... := ...
+```
+
+### Exception: zero-parameter aliases
+
+If the function takes **no additional explicit parameters** (a plain alias),
+dot notation is optional because there is no ambiguity:
+
+```lean
+noncomputable def process : ℕ → Ω → E :=   -- no extra params
+  sgdProcess setup.w₀ setup.η setup.gradL setup.ξ
+
+-- Both forms work:
+setup.process t   -- preferred
+process t         -- also OK (Lean fills setup from variable context)
+```
+
+### Why agents cannot self-repair this
+
+The error message (`m has type ℕ but expected FooSetup`) does not mention the
+missing `setup.` prefix. Agents typically respond by changing argument types or
+adding explicit type annotations, which never resolves the root cause. This bug
+was observed to persist for 15+ agent turns without progress (SVRGOuterLoop,
+March 2026).

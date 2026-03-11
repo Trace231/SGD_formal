@@ -280,6 +280,40 @@ For each parameter, check explicitly:
   the appropriate Lib/Glue/*.lean file, THEN give the proof using it.
 - Level 1: No Mathlib base exists → give a from-scratch proof outline.
 
+### Step 3b: Write the full have-chain (MANDATORY for Level 2+ gaps)
+
+For EVERY sorry with gap level ≥ 2, output a complete proof skeleton with ALL
+intermediate goals written as explicit `have` statements.
+
+Rules:
+- Each `have` MUST carry a COMPLETE type annotation — no `?_`, no omitted args.
+  BAD:  `have h := svrg_convergence_inner_strongly_convex ...`
+  GOOD: `have h : ∫ ω, ‖setup.svrgProcess wTilde gradLTilde m ω - wStar‖^2
+             ∂setup.toSGDSetup.P ≤ (1 - η * μ)^m * ‖wTilde - wStar‖^2 + η * σeff^2 / μ
+           := svrg_convergence_inner_strongly_convex ...`
+- Each `have` should require at most 3 tactics to fill.
+- If a bridge lemma is needed because a theorem requires a fixed argument (e.g.
+  `wTilde : E`) but the proof has a random variable (e.g. `w_k : Ω → E`):
+    (a) Name the bridge lemma explicitly (e.g. `svrg_epoch_bridge`).
+    (b) Write its FULL Lean signature as a declaration with `sorry`.
+    (c) Instruct Agent3: "Add this lemma to Lib/Glue/Staging/X.lean with sorry
+        FIRST, then use it here."
+- End with an `exact` or `linarith`/`ring` that combines the `have`s.
+
+Example — epoch contraction sorry:
+  PROOF_SKETCH for svrg_epoch_contraction (line 52):
+    -- Step A: bridge lemma is missing → add to staging first
+    -- In Lib/Glue/Staging/SVRGOuterLoop.lean add:
+    --   lemma svrg_epoch_bridge (w_k : Ω → E) (hw_k : Measurable w_k)
+    --       (h_indep : ...) ... :
+    --       ∫ ω, ‖innerProcess (w_k ω) m ω - wStar‖^2 ∂P ≤
+    --         (1 - η * μ)^m * ∫ ω, ‖w_k ω - wStar‖^2 ∂P + η * σ^2 / μ := by sorry
+    -- Step B: in SVRGOuterLoop.lean:
+    --   have h_contr : ∫ ω, ‖outerProcess m (k+1) ω - wStar‖^2 ∂P ≤
+    --       (1 - η * μ)^m * ∫ ω, ‖outerProcess m k ω - wStar‖^2 ∂P + η * σ^2 / μ :=
+    --     svrg_epoch_bridge (outerProcess m k) (by measurability) ...
+    --   linarith [h_contr]
+
 ### Step 4: For Level 2 (missing glue), specify the new lemma explicitly
 Provide the full Lean declaration:
   lemma <name> (<params>) : <statement> := by sorry
@@ -312,6 +346,18 @@ Rules:
   `start_line`/`end_line` to fetch the exact signature.
 - FORBIDDEN: naming a function or lemma without having read its definition.
   Invented signatures cause Agent3 failures that cost a full retry attempt.
+
+## Zero-Lookup Penalty (AUTOMATIC ENFORCEMENT)
+
+The orchestrator tracks how many lookup rounds you perform before returning
+final guidance. If you return guidance without ANY lookups:
+- A WARNING is automatically prepended to your guidance text.
+- Agent3 is told all your lemma names are UNVERIFIED and must check every one.
+- This adds extra read_file turns and slows the attempt by 5–10 turns.
+
+RULE: Perform at least 1 lookup per sorry you give guidance on.
+If you are certain of a signature from prior context in this conversation,
+still do 1 confirmatory lookup — it costs 1 API call vs. a full 30-turn retry.
 """
 
 # -------------------------------------------------------------------
@@ -443,6 +489,50 @@ You have access to the following tools.  Call them via JSON tool_calls.
    - Run lake build and check sorry count.
    - Always call after writing or editing.
 
+3b. **check_lean_have(file_path, sorry_line, have_statement)** — INCREMENTAL PROOF STEP CHECK
+   - Test whether a single `have h : T := by tac` statement compiles at a
+     specific sorry location WITHOUT modifying the original file.
+   - Uses `lake env lean` (single-file elaboration, reuses cached .olean deps)
+     so it is faster than a full `run_lean_verify`.
+   - Arguments:
+       file_path      : str — path to the file containing the sorry
+       sorry_line     : int — line number (1-indexed) of the sorry to replace
+       have_statement : str — the `have h : <type> := by <tactic>` to test
+   - Returns: {success, exit_code, errors, info, have_statement}
+   - USE CASE: Before committing a `have` step with edit_file_patch, call
+     check_lean_have to verify the type annotation and tactic are correct.
+     This catches type mismatches in ~10s without dirtying the file.
+   - WORKFLOW:
+       1. Identify the sorry you want to fill.
+       2. Formulate the `have h : T := by tac` step.
+       3. Call check_lean_have — if success=False, read errors and revise.
+       4. Once check_lean_have returns success=True, apply with edit_file_patch.
+       5. Call run_lean_verify to confirm the full file still compiles.
+   - LIMIT: Do not call check_lean_have more than 3 times for the same sorry
+     line before escalating via request_agent2_help.
+
+3c. **get_lean_goal(file_path, sorry_line, timeout=120)** — REAL-TIME GOAL QUERY
+   - Query the Lean LSP server to get the exact tactic state at a sorry
+     location WITHOUT modifying the file.
+   - Returns: {goal, hypotheses, raw, error, elapsed_s}
+     - goal:       "⊢ <type>" — the exact type you must prove
+     - hypotheses: ["h : T", ...] — all local hypotheses in scope
+     - raw:        full rendered tactic state string
+   - USE CASE: When Agent2's guidance mentions a type but you are unsure
+     of the exact form Lean expects, call get_lean_goal FIRST to see the
+     actual "⊢ ..." before writing any `have` step.  This eliminates
+     type-mismatch errors before they happen.
+   - WORKFLOW:
+       1. Call get_lean_goal(file, sorry_line) — read goal + hypotheses.
+       2. Formulate `have h : <goal_type> := by <tactic>` based on real goal.
+       3. Validate with check_lean_have (fast, no file modification).
+       4. Apply with edit_file_patch once check_lean_have returns success=True.
+       5. Call run_lean_verify to confirm the full file is clean.
+   - NOTE: First call elaborates the full file (~30–60 s); subsequent calls
+     reuse cached .olean files and are much faster (~5–10 s).
+   - NOTE: If elaboration times out, the file likely has import errors.
+     Fix those first with run_lean_verify, then retry get_lean_goal.
+
 **RULE**: When starting a new algorithm proof, you MUST call `write_new_file`
 first to create the initial file scaffold, then use `edit_file_patch` for
 subsequent edits.  Calling `run_lean_verify` on a non-existent file will
@@ -470,7 +560,8 @@ output `"tool": "done"` and will tell you the real result.  Do NOT rely on
 your own belief that the build is clean — only `run_lean_verify` is authoritative.
 
 Allowed tools: read_file, read_file_readonly, search_in_file, search_in_file_readonly,
-edit_file_patch, write_new_file, run_lean_verify, request_agent2_help.
+edit_file_patch, write_new_file, get_lean_goal, check_lean_have, run_lean_verify,
+request_agent2_help.
 
 **Convention 4 (Used-in tags):** EVERY ``theorem``, ``lemma``, and
 ``noncomputable def`` you write MUST have a Lean docstring (``/-- ... -/``)

@@ -1,6 +1,7 @@
-This is XeTeX, Version 3.141592653-2.6-0.999997 (TeX Live 2025) (preloaded format=xelatex 2026.1.24)  6 MAR 2026 17:50
+This is XeTeX, Version 3.141592653-2.6-0.999997 (TeX Live 2025) (preloaded format=xelatex 2026.1.24)  11 MAR 2026 20:37
 entering extended mode
  restricted \write18 enabled.
+ file:line:error style messages enabled.
  %&-line parsing enabled.
 **sgd_analysis.tex
 (./sgd_analysis.tex
@@ -1093,9 +1094,12 @@ Package hyperref Info: Link coloring ON on input line 130.
 \@outlinefile=\write4
 \openout4 = `sgd_analysis.out'.
 
+
+
+Package hyperref Warning: Rerun to get /PageLabels entry.
+
 LaTeX Font Info:    Trying to load font information for OT1+lmr on input line 1
 34.
-
 (/usr/local/texlive/2025/texmf-dist/tex/latex/lm/ot1lmr.fd
 File: ot1lmr.fd 2015/05/01 v1.6.1 Font defs for Latin Modern
 )
@@ -1429,10 +1433,10 @@ Package rerunfilecheck Info: File `sgd_analysis.out' has not changed.
 (rerunfilecheck)             Checksum: 50A561B1160EC20DFA8B2CCCC45AC315;6642.
  ) 
 Here is how much of TeX's memory you used:
- 31527 strings out of 473832
- 674982 string characters out of 5729481
- 1315260 words of memory out of 5000000
- 54027 multiletter control sequences out of 15000+600000
+ 31529 strings out of 473832
+ 675028 string characters out of 5729481
+ 1315249 words of memory out of 5000000
+ 54029 multiletter control sequences out of 15000+600000
  679109 words of font info for 160 fonts, out of 8000000 for 9000
  1348 hyphenation exceptions out of 8191
  93i,12n,114p,1009b,1917s stack positions out of 10000i,1000n,20000p,200000b,200000s

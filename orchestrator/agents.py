@@ -41,7 +41,9 @@ class ToolRegistry:
         """Register built-in controlled tools."""
         from orchestrator.tools import (
             apply_doc_patch,
+            check_lean_have,
             edit_file_patch,
+            get_lean_goal,
             overwrite_file,
             read_file,
             read_file_readonly,
@@ -59,6 +61,8 @@ class ToolRegistry:
         self.register("write_new_file", write_new_file)
         self.register("overwrite_file", overwrite_file)
         self.register("edit_file_patch", edit_file_patch)
+        self.register("check_lean_have", check_lean_have)
+        self.register("get_lean_goal", get_lean_goal)
         self.register("run_lean_verify", run_lean_verify)
         self.register("run_repo_verify", run_repo_verify)
         self.register("apply_doc_patch", apply_doc_patch)

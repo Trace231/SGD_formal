@@ -460,6 +460,192 @@ def _extract_lean_error_lines(raw: str) -> list[str]:
     return fallback
 
 
+def check_lean_have(
+    file_path: str | Path,
+    sorry_line: int,
+    have_statement: str,
+) -> dict[str, Any]:
+    """Test a single have-statement at a sorry location WITHOUT modifying the file.
+
+    Replaces the sorry at *sorry_line* (1-indexed) in a temp copy of the file
+    with *have_statement* followed by a continuation sorry, then runs
+    ``lake env lean <tempfile>`` to elaborate only that single file.  All
+    pre-compiled ``.olean`` dependencies are reused, so this is typically
+    faster than a full ``lake build``.
+
+    Returns::
+
+        {
+          "success":        bool,        # True when the have compiled cleanly
+          "exit_code":      int,
+          "errors":         list[str],   # file:line:col: error: ... lines
+          "info":           list[str],   # information: ... lines (e.g. #check)
+          "have_statement": str,         # echo of the input have_statement
+        }
+
+    The original file is never modified.  The temp file is deleted regardless
+    of whether compilation succeeded.
+    """
+    import subprocess
+    import uuid
+
+    # Allow reading from all allowed paths (read-write AND read-only)
+    _all_readable = _READ_WRITE_ALLOWLIST + _READ_ONLY_ALLOWLIST
+    resolved = _resolve_allowed_path(file_path, _all_readable)
+
+    if not resolved.exists():
+        return {
+            "success": False,
+            "exit_code": 1,
+            "errors": [f"Source file does not exist: {file_path}"],
+            "info": [],
+            "have_statement": have_statement,
+        }
+
+    content = resolved.read_text(encoding="utf-8")
+    lines = content.splitlines(keepends=True)
+
+    # Validate sorry_line (1-indexed)
+    target_idx = sorry_line - 1
+    if not (0 <= target_idx < len(lines)):
+        return {
+            "success": False,
+            "exit_code": 1,
+            "errors": [
+                f"sorry_line {sorry_line} out of range "
+                f"(file has {len(lines)} lines)"
+            ],
+            "info": [],
+            "have_statement": have_statement,
+        }
+
+    orig_line = lines[target_idx]
+    if "sorry" not in orig_line:
+        return {
+            "success": False,
+            "exit_code": 1,
+            "errors": [
+                f"No 'sorry' token found on line {sorry_line}: "
+                f"{orig_line.rstrip()!r}"
+            ],
+            "info": [],
+            "have_statement": have_statement,
+        }
+
+    # Preserve indentation of the original sorry line
+    indent_str = orig_line[: len(orig_line) - len(orig_line.lstrip())]
+    replacement = (
+        f"{indent_str}{have_statement.strip()}\n"
+        f"{indent_str}sorry  -- original sorry continued\n"
+    )
+    modified_lines = lines[:target_idx] + [replacement] + lines[target_idx + 1 :]
+    modified_content = "".join(modified_lines)
+
+    # Write to a uniquely-named temp file at the project root so lake env can
+    # find all pre-compiled .olean imports via LEAN_PATH.
+    unique_id = uuid.uuid4().hex[:8]
+    tmp_name = f"_LeanCheck_{unique_id}.lean"
+    tmp_path = PROJECT_ROOT / tmp_name
+    try:
+        tmp_path.write_text(modified_content, encoding="utf-8")
+        proc = subprocess.run(
+            ["lake", "env", "lean", tmp_name],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        raw = proc.stdout + proc.stderr
+        # Replace the temp filename with the original so Agent3 sees meaningful
+        # line references in error messages.
+        orig_rel = str(resolved.relative_to(PROJECT_ROOT))
+        raw_clean = raw.replace(tmp_name, orig_rel)
+
+        error_lines = _extract_lean_error_lines(raw_clean)
+        info_lines = [
+            line.strip()
+            for line in raw_clean.splitlines()
+            if re.search(r"\binformation\b", line, re.IGNORECASE)
+        ]
+        return {
+            "success": proc.returncode == 0,
+            "exit_code": proc.returncode,
+            "errors": error_lines,
+            "info": info_lines,
+            "have_statement": have_statement,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "exit_code": 1,
+            "errors": ["check_lean_have timed out after 120 s"],
+            "info": [],
+            "have_statement": have_statement,
+        }
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def get_lean_goal(
+    file_path: str | Path,
+    sorry_line: int,
+    timeout: int = 120,
+) -> dict[str, Any]:
+    """Query the Lean LSP server for the proof goal at a sorry location.
+
+    Starts ``lake env lean --server``, opens *file_path*, waits for full
+    elaboration, and returns the tactic state (``⊢ goal`` + hypotheses) at
+    *sorry_line*.  The server is shut down after the query.
+
+    Unlike ``check_lean_have``, this tool does **NOT** modify the file —
+    it only reads the current proof state.  Use it to discover exactly what
+    type you need to prove before formulating a ``have`` step.
+
+    Args:
+        file_path:  Path to the ``.lean`` file (relative to project root
+                    or absolute, must be under Algorithms/ or Lib/).
+        sorry_line: 1-indexed line number of the ``sorry`` to inspect.
+        timeout:    Maximum seconds to wait for elaboration (default 120).
+
+    Returns::
+
+        {
+            "goal":       str | None,   # "⊢ <type>" rendered goal
+            "hypotheses": list[str],    # local hypotheses ["name : Type", ...]
+            "raw":        str,          # full tactic state text from LSP
+            "error":      str | None,   # non-None if something went wrong
+            "elapsed_s":  float,        # wall-clock seconds
+        }
+
+    Usage pattern::
+
+        1. Call get_lean_goal(file, line) to see "⊢ <T>" at the sorry.
+        2. Formulate "have h : <T'> := by <tac>" that makes progress.
+        3. Verify with check_lean_have(file, line, have_statement).
+        4. Apply with edit_file_patch when check_lean_have returns success=True.
+    """
+    _all_readable = _READ_WRITE_ALLOWLIST + _READ_ONLY_ALLOWLIST
+    resolved = _resolve_allowed_path(file_path, _all_readable)
+
+    if not resolved.exists():
+        return {
+            "goal": None,
+            "hypotheses": [],
+            "raw": "",
+            "error": f"File does not exist: {file_path}",
+            "elapsed_s": 0.0,
+        }
+
+    from orchestrator.lean_lsp import query_goal_at_sorry
+
+    return query_goal_at_sorry(
+        project_root=PROJECT_ROOT,
+        file_path=resolved,
+        sorry_line=sorry_line,
+        timeout=timeout,
+    )
+
+
 def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     """Run Lean verification and return a JSON-serializable result."""
     resolved = _resolve_allowed_path(file_path, _LEAN_VERIFY_ALLOWLIST)

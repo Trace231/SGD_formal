@@ -519,23 +519,28 @@ def _call_agent2_with_tools(
     results are fed back to Agent2.  Any other reply format (plain text, or
     JSON without ``"type": "lookup"``) is returned immediately as final guidance.
     After *max_tool_rounds* the last reply is returned regardless.
+
+    When Agent2 returns final guidance without having performed any lookups,
+    a WARNING is prepended so Agent3 knows to verify lemma names before use.
     """
     reply = agent2.call(user_msg)
+    _lookup_rounds_performed = 0
 
     for _ in range(max_tool_rounds):
         # Try to parse as JSON lookup request.
         try:
             payload = json.loads(reply)
         except (json.JSONDecodeError, ValueError):
-            return reply  # plain text → final guidance
+            break  # plain text → final guidance, exit loop to apply warning check
 
         if not isinstance(payload, dict) or payload.get("type") != "lookup":
-            return reply  # non-lookup JSON → final guidance
+            break  # non-lookup JSON → final guidance
 
         tool_calls = payload.get("tool_calls", [])
         if not isinstance(tool_calls, list) or not tool_calls:
-            return reply
+            break
 
+        _lookup_rounds_performed += 1
         results: list[dict] = []
         for tc in tool_calls:
             if not isinstance(tc, dict):
@@ -554,7 +559,17 @@ def _call_agent2_with_tools(
             + "\n\nContinue planning or issue more lookups if still needed."
         )
 
-    return reply  # max rounds exhausted → return last reply as-is
+    # Attach a warning when Agent2 produced guidance without any signature lookups.
+    # This surfaces in Agent3's context so it knows to verify names independently.
+    if _lookup_rounds_performed == 0:
+        reply = (
+            "⚠ WARNING: Agent2 produced this guidance without performing any "
+            "signature lookups. All lemma/theorem names are UNVERIFIED. "
+            "Before applying any patch, call search_in_file to confirm each "
+            "lemma exists with the expected signature.\n\n"
+        ) + reply
+
+    return reply
 
 
 # ---------------------------------------------------------------------------
@@ -826,8 +841,9 @@ def phase2_plan_and_approve(
         for _retry in range(3):
             review_raw = agent1.call(review_prompt)
             if not review_raw.strip():
-                logger.warning(
-                    "[Phase 2] Reviewer returned empty response (attempt %d/3)", _retry + 1
+                console.print(
+                    f"[yellow][Phase 2] Reviewer returned empty response "
+                    f"(attempt {_retry + 1}/3)"
                 )
                 continue
             try:
@@ -835,9 +851,9 @@ def phase2_plan_and_approve(
                 break
             except json.JSONDecodeError as exc:
                 if _retry < 2:
-                    logger.warning(
-                        "[Phase 2] Reviewer returned invalid JSON (attempt %d/3): %s",
-                        _retry + 1, exc.msg,
+                    console.print(
+                        f"[yellow][Phase 2] Reviewer returned invalid JSON "
+                        f"(attempt {_retry + 1}/3): {exc.msg}"
                     )
                     continue
                 raise RuntimeError(
@@ -1092,6 +1108,18 @@ def phase3_prove(
             if not _tgt.exists()
             else ""
         )
+        # Fix 3: when checkpoint has already improved, forbid overwriting the target file.
+        _no_overwrite_rule = (
+            f"- FORBIDDEN: write_new_file({target_file}) — the file already exists "
+            f"with {best_checkpoint['sorry_count']} sorry(s), improved from the "
+            f"initial {_initial_sorry_for_ckpt}. Overwriting would discard this "
+            f"progress. Use ONLY edit_file_patch on {target_file}.\n"
+            if (
+                best_checkpoint["content"] is not None
+                and best_checkpoint["sorry_count"] < _initial_sorry_for_ckpt
+            )
+            else ""
+        )
         prover_prompt = (
             _file_absent_prefix
             + "Use tools to close sorry placeholders.\n"
@@ -1102,7 +1130,7 @@ def phase3_prove(
             "To signal no further actions are needed: "
             '{"thought": "...", "tool": "done", "arguments": {}}\n'
             "Allowed tools: read_file, read_file_readonly, search_in_file, search_in_file_readonly, "
-            "edit_file_patch, write_new_file, run_lean_verify, request_agent2_help.\n"
+            "edit_file_patch, write_new_file, check_lean_have, run_lean_verify, request_agent2_help.\n"
             "SITUATIONAL BEHAVIOR:\n"
             "- If guidance contains PATCH blocks (<<<SEARCH>>>/<<<REPLACE>>>): "
             "execute them exactly — copy old_str and new_str verbatim.\n"
@@ -1120,7 +1148,16 @@ def phase3_prove(
             "- BEFORE adding any new 'import X' statement to any file, call "
             "read_file_readonly(\"Main.lean\") or read_file_readonly(\"lakefile.lean\") "
             "to verify that X does not already import the file you are editing "
-            "(which would create a circular dependency).\n\n"
+            "(which would create a circular dependency).\n"
+            # Fix 2: staging cannot reference definitions from the target algorithm file.
+            f"- CRITICAL: {_staging_rel} does NOT import {target_file}. Any lemma you "
+            f"add to {_staging_rel} CANNOT reference definitions that are first defined "
+            f"in {target_file} (e.g., `outerProcess`, or any `def`/`theorem` introduced "
+            f"there). Such references always fail with 'Invalid field' or 'unknown "
+            f"identifier'. If a helper needs those definitions, place it INSIDE "
+            f"{target_file} directly.\n"
+            + _no_overwrite_rule
+            + "\n"
             f"Target file: {target_file}\n"
             + (_imported_sigs_block.lstrip("\n") + "\n" if _imported_sigs_block else "")
             + f"Guidance:\n{guidance}"
