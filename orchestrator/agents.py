@@ -356,10 +356,13 @@ def auto_repair_loop(
 
         if exit_code == 0 and sorry_count > 0:
             console.print(
-                f"[green][Agent5] Build clean with {sorry_count} sorry(s) remaining — "
-                "returning to Phase 3."
+                f"[yellow][Agent5] Build clean but {sorry_count} sorry(s) remain — "
+                "not a success under strict criterion."
             )
-            return "fixed"
+            current_errors = (
+                f"STRICT_SUCCESS_NOT_MET: build succeeded but sorry_count={sorry_count} > 0"
+            )
+            continue
 
         # Update errors for the next diagnosis round
         current_errors = result.get("errors", current_errors)

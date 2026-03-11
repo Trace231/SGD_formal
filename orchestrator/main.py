@@ -689,11 +689,14 @@ def _prequery_sorry_goals(
     goal_cache: dict,
     staging_has_errors: bool,
 ) -> str:
-    """Query Lean LSP for proof goals at sorry lines mentioned in Agent2 guidance.
+    """Query Lean LSP for proof goals at all sorry locations in the target file.
 
-    Extracts sorry line numbers from the guidance text, calls get_lean_goal for
-    each (with caching), and returns a formatted block to prepend to the
-    Agent3 prover_prompt.  Any line that cannot be resolved is silently skipped.
+    Primary source: directly scan the target file for lines containing `sorry`
+    (excluding commented-out lines).  This guarantees goal injection regardless
+    of whether Agent2 mentioned specific line numbers in its guidance.
+
+    Secondary source: extract line numbers from the guidance text and merge
+    them (deduped) with the file-scan results.
 
     Degradation conditions (any one triggers a skip for that line):
     - staging_has_errors is True (staging file broken → elaboration will fail)
@@ -706,27 +709,42 @@ def _prequery_sorry_goals(
     if staging_has_errors:
         return ""
 
-    # Extract line numbers from guidance.  Accept multiple patterns:
+    tgt_path = PROJECT_ROOT / target_file
+    if not tgt_path.exists():
+        return ""
+
+    current_hash = _file_hash(target_file)
+
+    # Primary source: scan the file directly for sorry lines.
+    # Skip lines that are pure comments (start with --).
+    try:
+        file_lines = tgt_path.read_text(encoding="utf-8").splitlines()
+        file_sorry_lines = [
+            i + 1
+            for i, ln in enumerate(file_lines)
+            if re.search(r"\bsorry\b", ln) and not ln.strip().startswith("--")
+        ]
+    except OSError:
+        file_sorry_lines = []
+
+    # Secondary source: extract line numbers from guidance text.
     # "line 305", "Line 305:", "sorry at 305", "line numbers: 305, 307"
     raw_lines = re.findall(
         r"(?:line|sorry\s+at|sorry(?:\s+on)?)\s+(\d+)",
         guidance,
         re.IGNORECASE,
     )
-    # Also pick up bare numbers preceded by context like "fill sorry #305"
     raw_lines += re.findall(r"\bsorry\b.*?(\d{2,4})\b", guidance, re.IGNORECASE)
-    sorry_lines = list(dict.fromkeys(int(x) for x in raw_lines if 1 <= int(x) <= 9999))
+    guidance_sorry_lines = [int(x) for x in raw_lines if 1 <= int(x) <= 9999]
+
+    # Merge: file-scan first (deterministic ordering), guidance as supplement.
+    sorry_lines = list(dict.fromkeys(file_sorry_lines + guidance_sorry_lines))
 
     if not sorry_lines:
         return ""
 
-    current_hash = _file_hash(target_file)
-    tgt_path = PROJECT_ROOT / target_file
-    if not tgt_path.exists():
-        return ""
-
     results: list[str] = []
-    for line in sorry_lines[:4]:  # cap at 4 lines to limit total LSP time
+    for line in sorry_lines[:6]:  # cap at 6 lines to limit total LSP time
         cache_key = (target_file, line, current_hash or "")
         if cache_key in goal_cache:
             cached = goal_cache[cache_key]
@@ -2722,17 +2740,28 @@ def phase3_prove(
     )
 
     if action == "fixed":
-        console.print("[green bold][Agent5] Auto-repair fixed the build — Phase 3 complete.")
-        return True, attempts, "", {
-            "execution_history": [r.__dict__ for r in execution_history],
-            "attempt_failures": attempt_failures,
-            "estimated_token_consumption": max(1, token_char_budget // 4),
-            "retry_count": sum(
-                1
-                for r in execution_history
-                if r.status_code in {"ERROR", "BLOCKED"}
-            ),
-        }
+        _strict_verify = registry.call("run_lean_verify", target_file)
+        _strict_exit = int(_strict_verify.get("exit_code", 1))
+        _strict_sorry = int(_strict_verify.get("sorry_count", -1))
+        if _strict_exit == 0 and _strict_sorry == 0:
+            console.print("[green bold][Agent5] Auto-repair fixed the build — Phase 3 complete.")
+            return True, attempts, "", {
+                "execution_history": [r.__dict__ for r in execution_history],
+                "attempt_failures": attempt_failures,
+                "estimated_token_consumption": max(1, token_char_budget // 4),
+                "retry_count": sum(
+                    1
+                    for r in execution_history
+                    if r.status_code in {"ERROR", "BLOCKED"}
+                ),
+            }
+        last_errors = str(_strict_verify.get("errors", last_errors))
+        console.print(
+            "[yellow][Strict Success Gate] Blocked success: "
+            f"exit={_strict_exit}, sorry={_strict_sorry}. "
+            "Continuing as non-success."
+        )
+        action = "replan"
     elif action == "abort":
         console.print("[red]Aborted by user.")
         sys.exit(1)
