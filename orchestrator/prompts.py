@@ -832,6 +832,64 @@ For COMPILATION_ERROR: cite the exact line, symbol, and correct usage.
 ## Output format
 Use the three sections above.  Be precise — cite line numbers and exact
 Lean identifiers.
+
+## Structured JSON (REQUIRED at the end of every response)
+
+After your diagnosis sections, append a fenced JSON block.
+
+When classification is **ASSUMPTIONS_WRONG** and you can enumerate the
+missing hypotheses exactly:
+
+```json
+{
+  "classification": "ASSUMPTIONS_WRONG",
+  "auto_repairable": true,
+  "assumptions_to_add": [
+    {
+      "theorem": "<theorem_name_in_file>",
+      "hyp_name": "h_int_oracle_sq",
+      "hyp_type": "∀ w_tilde w : E, Integrable (fun s => ‖setup.oracle w_tilde w s‖ ^ 2) ν",
+      "insert_after": "<existing_hyp_name_or_null>"
+    }
+  ]
+}
+```
+
+When the errors are in a `Lib/Glue/Staging/` file and match a mechanical
+pattern (over-specified simp set, or `exact h` needing `funext`):
+
+```json
+{
+  "classification": "STAGING_FIX",
+  "auto_repairable": true,
+  "staging_errors": [
+    {
+      "line": 36,
+      "pattern": "over_specified_simp",
+      "description": "Remove SVRGSetup.svrgProcess from simp set"
+    }
+  ]
+}
+```
+
+For all other classifications output:
+
+```json
+{
+  "classification": "COMPILATION_ERROR",
+  "auto_repairable": false
+}
+```
+
+Rules for `assumptions_to_add`:
+- `theorem`: the exact Lean declaration name where the assumption must be added.
+- `hyp_name`: follow the `h_int_xxx` / `h_meas_xxx` naming convention.
+- `hyp_type`: valid Lean 4 type expression (use the exact variable names from
+  the theorem signature — do NOT invent new variable names).
+- `insert_after`: name of an existing hypothesis to insert after, or null to
+  insert before `:=` / `by`.
+- List only genuinely new hypotheses — do NOT repeat assumptions that already
+  appear in the signature.
 """
 
 

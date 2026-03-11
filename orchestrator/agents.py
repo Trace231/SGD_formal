@@ -196,8 +196,41 @@ class Agent:
 
 
 # ---------------------------------------------------------------------------
-# Pattern 3: Escalation (Agent5 → Human → Agent2)
+# Pattern 3: Escalation (Agent5 → Auto-Repair → Human fallback)
 # ---------------------------------------------------------------------------
+
+_DIAG_PROMPT_TEMPLATE = (
+    "Diagnose why these sorry's cannot be closed.\n\n"
+    "## Remaining sorry context\n{sorry_context}\n\n"
+    "## Build errors\n```\n{build_errors}\n```\n\n"
+    "## Planner guidance that was used\n{plan_text}"
+)
+
+
+def diagnose(
+    agent5: Agent,
+    sorry_context: str,
+    build_errors: str,
+    plan_text: str,
+) -> tuple[str, dict]:
+    """Call Agent5 and return (raw_text, structured_dict).
+
+    The structured dict is parsed from the JSON block that Agent5 appends
+    to every response (see diagnostician system prompt).  Falls back to
+    ``{"auto_repairable": False}`` when no valid JSON block is present.
+    """
+    from orchestrator.assumption_repair import parse_diagnosis_json
+
+    raw = agent5.call(
+        _DIAG_PROMPT_TEMPLATE.format(
+            sorry_context=sorry_context,
+            build_errors=build_errors[:3000],
+            plan_text=plan_text[:2000],
+        )
+    )
+    structured = parse_diagnosis_json(raw)
+    return raw, structured
+
 
 def escalate(
     agent5: Agent,
@@ -209,14 +242,8 @@ def escalate(
 
     Returns one of: ``"replan"``, ``"fix_assumptions"``, ``"abort"``.
     """
-    diagnosis = agent5.call(
-        f"Diagnose why these sorry's cannot be closed.\n\n"
-        f"## Remaining sorry context\n{sorry_context}\n\n"
-        f"## Build errors\n```\n{build_errors[:3000]}\n```\n\n"
-        f"## Planner guidance that was used\n{plan_text[:2000]}"
-    )
-
-    console.print(Panel(diagnosis, title="[red bold]Agent5 — Diagnosis"))
+    raw, _ = diagnose(agent5, sorry_context, build_errors, plan_text)
+    console.print(Panel(raw, title="[red bold]Agent5 — Diagnosis"))
     console.print()
 
     while True:
@@ -231,3 +258,111 @@ def escalate(
         if action in ("a", "abort"):
             return "abort"
         console.print("[red]Invalid choice.  Enter r, f, or a.")
+
+
+def auto_repair_loop(
+    agent5: Agent,
+    target_file: str,
+    staging_file: str | None,
+    build_errors: str,
+    plan_text: str,
+    sorry_context: str,
+    *,
+    max_repair_rounds: int = 3,
+) -> str:
+    """Attempt automatic repair before asking the human.
+
+    Rounds:
+      1. Agent5 produces a structured diagnosis.
+      2. If ``auto_repairable`` and classification is ASSUMPTIONS_WRONG →
+         patch the target file signatures and re-verify.
+      3. If classification is STAGING_FIX → apply rule-based staging fixes
+         and re-verify.
+      4. If verification passes → return ``"fixed"``.
+      5. Otherwise loop with updated errors up to *max_repair_rounds* times.
+      6. If still failing → fall back to the human ``escalate()`` prompt.
+
+    Returns one of: ``"fixed"``, ``"replan"``, ``"fix_assumptions"``,
+    ``"abort"``.
+    """
+    from pathlib import Path
+    from orchestrator.assumption_repair import (
+        apply_assumption_patches,
+        apply_staging_rules,
+    )
+    from orchestrator.tools import run_lean_verify
+    from orchestrator.config import PROJECT_ROOT
+
+    _staging_path = Path(staging_file) if staging_file else None
+    _target_path = (
+        Path(target_file) if Path(target_file).is_absolute()
+        else PROJECT_ROOT / target_file
+    )
+
+    current_errors = build_errors
+
+    for repair_round in range(1, max_repair_rounds + 1):
+        console.print(
+            f"[cyan][Agent5] Auto-repair round {repair_round}/{max_repair_rounds}…"
+        )
+
+        raw, structured = diagnose(agent5, sorry_context, current_errors, plan_text)
+        console.print(Panel(raw, title=f"[yellow]Agent5 — Diagnosis (round {repair_round})"))
+
+        if not structured.get("auto_repairable", False):
+            console.print("[yellow][Agent5] Not auto-repairable — falling back to human.")
+            break
+
+        classification = structured.get("classification", "")
+        patched = 0
+
+        if classification == "ASSUMPTIONS_WRONG":
+            assumptions = structured.get("assumptions_to_add", [])
+            if assumptions:
+                patched = apply_assumption_patches(target_file, assumptions)
+                console.print(
+                    f"[green][Agent5] Patched {patched} assumption(s) into {target_file}"
+                )
+
+        elif classification == "STAGING_FIX" and _staging_path:
+            patched = apply_staging_rules(_staging_path, current_errors)
+            console.print(
+                f"[green][Agent5] Applied {patched} staging fix(es) to {_staging_path.name}"
+            )
+
+        else:
+            console.print(
+                f"[yellow][Agent5] Classification '{classification}' — "
+                "no auto-repair action available."
+            )
+            break
+
+        if patched == 0:
+            console.print("[yellow][Agent5] No patches applied — stopping auto-repair.")
+            break
+
+        # Re-verify after patching
+        result = run_lean_verify(target_file)
+        exit_code = int(result.get("exit_code", 1))
+        sorry_count = int(result.get("sorry_count", -1))
+
+        console.print(
+            f"[cyan][Agent5] Post-repair verify: exit={exit_code}, sorry={sorry_count}"
+        )
+
+        if exit_code == 0 and sorry_count == 0:
+            console.print("[green bold][Agent5] Auto-repair succeeded — build clean!")
+            return "fixed"
+
+        if exit_code == 0 and sorry_count > 0:
+            console.print(
+                f"[green][Agent5] Build clean with {sorry_count} sorry(s) remaining — "
+                "returning to Phase 3."
+            )
+            return "fixed"
+
+        # Update errors for the next diagnosis round
+        current_errors = result.get("errors", current_errors)
+
+    # Auto-repair exhausted or not applicable — ask the human
+    return escalate(agent5, sorry_context, current_errors, plan_text)

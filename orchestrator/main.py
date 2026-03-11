@@ -32,8 +32,10 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from orchestrator.agents import (
     Agent,
     ToolRegistry,
+    auto_repair_loop,
     escalate,
 )
+from orchestrator.assumption_repair import apply_staging_rules
 from orchestrator.config import (
     DOC_ANCHORS,
     LIB_GLUE_ANCHORS,
@@ -2344,6 +2346,15 @@ def phase3_prove(
                         f"  [Agent3] attempt {attempt}/{max_retries} — "
                         "[cyan]DEPENDENCY_COMPILE_ERROR — routing to dep-fix (staging fix)"
                     )
+                    # Try deterministic rule-based staging fix first (no LLM call).
+                    _staging_rule_fixes = apply_staging_rules(_staging_path, last_verify_text)
+                    if _staging_rule_fixes > 0:
+                        console.print(
+                            f"  [Auto-fix] Applied {_staging_rule_fixes} rule-based "
+                            f"fix(es) to {_staging_path.name} — skipping Agent2 call."
+                        )
+                        _inner_break_reason = "dep_compile_error"
+                        break
                     execution_history.extend(exec_results)
                     guidance = _call_agent2_with_tools(
                         agent2,
@@ -2477,6 +2488,14 @@ def phase3_prove(
                 f"  [Agent3] attempt {attempt}/{max_retries} — "
                 "[cyan]DEPENDENCY_COMPILE_ERROR (post-attempt) — routing to dep-fix"
             )
+            # Try deterministic rule-based staging fix first (no LLM call).
+            _staging_rule_fixes_post = apply_staging_rules(_staging_path, last_verify_text)
+            if _staging_rule_fixes_post > 0:
+                console.print(
+                    f"  [Auto-fix] Applied {_staging_rule_fixes_post} rule-based "
+                    f"fix(es) to {_staging_path.name} — retrying without Agent2 call."
+                )
+                continue
             _dep_staging_ctx = (
                 _staging_path.read_text(encoding="utf-8")
                 if _staging_path.exists() else "(staging file is empty)"
@@ -2690,9 +2709,31 @@ def phase3_prove(
         if _tgt.exists()
         else f"(File '{target_file}' does not exist — Prover Agent never created it.)"
     )
-    action = escalate(agent5, sorry_context, last_errors, guidance)
+    _staging_file_for_repair = (
+        str(_staging_path) if _staging_path.exists() else None
+    )
+    action = auto_repair_loop(
+        agent5,
+        target_file,
+        _staging_file_for_repair,
+        last_errors,
+        guidance,
+        sorry_context,
+    )
 
-    if action == "abort":
+    if action == "fixed":
+        console.print("[green bold][Agent5] Auto-repair fixed the build — Phase 3 complete.")
+        return True, attempts, "", {
+            "execution_history": [r.__dict__ for r in execution_history],
+            "attempt_failures": attempt_failures,
+            "estimated_token_consumption": max(1, token_char_budget // 4),
+            "retry_count": sum(
+                1
+                for r in execution_history
+                if r.status_code in {"ERROR", "BLOCKED"}
+            ),
+        }
+    elif action == "abort":
         console.print("[red]Aborted by user.")
         sys.exit(1)
     elif action == "fix_assumptions":

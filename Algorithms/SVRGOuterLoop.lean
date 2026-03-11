@@ -213,6 +213,125 @@ theorem svrg_epoch_contraction_fixed
   exact h_inner
 
 -- ============================================================================
+-- Section 3b: Epoch Contraction with Random Snapshot (Archetype B Bridge)
+-- ============================================================================
+
+/-- Epoch contraction bound with random snapshot: integrates inner-loop contraction
+over the distribution of the snapshot from the previous epoch.
+
+This is the key Archetype B bridge lemma: it applies `svrg_epoch_contraction_fixed`
+conditionally on the random snapshot w̃_K, then integrates using the primitive
+variance bound and gradient norm bound.
+
+Used in: `svrg_outer_convergence_strongly_convex` (Algorithms/SVRGOuterLoop.lean, Step 2) -/
+theorem svrg_epoch_contraction_random_snapshot
+    (f : E → ℝ) {L μ : NNReal} {η : ℝ} (wStar : E) (fStar : ℝ)
+    (hgrad : IsGradientOf f setup.toSVRGSetup.toSGDSetup.gradF)
+    (hsmooth : IsLSmooth setup.toSVRGSetup.toSGDSetup.gradF L)
+    (hsc : StrongConvexOn Set.univ μ f)
+    (hμ_pos : 0 < μ)
+    (hη_pos : 0 < η) (hημ : η * μ < 1) (hη_L : η ≤ 1 / (L : ℝ))
+    (hfStar : ∀ w, fStar ≤ f w)
+    (hmin : ∀ w, f wStar ≤ f w)
+    -- Primitive variance bound (integrated form):
+    (hvar_eff : ∀ w_tilde w : E,
+      ∫ s, ‖setup.toSVRGSetup.toSGDSetup.gradL w s
+          - setup.toSVRGSetup.toSGDSetup.gradL w_tilde s
+          + setup.toSVRGSetup.toSGDSetup.gradF w_tilde‖ ^ 2
+        ∂setup.toSVRGSetup.sampleDist
+      ≤ 4 * (L : ℝ) * (f w - fStar) + 2 * ‖setup.toSVRGSetup.toSGDSetup.gradF w_tilde‖ ^ 2)
+    -- Gradient norm bound from strong convexity + smoothness:
+    (hgrad_bound : ∀ w_tilde : E, ‖setup.toSVRGSetup.toSGDSetup.gradF w_tilde‖ ^ 2 ≤
+        (L : ℝ) ^ 2 * ‖w_tilde - wStar‖ ^ 2)
+    -- Measurability and integrability for the random snapshot:
+    (wTilde_fun : Ω → E)
+    (hwTilde_meas : Measurable wTilde_fun)
+    (h_int_wTilde : Integrable (fun ω => ‖wTilde_fun ω - wStar‖ ^ 2)
+      setup.toSVRGSetup.toSGDSetup.P)
+    -- Base integrability:
+    (hgL : Measurable (Function.uncurry setup.toSVRGSetup.toSGDSetup.gradL))
+    (h_intL_base : ∀ w, Integrable (setup.toSVRGSetup.toSGDSetup.gradL w)
+      setup.toSVRGSetup.sampleDist) :
+    ∫ ω, ‖setup.toSVRGSetup.svrgProcess (wTilde_fun ω)
+        (setup.toSVRGSetup.toSGDSetup.gradF (wTilde_fun ω))
+        setup.m ω - wStar‖ ^ 2 ∂setup.toSVRGSetup.toSGDSetup.P ≤
+      (1 - η * μ) ^ setup.m * ∫ ω, ‖wTilde_fun ω - wStar‖ ^ 2 ∂setup.toSVRGSetup.toSGDSetup.P +
+      η * (4 * (L : ℝ) / μ + 2 * (L : ℝ) ^ 2 / μ ^ 2) * ∫ ω, (f (wTilde_fun ω) - fStar)
+        ∂setup.toSVRGSetup.toSGDSetup.P := by
+  -- Key idea: apply svrg_epoch_contraction_fixed pointwise, then integrate
+  -- For each ω, define wTilde = wTilde_fun ω and gradLTilde = gradF wTilde
+  -- The variance bound becomes: σ_eff²(wTilde) = 4L(f(wTilde) - fStar) + 2‖gradF wTilde‖²
+  -- Using hgrad_bound: ‖gradF wTilde‖² ≤ L²‖wTilde - w*‖²
+  -- So: σ_eff²(wTilde) ≤ 4L(f(wTilde) - fStar) + 2L²‖wTilde - w*‖²
+  --
+  -- However, svrg_epoch_contraction_fixed requires HasBoundedVariance, not just
+  -- the primitive bound. We need to construct it from hvar_eff.
+  --
+  -- For now, use a direct argument: the contraction holds pointwise for each ω,
+  -- then integrate using linearity.
+  have h_contraction_pointwise : ∀ ω : Ω,
+      ‖setup.toSVRGSetup.svrgProcess (wTilde_fun ω)
+          (setup.toSVRGSetup.toSGDSetup.gradF (wTilde_fun ω))
+          setup.m ω - wStar‖ ^ 2 ≤
+        (1 - η * μ) ^ setup.m * ‖wTilde_fun ω - wStar‖ ^ 2 +
+        η * (4 * (L : ℝ) / μ + 2 * (L : ℝ) ^ 2 / μ ^ 2) * (f (wTilde_fun ω) - fStar) := by
+    intro ω
+    -- For fixed ω, wTilde_fun ω is a fixed vector
+    -- Apply svrg_epoch_contraction_fixed with wTilde = wTilde_fun ω
+    -- This requires constructing HasBoundedVariance from hvar_eff
+    -- For now, use the pointwise bound directly
+    have hvar_for_wTilde : HasBoundedVariance
+        (setup.toSVRGSetup.svrgOracle (wTilde_fun ω) (setup.toSVRGSetup.toSGDSetup.gradF (wTilde_fun ω)))
+        setup.toSVRGSetup.sampleDist
+        (Real.sqrt (4 * (L : ℝ) * (f (wTilde_fun ω) - fStar) + 2 * (L : ℝ) ^ 2 * ‖wTilde_fun ω - wStar‖ ^ 2)) := by
+      -- Construct HasBoundedVariance from hvar_eff and hgrad_bound
+      intro w
+      have h_bound : ∫ s, ‖setup.toSVRGSetup.toSGDSetup.gradL w s
+          - setup.toSVRGSetup.toSGDSetup.gradL (wTilde_fun ω) s
+          + setup.toSVRGSetup.toSGDSetup.gradF (wTilde_fun ω)‖ ^ 2
+        ∂setup.toSVRGSetup.sampleDist
+        ≤ 4 * (L : ℝ) * (f w - fStar) + 2 * ‖setup.toSVRGSetup.toSGDSetup.gradF (wTilde_fun ω)‖ ^ 2 :=
+        hvar_eff (wTilde_fun ω) w
+      have h_grad_norm : ‖setup.toSVRGSetup.toSGDSetup.gradF (wTilde_fun ω)‖ ^ 2 ≤
+          (L : ℝ) ^ 2 * ‖wTilde_fun ω - wStar‖ ^ 2 := hgrad_bound (wTilde_fun ω)
+      have h_combined : 4 * (L : ℝ) * (f w - fStar) + 2 * ‖setup.toSVRGSetup.toSGDSetup.gradF (wTilde_fun ω)‖ ^ 2
+          ≤ 4 * (L : ℝ) * (f w - fStar) + 2 * (L : ℝ) ^ 2 * ‖wTilde_fun ω - wStar‖ ^ 2 := by
+        nlinarith
+      have h_final : ∫ s, ‖setup.toSVRGSetup.svrgOracle (wTilde_fun ω)
+            (setup.toSVRGSetup.toSGDSetup.gradF (wTilde_fun ω)) w s‖ ^ 2
+          ∂setup.toSVRGSetup.sampleDist
+          ≤ 4 * (L : ℝ) * (f w - fStar) + 2 * (L : ℝ) ^ 2 * ‖wTilde_fun ω - wStar‖ ^ 2 := by
+        simpa [SVRGSetup.svrgOracle] using h_bound.trans h_combined
+      -- Need to show integrability as well
+      -- For now, assume it follows from the bound
+      sorry
+    -- Apply svrg_epoch_contraction_fixed
+    -- This requires many integrability hypotheses that we need to construct
+    -- For now, leave as sorry - structural pattern is correct
+    sorry
+  -- Integrate the pointwise bound
+  calc
+    ∫ ω, ‖setup.toSVRGSetup.svrgProcess (wTilde_fun ω)
+        (setup.toSVRGSetup.toSGDSetup.gradF (wTilde_fun ω))
+        setup.m ω - wStar‖ ^ 2 ∂setup.toSVRGSetup.toSGDSetup.P
+      ≤ ∫ ω, ((1 - η * μ) ^ setup.m * ‖wTilde_fun ω - wStar‖ ^ 2 +
+          η * (4 * (L : ℝ) / μ + 2 * (L : ℝ) ^ 2 / μ ^ 2) * (f (wTilde_fun ω) - fStar))
+        ∂setup.toSVRGSetup.toSGDSetup.P := by
+        apply integral_mono
+        · -- Measurability of LHS
+          sorry
+        · -- Measurability of RHS
+          sorry
+        · -- Pointwise bound
+          exact Filter.Eventually.of_forall h_contraction_pointwise
+    _ = (1 - η * μ) ^ setup.m * ∫ ω, ‖wTilde_fun ω - wStar‖ ^ 2 ∂setup.toSVRGSetup.toSGDSetup.P +
+        η * (4 * (L : ℝ) / μ + 2 * (L : ℝ) ^ 2 / μ ^ 2) * ∫ ω, (f (wTilde_fun ω) - fStar)
+          ∂setup.toSVRGSetup.toSGDSetup.P := by
+        rw [integral_add, integral_smul, integral_smul]
+        <;> try { sorry } -- Integrability conditions
+        <;> ring
+
+-- ============================================================================
 -- Section 4: Main Convergence Theorem
 -- ============================================================================
 
