@@ -61,7 +61,15 @@ from orchestrator.file_io import (
     load_file,
     snapshot_file,
 )
-from orchestrator.tools import _path_to_lean_module, write_staging_lemma
+from orchestrator.tools import (
+    _path_to_lean_module,
+    commit_staging_to_workspace,
+    configure_staging_barrier,
+    discard_staging_changes,
+    get_staging_barrier_status,
+    list_staging_changes,
+    write_staging_lemma,
+)
 from orchestrator.metrics import (
     MetricsStore,
     capture_physical_metrics,
@@ -79,7 +87,6 @@ from orchestrator.verify import (
     check_glue_tricks_gate,
     check_leverage_gate,
     check_used_in_tags,
-    lake_build,
 )
 from orchestrator.providers import call_llm
 
@@ -461,12 +468,18 @@ def _extract_staging_sigs(staging_path: "Path") -> str:
     Reuses the same parsing logic as _extract_imported_algo_sigs: collect declaration
     lines until proof body, strip at `:=`. Generic — works for any staging file.
     """
-    if not staging_path.exists():
-        return ""
     try:
-        algo_lines = staging_path.read_text(encoding="utf-8").splitlines()
+        rel = (
+            str(staging_path.relative_to(PROJECT_ROOT))
+            if staging_path.is_absolute()
+            else str(staging_path)
+        )
+        content = snapshot_file(rel)
     except Exception:  # noqa: BLE001
         return ""
+    if not content:
+        return ""
+    algo_lines = content.splitlines()
     sigs: list[str] = []
     i = 0
     while i < len(algo_lines):
@@ -1423,10 +1436,11 @@ def _extract_catalog_lemma_names(content: str) -> list[str]:
 
 def _file_hash(path: str | Path) -> str | None:
     """Return MD5 hex-digest of *path*, or None if the file does not exist."""
-    p = Path(path)
-    if not p.is_absolute():
-        p = PROJECT_ROOT / p
-    return hashlib.md5(p.read_bytes()).hexdigest() if p.exists() else None
+    try:
+        content = load_file(path)
+    except FileNotFoundError:
+        return None
+    return hashlib.md5(content.encode("utf-8")).hexdigest()
 
 
 def _git_diff_files() -> set[str]:
@@ -2420,14 +2434,22 @@ def _audit_staging_usage(
     Scans the final algorithm file for each declaration name found in the
     staging file and reports whether it is referenced at least once.
     """
-    if not staging_path.exists():
+    staging_content = ""
+    if staging_path.exists():
+        staging_content = staging_path.read_text(encoding="utf-8")
+    else:
+        try:
+            _rel = str(staging_path.relative_to(PROJECT_ROOT))
+            staging_content = snapshot_file(_rel)
+        except Exception:  # noqa: BLE001
+            staging_content = ""
+    if not staging_content:
         return {}
     try:
         target_content = load_file(target_file)
     except Exception:  # noqa: BLE001
         target_content = ""
 
-    staging_content = staging_path.read_text(encoding="utf-8")
     decl_names = re.findall(r"(?:theorem|lemma|def)\s+(\w+)", staging_content)
 
     usage: dict[str, bool] = {}
@@ -2491,8 +2513,15 @@ def phase3_prove(
     # Pre-check: if the target file already has 0 sorry and builds clean,
     # skip the entire Agent3 loop.  This prevents destructive rewrites when
     # a previous run already completed the proof (e.g., after a Gate 4 crash).
-    _tgt_precheck = Path(target_file) if Path(target_file).is_absolute() else PROJECT_ROOT / target_file
-    if _tgt_precheck.exists():
+    def _target_exists_overlay() -> bool:
+        """True when target exists in workspace or staging overlay."""
+        try:
+            load_file(target_file)
+            return True
+        except FileNotFoundError:
+            return False
+
+    if _target_exists_overlay():
         pre_result = registry.call("run_lean_verify", target_file)
         if int(pre_result.get("exit_code", 1)) == 0 and int(pre_result.get("sorry_count", 0)) == 0:
             console.print(
@@ -2506,6 +2535,10 @@ def phase3_prove(
                 "agent7_step_execution_log": [],
                 "agent7_plan_revisions": [],
                 "agent7_blocked_actions": [],
+                "agent7_forced_trigger_count": 0,
+                "agent7_force_gate_entries": [],
+                "agent7_force_gate_rejections": [],
+                "agent7_force_gate_reason_samples": [],
                 "estimated_token_consumption": 0,
                 "retry_count": 0,
             }
@@ -2525,24 +2558,49 @@ def phase3_prove(
     # never needs to touch the shared Lib/Glue/*.lean infrastructure.
     _algo_name = Path(target_file).stem  # e.g. "SVRGOuterLoop"
     _staging_path = PROJECT_ROOT / "Lib" / "Glue" / "Staging" / f"{_algo_name}.lean"
-    _staging_path.parent.mkdir(parents=True, exist_ok=True)
     _staging_rel = str(_staging_path.relative_to(PROJECT_ROOT))
 
-    if not _staging_path.exists():
-        _staging_path.write_text(
+    def _staging_exists_overlay() -> bool:
+        try:
+            load_file(_staging_rel)
+            return True
+        except FileNotFoundError:
+            return False
+
+    def _staging_read_overlay(default: str = "(staging file is empty)") -> str:
+        try:
+            return load_file(_staging_rel)
+        except FileNotFoundError:
+            return default
+
+    def _staging_physical_path() -> Path:
+        """Return concrete file path used by low-level patch helpers."""
+        _status = get_staging_barrier_status()
+        _root = _status.get("staging_root")
+        if isinstance(_root, str) and _root:
+            _candidate = (Path(_root) / _staging_rel).resolve()
+            if _candidate.exists():
+                return _candidate
+        return _staging_path
+
+    if not snapshot_file(_staging_rel):
+        registry.call(
+            "write_new_file",
+            path=_staging_rel,
+            content=(
             f"-- Staging lemmas for {_algo_name} formalization.\n"
             "-- Add new helper lemmas here. Do NOT modify existing Lib/Glue files.\n"
             "import Lib.Glue.Probability\n"
             "import Lib.Glue.Algebra\n"
             "import Lib.Glue.Measurable\n"
-            "import Lib.Glue.Calculus\n",
-            encoding="utf-8",
+            "import Lib.Glue.Calculus\n"
+            ),
         )
         console.print(f"  [Staging] Created {_staging_rel}")
 
     # Inject staging import into algorithm file if not already present.
-    if _tgt.exists():
-        _tgt_content = _tgt.read_text(encoding="utf-8")
+    if snapshot_file(target_file):
+        _tgt_content = load_file(target_file)
         _staging_import = f"import Lib.Glue.Staging.{_algo_name}"
         if _staging_import not in _tgt_content:
             _lines = _tgt_content.splitlines()
@@ -2550,7 +2608,7 @@ def phase3_prove(
                 (i for i, l in enumerate(_lines) if l.startswith("import")), default=-1
             )
             _lines.insert(last_import_idx + 1, _staging_import)
-            _tgt.write_text("\n".join(_lines) + "\n", encoding="utf-8")
+            registry.call("overwrite_file", path=target_file, content="\n".join(_lines) + "\n")
             console.print(f"  [Staging] Injected import into {target_file}")
 
     # --- Glue pollution guard (Fix B2) ---
@@ -2571,7 +2629,7 @@ def phase3_prove(
         for p in _layer0_dir.glob("*.lean")
     }
 
-    initial_exists: bool = _tgt.exists()
+    initial_exists: bool = _target_exists_overlay()
     _file_absent_suffix = (
         "\n\nCRITICAL: The target file does NOT exist yet. Your guidance MUST instruct "
         f'Agent3 to call write_new_file(path="{target_file}", content=<full Lean scaffold>) '
@@ -2616,6 +2674,10 @@ def phase3_prove(
     agent7_step_execution_log: list[dict] = []
     agent7_plan_revisions: list[dict] = []
     agent7_blocked_actions: list[dict] = []
+    agent7_forced_trigger_count = 0
+    agent7_force_gate_entries: list[dict] = []
+    agent7_force_gate_rejections: list[dict] = []
+    agent7_force_gate_reason_samples: list[str] = []
     token_char_budget = 0
 
     # Circuit breaker: track consecutive repeat error signatures.
@@ -2653,23 +2715,28 @@ def phase3_prove(
     # nuking all work.  Only verified (compilable) states are checkpointed.
     _initial_sorry_for_ckpt = int(
         registry.call("run_lean_verify", target_file).get("sorry_count", 999)
-        if _tgt.exists() else 999
+        if _target_exists_overlay() else 999
     )
     best_checkpoint: dict = {
         "sorry_count": _initial_sorry_for_ckpt,
-        "content": load_file(target_file) if _tgt.exists() else None,
-        "staging_content": _staging_path.read_text(encoding="utf-8") if _staging_path.exists() else None,
+        "content": load_file(target_file) if _target_exists_overlay() else None,
+        "staging_content": _staging_read_overlay(default="") or None,
     }
 
     for attempt in range(1, max_retries + 1):
         attempts = attempt
         attempt_start_hash: str | None = _file_hash(target_file)
+        # Keep previous verify context available before prequery (attempt>1 path).
+        # These are re-initialized later for per-attempt tracking, but must exist
+        # before first use in _prequery_sorry_goals.
+        last_exit_code = 1
+        last_verify_text = ""
         _file_absent_prefix = (
             "CRITICAL: Target file does NOT exist. You MUST call write_new_file(path="
             f'"{target_file}", content=<complete Lean code>) as your FIRST tool call. '
             "The guidance below contains the full file content — pass it to write_new_file. "
             "Only after the file exists do you call run_lean_verify.\n\n"
-            if not _tgt.exists()
+            if not _target_exists_overlay()
             else ""
         )
         # Fix 3: when checkpoint has already improved, forbid overwriting the target file.
@@ -2732,12 +2799,12 @@ def phase3_prove(
             + "\n"
             f"Target file: {target_file}\n"
             + (_imported_sigs_block.lstrip("\n") + "\n" if _imported_sigs_block else "")
-            + (_extract_staging_sigs(_staging_path) if _staging_path.exists() else "")
+            + (_extract_staging_sigs(_staging_path) if _staging_exists_overlay() else "")
             + (
                 "\n## Staging file (writable — add new glue lemmas here)\n"
                 f"File: {_staging_rel}\n"
                 "```lean\n"
-                + (_staging_path.read_text(encoding="utf-8") if _staging_path.exists() else "")
+                + _staging_read_overlay(default="")
                 + "\n```\n"
                 "If a lemma is NOT in Lib/Glue/*.lean but IS in this staging file, use it directly.\n"
                 f"To add a new lemma: use write_staging_lemma(staging_path=\"{_staging_rel}\", "
@@ -2787,9 +2854,9 @@ def phase3_prove(
         # Staging file lint check at start of each attempt.
         # If the staging file already has known API misspellings, alert Agent3
         # immediately so it fixes them before the first verify.
-        if _staging_path.exists():
+        if _staging_exists_overlay():
             _staging_lint_violations = _lint_staging_content(
-                _staging_path.read_text(encoding="utf-8")
+                _staging_read_overlay(default="")
             )
             if _staging_lint_violations:
                 _lint_feedback = _format_staging_lint_feedback(
@@ -2825,6 +2892,14 @@ def phase3_prove(
         _agent7_last_step_id: str | None = None
         _agent7_prev_sorry = last_sorry_count
         _agent7_no_progress_count = 0
+        _agent7_force_stale_threshold = RETRY_LIMITS.get("AGENT7_FORCE_STALE_LINE_THRESHOLD", 3)
+        _agent7_force_no_progress_turns_threshold = RETRY_LIMITS.get("AGENT7_FORCE_NO_PROGRESS_TURNS", 2)
+        _agent7_force_after_soft_warn = RETRY_LIMITS.get("AGENT7_FORCE_AFTER_SOFT_WARN", 1)
+        _agent7_soft_warned = False
+        _agent7_force_gate_active = False
+        _agent7_force_warn_turn: int | None = None
+        _agent7_no_progress_turns = 0
+        _agent7_last_verified_sorry: int | None = None
         _stale_err_line: int | None = None
         _stale_err_count: int = 0
         _tools_used_this_attempt: set[str] = set()
@@ -2861,6 +2936,33 @@ def phase3_prove(
                 arguments = {}
             if tool_name:
                 _tools_used_this_attempt.add(tool_name)
+
+            # ---------------------------------------------------------------
+            # Forced Agent7 gate: when stuck too long, restrict next actions
+            # ---------------------------------------------------------------
+            if (
+                _agent7_force_gate_active
+                and _active_agent7_plan is None
+                and tool_name not in ("request_agent7_interface_audit", "run_lean_verify", "request_agent2_help")
+            ):
+                agent7_force_gate_rejections.append({
+                    "attempt": attempt,
+                    "turn": tool_turn + 1,
+                    "tool": tool_name,
+                })
+                exec_results.append(ExecutionResult(
+                    status_code="BLOCKED",
+                    message=f"AGENT7_FORCE_GATE_REJECT tool={tool_name}",
+                    attempt=attempt,
+                ))
+                raw_reply = agent3.call(
+                    "## FORCE_GATE_ACTIVE\n"
+                    "You are stuck on repeated structural/type mismatch errors.\n"
+                    "Allowed next tools: request_agent7_interface_audit, run_lean_verify, request_agent2_help.\n"
+                    "Call request_agent7_interface_audit now."
+                )
+                token_char_budget += len(raw_reply)
+                continue
 
             # ---------------------------------------------------------------
             # Agent3 → Agent7 interface-audit escalation
@@ -2940,6 +3042,13 @@ def phase3_prove(
                 _agent7_last_step_id = None
                 _agent7_prev_sorry = last_sorry_in_attempt
                 _agent7_no_progress_count = 0
+                if _agent7_force_gate_active:
+                    _agent7_force_gate_active = False
+                    exec_results.append(ExecutionResult(
+                        status_code="SUCCESS",
+                        message="AGENT7_FORCE_GATE_OFF",
+                        attempt=attempt,
+                    ))
                 agent7_plan_revisions.append({
                     "attempt": attempt,
                     "turn": tool_turn + 1,
@@ -3038,13 +3147,13 @@ def phase3_prove(
                 forced_exit = int(forced_verify.get("exit_code", 1))
                 forced_sorry = int(forced_verify.get("sorry_count", 0))
                 current_hash = _file_hash(target_file)
-                file_changed = _tgt.exists() and (
-                    not initial_exists or current_hash != initial_hash
+                file_changed = (snapshot_file(target_file) != "") and (
+                    (not initial_exists) or (current_hash != initial_hash)
                 )
                 if forced_exit == 0 and forced_sorry == 0 and file_changed:
                     # Full-library gate
-                    full_build = lake_build(target="SGDAlgorithms")
-                    if full_build.returncode == 0:
+                    full_build = registry.call("run_repo_verify")
+                    if int(full_build.get("exit_code", 1)) == 0:
                         execution_history.extend(exec_results)
                         console.print(
                             f"  [Agent3] attempt {attempt}/{max_retries} — "
@@ -3052,12 +3161,14 @@ def phase3_prove(
                         )
                         # Success: restore any shared Glue/Layer0 files Agent3 may have edited.
                         for _gp, _goriginal in _glue_snapshot.items():
-                            if _gp.exists() and _gp.read_text(encoding="utf-8") != _goriginal:
-                                _gp.write_text(_goriginal, encoding="utf-8")
+                            _gp_rel = str(_gp.relative_to(PROJECT_ROOT))
+                            if snapshot_file(_gp_rel) != _goriginal:
+                                registry.call("overwrite_file", path=_gp_rel, content=_goriginal)
                                 console.print(f"  [Staging] Restored {_gp.name} (was modified)")
                         for _lp, _loriginal in _layer0_snapshot.items():
-                            if _lp.exists() and _lp.read_text(encoding="utf-8") != _loriginal:
-                                _lp.write_text(_loriginal, encoding="utf-8")
+                            _lp_rel = str(_lp.relative_to(PROJECT_ROOT))
+                            if snapshot_file(_lp_rel) != _loriginal:
+                                registry.call("overwrite_file", path=_lp_rel, content=_loriginal)
                                 console.print(f"  [Layer0] Restored {_lp.name} (was modified by Agent3)")
                         return True, attempts, "", {
                             "execution_history": [r.__dict__ for r in execution_history],
@@ -3066,6 +3177,10 @@ def phase3_prove(
                             "agent7_step_execution_log": agent7_step_execution_log,
                             "agent7_plan_revisions": agent7_plan_revisions,
                             "agent7_blocked_actions": agent7_blocked_actions,
+                            "agent7_forced_trigger_count": agent7_forced_trigger_count,
+                            "agent7_force_gate_entries": agent7_force_gate_entries,
+                            "agent7_force_gate_rejections": agent7_force_gate_rejections,
+                            "agent7_force_gate_reason_samples": agent7_force_gate_reason_samples,
                             "estimated_token_consumption": max(1, token_char_budget // 4),
                             "retry_count": sum(
                                 1 for r in execution_history
@@ -3073,7 +3188,7 @@ def phase3_prove(
                             ),
                         }
                     else:
-                        full_errors = full_build.errors or "SGDAlgorithms full build failed"
+                        full_errors = "\n".join(full_build.get("errors", [])) or "SGDAlgorithms full build failed"
                         last_errors = full_errors
                         exec_results.append(ExecutionResult(
                             status_code="ERROR",
@@ -3200,10 +3315,7 @@ def phase3_prove(
                 else:
                     _stuck_line_int = int(stuck_at_line) if str(stuck_at_line).isdigit() else None
                     _current_snippet = _build_escalation_file_context(target_file, _stuck_line_int)
-                    _staging_snippet = (
-                        _staging_path.read_text(encoding="utf-8")
-                        if _staging_path.exists() else "(staging file is empty)"
-                    )
+                    _staging_snippet = _staging_read_overlay()
                     new_guidance = _call_agent2_with_tools(
                         agent2,
                         staging_registry,
@@ -3250,10 +3362,7 @@ def phase3_prove(
                 )
                 _stuck_line_int = int(stuck_at_line) if str(stuck_at_line).isdigit() else None
                 current_file_snippet = _build_escalation_file_context(target_file, _stuck_line_int)
-                _staging_snippet = (
-                    _staging_path.read_text(encoding="utf-8")
-                    if _staging_path.exists() else "(staging file is empty)"
-                )
+                _staging_snippet = _staging_read_overlay()
                 new_guidance = _call_agent2_with_tools(
                     agent2,
                     staging_registry,
@@ -3357,10 +3466,10 @@ def phase3_prove(
                 if (
                     _edited_path_str
                     and "Staging" in _edited_path_str
-                    and _staging_path.exists()
+                    and _staging_exists_overlay()
                 ):
                     _post_lint = _lint_staging_content(
-                        _staging_path.read_text(encoding="utf-8")
+                        _staging_read_overlay(default="")
                     )
                     if _post_lint:
                         _post_lint_msg = _format_staging_lint_feedback(
@@ -3392,6 +3501,12 @@ def phase3_prove(
                 )
                 last_sorry_count = last_sorry_in_attempt
                 last_errors = last_verify_text
+                if _agent7_last_verified_sorry is not None:
+                    if last_sorry_in_attempt < _agent7_last_verified_sorry:
+                        _agent7_no_progress_turns = 0
+                    else:
+                        _agent7_no_progress_turns += 1
+                _agent7_last_verified_sorry = last_sorry_in_attempt
 
                 # Agent7 execution gate: evaluate current step only on verify.
                 if _active_agent7_plan is not None and _agent7_pending_verify:
@@ -3489,15 +3604,17 @@ def phase3_prove(
                 # Checkpoint: save verified state whenever sorry count improves.
                 # Only verified (compilable) states are checkpointed.
                 if (
+                    last_exit_code == 0
+                    and
                     last_sorry_in_attempt < best_checkpoint["sorry_count"]
-                    and _tgt.exists()
+                    and snapshot_file(target_file) != ""
                 ):
                     best_checkpoint = {
                         "sorry_count": last_sorry_in_attempt,
                         "content": load_file(target_file),
                         "staging_content": (
-                            _staging_path.read_text(encoding="utf-8")
-                            if _staging_path.exists() else None
+                            snapshot_file(_staging_rel)
+                            if snapshot_file(_staging_rel) else None
                         ),
                     }
                     console.print(
@@ -3507,12 +3624,14 @@ def phase3_prove(
                     last_exit_code == 0
                     and last_sorry_in_attempt > best_checkpoint["sorry_count"]
                     and best_checkpoint["content"] is not None
-                    and _tgt.exists()
+                    and snapshot_file(target_file) != ""
                 ):
-                    _tgt.write_text(best_checkpoint["content"], encoding="utf-8")
+                    registry.call("overwrite_file", path=target_file, content=best_checkpoint["content"])
                     if best_checkpoint.get("staging_content") is not None:
-                        _staging_path.write_text(
-                            best_checkpoint["staging_content"], encoding="utf-8"
+                        registry.call(
+                            "overwrite_file",
+                            path=_staging_rel,
+                            content=best_checkpoint["staging_content"],
                         )
                     result_msg = (
                         "## REGRESSION DETECTED\n"
@@ -3552,7 +3671,7 @@ def phase3_prove(
                             _inner_err_line, target_file
                         ),
                         "target_file_content": (
-                            load_file(target_file)[:50000] if _tgt.exists() else None
+                            load_file(target_file)[:50000] if _target_exists_overlay() else None
                         ),
                     })
 
@@ -3583,24 +3702,28 @@ def phase3_prove(
                     # that condition fails when the run started from a sorry=0 file,
                     # causing the checkpoint to be skipped and the file deleted.
                     if best_checkpoint["content"] is not None:
-                        _tgt.write_text(best_checkpoint["content"], encoding="utf-8")
-                        initial_hash = hashlib.md5(_tgt.read_bytes()).hexdigest()
+                        registry.call("overwrite_file", path=target_file, content=best_checkpoint["content"])
+                        initial_hash = _file_hash(target_file)
                         initial_exists = True
                         file_changed = True
                         # Also restore staging file to its checkpointed state.
                         if best_checkpoint.get("staging_content") is not None:
-                            _staging_path.write_text(
-                                best_checkpoint["staging_content"], encoding="utf-8"
+                            registry.call(
+                                "overwrite_file",
+                                path=_staging_rel,
+                                content=best_checkpoint["staging_content"],
                             )
                         # Restore any Glue files Agent3 may have corrupted.
                         for _gp, _goriginal in _glue_snapshot.items():
-                            if _gp.exists() and _gp.read_text(encoding="utf-8") != _goriginal:
-                                _gp.write_text(_goriginal, encoding="utf-8")
+                            _gp_rel = str(_gp.relative_to(PROJECT_ROOT))
+                            if snapshot_file(_gp_rel) != _goriginal:
+                                registry.call("overwrite_file", path=_gp_rel, content=_goriginal)
                                 console.print(f"  [Staging] Restored {_gp.name} (SIGNATURE_HALLUCINATION rollback)")
                         # Restore any Layer0 files Agent3 may have corrupted.
                         for _lp, _loriginal in _layer0_snapshot.items():
-                            if _lp.exists() and _lp.read_text(encoding="utf-8") != _loriginal:
-                                _lp.write_text(_loriginal, encoding="utf-8")
+                            _lp_rel = str(_lp.relative_to(PROJECT_ROOT))
+                            if snapshot_file(_lp_rel) != _loriginal:
+                                registry.call("overwrite_file", path=_lp_rel, content=_loriginal)
                                 console.print(f"  [Layer0] Restored {_lp.name} (SIGNATURE_HALLUCINATION rollback)")
                         console.print(
                             f"  [Checkpoint] Restored (sorry={best_checkpoint['sorry_count']}) "
@@ -3740,10 +3863,7 @@ def phase3_prove(
                                 )
                             else:
                                 _current_snippet = _build_escalation_file_context(target_file, _line_int)
-                                _staging_snippet = (
-                                    _staging_path.read_text(encoding="utf-8")
-                                    if _staging_path.exists() else "(staging file is empty)"
-                                )
+                                _staging_snippet = _staging_read_overlay()
                                 new_guidance = _call_agent2_with_tools(
                                     agent2,
                                     staging_registry,
@@ -3768,6 +3888,58 @@ def phase3_prove(
                             err_line_no,
                             _stale_err_count,
                         )
+                    _stuck_now = (
+                        _stale_err_count >= _agent7_force_stale_threshold
+                        and _agent7_no_progress_turns >= _agent7_force_no_progress_turns_threshold
+                    )
+                    _reason = (
+                        f"stale_line_count={_stale_err_count}, "
+                        f"no_progress_turns={_agent7_no_progress_turns}, "
+                        f"line={line_no_display}"
+                    )
+                    if _stuck_now and not _agent7_soft_warned:
+                        _agent7_soft_warned = True
+                        _agent7_force_warn_turn = tool_turn + 1
+                        agent7_force_gate_reason_samples.append(_reason)
+                        exec_results.append(ExecutionResult(
+                            status_code="BLOCKED",
+                            message=f"AGENT7_FORCE_WARNING {_reason}",
+                            attempt=attempt,
+                        ))
+                        raw_reply = agent3.call(
+                            "## AGENT7_FORCE_WARNING\n"
+                            "Repeated structural/type mismatch with no progress detected.\n"
+                            "Next action SHOULD be request_agent7_interface_audit.\n"
+                            "If stuck persists, FORCE_GATE_ACTIVE will be enabled."
+                        )
+                        token_char_budget += len(raw_reply)
+                        continue
+                    if (
+                        _stuck_now
+                        and _agent7_soft_warned
+                        and (not _agent7_force_gate_active)
+                        and _agent7_force_warn_turn is not None
+                        and (tool_turn + 1 - _agent7_force_warn_turn) >= _agent7_force_after_soft_warn
+                    ):
+                        _agent7_force_gate_active = True
+                        agent7_forced_trigger_count += 1
+                        agent7_force_gate_entries.append({
+                            "attempt": attempt,
+                            "turn": tool_turn + 1,
+                            "reason": _reason,
+                        })
+                        exec_results.append(ExecutionResult(
+                            status_code="BLOCKED",
+                            message=f"AGENT7_FORCE_GATE_ON {_reason}",
+                            attempt=attempt,
+                        ))
+                        raw_reply = agent3.call(
+                            "## FORCE_GATE_ACTIVE\n"
+                            "You are stuck on repeated structural/type mismatch errors.\n"
+                            "You must call request_agent7_interface_audit now (or request_agent2_help as fallback)."
+                        )
+                        token_char_budget += len(raw_reply)
+                        continue
 
                 if error_type == "DEPENDENCY_COMPILE_ERROR":
                     # Errors originate from a staging/dependency file, not target.
@@ -3785,7 +3957,7 @@ def phase3_prove(
                         "[cyan]DEPENDENCY_COMPILE_ERROR — routing to dep-fix (staging fix)"
                     )
                     # Try deterministic rule-based staging fix first (no LLM call).
-                    _staging_rule_fixes = apply_staging_rules(_staging_path, last_verify_text)
+                    _staging_rule_fixes = apply_staging_rules(_staging_physical_path(), last_verify_text)
                     if _staging_rule_fixes > 0:
                         console.print(
                             f"  [Auto-fix] Applied {_staging_rule_fixes} rule-based "
@@ -3849,15 +4021,16 @@ def phase3_prove(
                 last_sorry_count = last_sorry_in_attempt
                 last_errors = last_verify_text
                 if (
+                    last_exit_code == 0
+                    and
                     last_sorry_in_attempt < best_checkpoint["sorry_count"]
-                    and _tgt.exists()
+                    and _target_exists_overlay()
                 ):
                     best_checkpoint = {
                         "sorry_count": last_sorry_in_attempt,
                         "content": load_file(target_file),
                         "staging_content": (
-                            _staging_path.read_text(encoding="utf-8")
-                            if _staging_path.exists() else None
+                            _staging_read_overlay(default="") or None
                         ),
                     }
                     console.print(
@@ -3894,15 +4067,15 @@ def phase3_prove(
 
         current_code = (
             load_file(target_file)
-            if _tgt.exists()
+            if _target_exists_overlay()
             else "(Agent3 has not created the file yet.)"
         )
 
         current_hash_end = _file_hash(target_file)
-        attempt_file_changed = _tgt.exists() and (current_hash_end != attempt_start_hash)
+        attempt_file_changed = _target_exists_overlay() and (current_hash_end != attempt_start_hash)
 
         # File-not-created check
-        if not _tgt.exists():
+        if not _target_exists_overlay():
             guidance = _call_agent2_with_tools(
                 agent2,
                 staging_registry,
@@ -3923,7 +4096,7 @@ def phase3_prove(
         # NOTE: DEPENDENCY_COMPILE_ERROR is excluded — when staging is broken
         # Agent3 correctly leaves the target file untouched; falling through to
         # the dep-error handler below is the right behaviour.
-        if not attempt_file_changed and _tgt.exists():
+        if not attempt_file_changed and _target_exists_overlay():
             if error_type_final == "DEPENDENCY_COMPILE_ERROR":
                 pass  # dep handler below will deal with it
             elif last_exit_code == 0 and last_sorry_in_attempt == 0:
@@ -3971,7 +4144,7 @@ def phase3_prove(
                 _dep_error_streak = 0
             _last_dep_error_sig = _dep_sig_now
             # Try deterministic rule-based staging fix first (no LLM call).
-            _staging_rule_fixes_post = apply_staging_rules(_staging_path, last_verify_text)
+            _staging_rule_fixes_post = apply_staging_rules(_staging_physical_path(), last_verify_text)
             if _staging_rule_fixes_post > 0:
                 console.print(
                     f"  [Auto-fix] Applied {_staging_rule_fixes_post} rule-based "
@@ -3979,10 +4152,7 @@ def phase3_prove(
                 )
                 _dep_error_streak = 0  # reset streak after a fix
                 continue
-            _dep_staging_ctx = (
-                _staging_path.read_text(encoding="utf-8")
-                if _staging_path.exists() else "(staging file is empty)"
-            )
+            _dep_staging_ctx = _staging_read_overlay()
             _ref_files_dep = _get_reference_files_with_descriptions(target_file)
             _ref_class_dep = _format_ref_and_classification_blocks(
                 _ref_files_dep, None
@@ -4029,10 +4199,7 @@ def phase3_prove(
                 else last_verify_text[:120].replace("\n", " ")
             )
             _escalation_file_ctx = _build_escalation_file_context(target_file, _err_line_int)
-            _staging_content_ctx = (
-                _staging_path.read_text(encoding="utf-8")
-                if _staging_path.exists() else "(staging file is empty)"
-            )
+            _staging_content_ctx = _staging_read_overlay()
             _primary_local = _structured_errors_final[0] if _structured_errors_final else None
             _ref_files_local = _get_reference_files_with_descriptions(target_file)
             _llm_class_local = (
@@ -4197,10 +4364,7 @@ def phase3_prove(
             _consecutive_repeat_count = 0  # reset after intervention
 
         _gen_file_ctx = _build_escalation_file_context(target_file, _err_line_int)
-        _gen_staging_ctx = (
-            _staging_path.read_text(encoding="utf-8")
-            if _staging_path.exists() else "(staging file is empty)"
-        )
+        _gen_staging_ctx = _staging_read_overlay()
         _surgeon_prefix = (
             "[CIRCUIT BREAKER — SURGEON MODE FORCED]\n"
             "The same Lean error has occurred in 3 or more consecutive attempts.\n"
@@ -4271,18 +4435,20 @@ def phase3_prove(
         )
 
     # Staging lemma usage audit (6c): report which staging lemmas were referenced.
-    if _staging_path.exists() and _tgt.exists():
+    if snapshot_file(_staging_rel) and snapshot_file(target_file):
         console.rule("[dim]Staging usage audit")
         _audit_staging_usage(target_file, _staging_path, console.print)
 
     # Restore any shared Glue/Layer0 files Agent3 may have edited before exiting Phase 3.
     for _gp, _goriginal in _glue_snapshot.items():
-        if _gp.exists() and _gp.read_text(encoding="utf-8") != _goriginal:
-            _gp.write_text(_goriginal, encoding="utf-8")
+        _gp_rel = str(_gp.relative_to(PROJECT_ROOT))
+        if snapshot_file(_gp_rel) != _goriginal:
+            registry.call("overwrite_file", path=_gp_rel, content=_goriginal)
             console.print(f"  [Staging] Restored {_gp.name} (was modified by Agent3)")
     for _lp, _loriginal in _layer0_snapshot.items():
-        if _lp.exists() and _lp.read_text(encoding="utf-8") != _loriginal:
-            _lp.write_text(_loriginal, encoding="utf-8")
+        _lp_rel = str(_lp.relative_to(PROJECT_ROOT))
+        if snapshot_file(_lp_rel) != _loriginal:
+            registry.call("overwrite_file", path=_lp_rel, content=_loriginal)
             console.print(f"  [Layer0] Restored {_lp.name} (was modified by Agent3)")
 
     console.print("[red bold]Max retries exhausted — escalating to Agent5.")
@@ -4291,14 +4457,14 @@ def phase3_prove(
             "\n".join(diag_log[-12:]),
             title="[yellow]Phase 3 Retry Log",
         ))
-    agent5 = Agent("diagnostician", extra_files=[target_file] if _tgt.exists() else [])
+    agent5 = Agent("diagnostician", extra_files=[target_file] if _target_exists_overlay() else [])
     sorry_context = (
         load_file(target_file)
-        if _tgt.exists()
+        if _target_exists_overlay()
         else f"(File '{target_file}' does not exist — Prover Agent never created it.)"
     )
     _staging_file_for_repair = (
-        str(_staging_path) if _staging_path.exists() else None
+        str(_staging_physical_path()) if _staging_exists_overlay() else None
     )
     action = auto_repair_loop(
         agent5,
@@ -4322,6 +4488,10 @@ def phase3_prove(
                 "agent7_step_execution_log": agent7_step_execution_log,
                 "agent7_plan_revisions": agent7_plan_revisions,
                 "agent7_blocked_actions": agent7_blocked_actions,
+                "agent7_forced_trigger_count": agent7_forced_trigger_count,
+                "agent7_force_gate_entries": agent7_force_gate_entries,
+                "agent7_force_gate_rejections": agent7_force_gate_rejections,
+                "agent7_force_gate_reason_samples": agent7_force_gate_reason_samples,
                 "estimated_token_consumption": max(1, token_char_budget // 4),
                 "retry_count": sum(
                     1
@@ -4354,6 +4524,10 @@ def phase3_prove(
             "agent7_step_execution_log": agent7_step_execution_log,
             "agent7_plan_revisions": agent7_plan_revisions,
             "agent7_blocked_actions": agent7_blocked_actions,
+            "agent7_forced_trigger_count": agent7_forced_trigger_count,
+            "agent7_force_gate_entries": agent7_force_gate_entries,
+            "agent7_force_gate_rejections": agent7_force_gate_rejections,
+            "agent7_force_gate_reason_samples": agent7_force_gate_reason_samples,
             "estimated_token_consumption": max(1, token_char_budget // 4),
             "retry_count": sum(
                 1
@@ -4369,6 +4543,10 @@ def phase3_prove(
         "agent7_step_execution_log": agent7_step_execution_log,
         "agent7_plan_revisions": agent7_plan_revisions,
         "agent7_blocked_actions": agent7_blocked_actions,
+        "agent7_forced_trigger_count": agent7_forced_trigger_count,
+        "agent7_force_gate_entries": agent7_force_gate_entries,
+        "agent7_force_gate_rejections": agent7_force_gate_rejections,
+        "agent7_force_gate_reason_samples": agent7_force_gate_reason_samples,
         "estimated_token_consumption": max(1, token_char_budget // 4),
         "retry_count": sum(
             1
@@ -4479,10 +4657,9 @@ def _apply_lib_insert(file_path: str, anchor_id: str, content: str) -> str:
     regex = cfg["regex"]
     insert_mode = cfg.get("insert", "before")
 
-    full_path = PROJECT_ROOT / file_path
-    if not full_path.exists():
+    original = snapshot_file(file_path)
+    if not original:
         raise FileNotFoundError(f"[Phase 4] Lib file does not exist: {file_path}")
-    original = full_path.read_text(encoding="utf-8")
 
     matches = list(re.finditer(regex, original, flags=re.MULTILINE))
     if not matches:
@@ -4683,14 +4860,14 @@ def phase4_persist(
 
         # Full-library build: catches cascade failures in algorithm files caused
         # by changes to Lib/Glue lemma signatures or new lemma insertions.
-        build_result = lake_build(target="SGDAlgorithms")
-        if build_result.returncode != 0:
+        build_result = registry.call("run_repo_verify")
+        if int(build_result.get("exit_code", 1)) != 0:
             console.print("[red]\\[Phase 4] lib_write caused build failure. Rolling back...")
             for path, snap in lib_snapshots.items():
                 registry.call("overwrite_file", path=path, content=snap)
             raise RuntimeError(
                 "[Phase 4] Lib/refactor caused build failure. Rolled back.\n"
-                + (build_result.errors or "Unknown error")
+                + ("\n".join(build_result.get("errors", [])) or "Unknown error")
             )
 
     if algorithm_refactor_ops:
@@ -4722,14 +4899,14 @@ def phase4_persist(
 
         # Full-library build: catches cascade failures across all algorithm files,
         # not just the directly refactored ones.
-        build_result = lake_build(target="SGDAlgorithms")
-        if build_result.returncode != 0:
+        build_result = registry.call("run_repo_verify")
+        if int(build_result.get("exit_code", 1)) != 0:
             console.print("[red]\\[Phase 4] algorithm_refactor caused build failure. Rolling back...")
             for path, snap in algo_snapshots.items():
                 registry.call("overwrite_file", path=path, content=snap)
             raise RuntimeError(
                 "[Phase 4] Algorithm refactor caused build failure. Rolled back.\n"
-                + (build_result.errors or "Unknown error")
+                + ("\n".join(build_result.get("errors", [])) or "Unknown error")
             )
 
     # Doc-code alignment: if CATALOG lemma status was touched, the lemmas must exist in Lib/.
@@ -4860,10 +5037,12 @@ def run(
 
     baseline_tracked, baseline_untracked = _capture_lean_baseline()
     audit = AuditLogger.get()
-    audit.start_run(algorithm)
+    run_id = audit.start_run(algorithm)
     success = False
     _lakefile_added_by_us = False
     files_modified: list[str] = []
+    _staging_root = PROJECT_ROOT / "orchestrator" / "staging_runs" / run_id
+    configure_staging_barrier(_staging_root, enabled=True)
     merged_phase3_audit = {
         "execution_history": [],
         "attempt_failures": [],
@@ -4871,6 +5050,14 @@ def run(
         "agent7_step_execution_log": [],
         "agent7_plan_revisions": [],
         "agent7_blocked_actions": [],
+        "agent7_forced_trigger_count": 0,
+        "agent7_force_gate_entries": [],
+        "agent7_force_gate_rejections": [],
+        "agent7_force_gate_reason_samples": [],
+        "staging_root": str(_staging_root.relative_to(PROJECT_ROOT)),
+        "staging_changes": [],
+        "commit_applied": False,
+        "discard_reason": None,
         "estimated_token_consumption": 0,
         "retry_count": 0,
     }
@@ -4938,6 +5125,18 @@ def run(
                 merged_phase3_audit["agent7_blocked_actions"].extend(
                     phase3_audit.get("agent7_blocked_actions", [])
                 )
+                merged_phase3_audit["agent7_forced_trigger_count"] += int(
+                    phase3_audit.get("agent7_forced_trigger_count", 0)
+                )
+                merged_phase3_audit["agent7_force_gate_entries"].extend(
+                    phase3_audit.get("agent7_force_gate_entries", [])
+                )
+                merged_phase3_audit["agent7_force_gate_rejections"].extend(
+                    phase3_audit.get("agent7_force_gate_rejections", [])
+                )
+                merged_phase3_audit["agent7_force_gate_reason_samples"].extend(
+                    phase3_audit.get("agent7_force_gate_reason_samples", [])
+                )
                 merged_phase3_audit["estimated_token_consumption"] += int(
                     phase3_audit.get("estimated_token_consumption", 0)
                 )
@@ -4978,6 +5177,14 @@ def run(
                 )
             progress.advance(task)
 
+            # Commit staging barrier to workspace only after Phase 4 succeeds.
+            _staging_changes = list_staging_changes()
+            _commit_result = commit_staging_to_workspace()
+            merged_phase3_audit["staging_changes"] = _staging_changes
+            merged_phase3_audit["commit_applied"] = bool(_commit_result.get("applied", False))
+            merged_phase3_audit["discard_reason"] = "committed"
+            discard_staging_changes()
+
             # Phase 5
             audit.set_phase(5)
             progress.update(task, description="Phase 5/5: Finalizing metrics...")
@@ -4997,9 +5204,19 @@ def run(
             docs_in_diff = {f for f in _git_diff_files() if f.startswith("docs/")}
             files_modified = sorted(set(all_modified) | docs_in_diff)
     finally:
+        _stage_status = get_staging_barrier_status()
+        if _stage_status.get("enabled", False):
+            merged_phase3_audit["staging_changes"] = list_staging_changes()
+            if not merged_phase3_audit.get("commit_applied", False):
+                merged_phase3_audit["discard_reason"] = (
+                    merged_phase3_audit.get("discard_reason")
+                    or ("run_failed" if not success else "cleanup")
+                )
+            discard_staging_changes()
         audit.add_phase3_data(
             merged_phase3_audit.get("execution_history", []),
             merged_phase3_audit.get("attempt_failures", []),
+            extra=merged_phase3_audit,
         )
         extra_snapshot = [target_file] if not success else []
         audit.finish_run(success, files_modified, extra_files_to_snapshot=extra_snapshot)

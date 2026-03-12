@@ -56,6 +56,7 @@ class AuditLogger:
         self._current_phase: int = 0
         self._phase3_execution_history: list[dict[str, Any]] = []
         self._phase3_attempt_failures: list[dict[str, Any]] = []
+        self._phase3_extra: dict[str, Any] = {}
         self._phase4_patch_ops_summary: list[dict[str, Any]] = []
         self._phase1_detail: dict[str, Any] | None = None
         self._phase2_rounds: list[dict[str, Any]] = []
@@ -89,6 +90,7 @@ class AuditLogger:
         self._current_phase = 0
         self._phase3_execution_history = []
         self._phase3_attempt_failures = []
+        self._phase3_extra = {}
         self._phase4_patch_ops_summary = []
         self._phase1_detail = None
         self._phase2_rounds = []
@@ -231,10 +233,12 @@ class AuditLogger:
         self,
         execution_history: list[dict[str, Any]],
         attempt_failures: list[dict[str, Any]] | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         """Append Phase 3 execution history and attempt failures (Lean errors)."""
         self._phase3_execution_history = execution_history
         self._phase3_attempt_failures = attempt_failures or []
+        self._phase3_extra = extra or {}
 
     def add_phase4_data(self, patch_ops_summary: list[dict[str, Any]]) -> None:
         """Append Phase 4 patch ops summary."""
@@ -299,6 +303,8 @@ class AuditLogger:
             "phase4_patch_ops_summary": self._phase4_patch_ops_summary,
             "files_modified": files_modified,
         }
+        if self._phase3_extra:
+            payload.update(self._phase3_extra)
         if final_files:
             payload["final_files"] = final_files
 

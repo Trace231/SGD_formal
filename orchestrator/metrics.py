@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.config import LIB_DIR, METRICS_PATH, PROJECT_ROOT
+from orchestrator.file_io import load_file
 from orchestrator.tools import run_repo_verify
 
 
@@ -98,7 +99,7 @@ def count_glue_tricks_sections() -> int:
     path = PROJECT_ROOT / "docs" / "GLUE_TRICKS.md"
     if not path.exists():
         return 0
-    content = path.read_text(encoding="utf-8")
+    content = load_file(path)
     return len(re.findall(r"^#{3,4}\s+Pattern", content, re.MULTILINE))
 
 

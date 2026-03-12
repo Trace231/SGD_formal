@@ -9,11 +9,19 @@ from __future__ import annotations
 import difflib
 import os
 import re
+import shutil
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from orchestrator.config import LEAN_VERIFY_PATHS, PROJECT_ROOT, READ_ONLY_PATHS, WHITELIST_PATHS
+from orchestrator.config import (
+    LEAN_BUILD_TIMEOUT,
+    LEAN_VERIFY_PATHS,
+    PROJECT_ROOT,
+    READ_ONLY_PATHS,
+    WHITELIST_PATHS,
+)
 from orchestrator.verify import count_sorrys, lake_build
 
 _READ_WRITE_ALLOWLIST = tuple(p.rstrip("/") for p in WHITELIST_PATHS)
@@ -22,6 +30,163 @@ _DOC_ALLOWLIST = tuple(p for p in _READ_WRITE_ALLOWLIST if p == "docs")
 # Extended read-only allowlist — includes root infrastructure files (Main.lean, lakefile.lean)
 # so agents can inspect the import graph without write access.
 _READ_ONLY_ALLOWLIST = tuple(p.rstrip("/") for p in READ_ONLY_PATHS)
+
+
+_STAGING_STATE: dict[str, Any] = {
+    "enabled": False,
+    "root": None,  # Path | None
+    "written_relpaths": set(),  # set[str]
+}
+
+_STAGING_PREFIXES = (
+    "Lib/Glue/Staging/",
+    "Lib/Glue/",
+    "Lib/Layer0/",
+    "docs/",
+)
+
+
+def _to_rel(path: Path) -> str:
+    return str(path.resolve().relative_to(PROJECT_ROOT.resolve()))
+
+
+def _staging_root() -> Path | None:
+    root = _STAGING_STATE.get("root")
+    return root if isinstance(root, Path) else None
+
+
+def _staging_enabled() -> bool:
+    return bool(_STAGING_STATE.get("enabled", False)) and _staging_root() is not None
+
+
+def _is_staging_scoped_rel(rel: str) -> bool:
+    rel_norm = rel.replace("\\", "/")
+    return any(rel_norm == p.rstrip("/") or rel_norm.startswith(p) for p in _STAGING_PREFIXES)
+
+
+def _resolve_stage_path_from_rel(rel: str) -> Path:
+    root = _staging_root()
+    if root is None:
+        raise RuntimeError("Staging root is not set")
+    return (root / rel).resolve()
+
+
+def configure_staging_barrier(staging_root: str | Path | None, enabled: bool = True) -> dict[str, Any]:
+    """Enable/disable write barrier that redirects writes to a staging root."""
+    if not enabled or staging_root is None:
+        _STAGING_STATE["enabled"] = False
+        _STAGING_STATE["root"] = None
+        _STAGING_STATE["written_relpaths"] = set()
+        return {"enabled": False}
+    root = Path(staging_root)
+    if not root.is_absolute():
+        root = (PROJECT_ROOT / root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    _STAGING_STATE["enabled"] = True
+    _STAGING_STATE["root"] = root
+    _STAGING_STATE["written_relpaths"] = set()
+    return {"enabled": True, "staging_root": str(root)}
+
+
+def get_staging_barrier_status() -> dict[str, Any]:
+    root = _staging_root()
+    return {
+        "enabled": _staging_enabled(),
+        "staging_root": str(root) if root else None,
+        "written_relpaths": sorted(_STAGING_STATE.get("written_relpaths", set())),
+    }
+
+
+def _map_for_read(resolved_workspace_path: Path) -> Path:
+    """Read from staged file when present, else workspace path."""
+    if not _staging_enabled():
+        return resolved_workspace_path
+    rel = _to_rel(resolved_workspace_path)
+    if not _is_staging_scoped_rel(rel):
+        return resolved_workspace_path
+    staged = _resolve_stage_path_from_rel(rel)
+    return staged if staged.exists() else resolved_workspace_path
+
+
+def _map_for_write(resolved_workspace_path: Path) -> Path:
+    """Redirect writes into staging root when barrier is enabled."""
+    if not _staging_enabled():
+        return resolved_workspace_path
+    rel = _to_rel(resolved_workspace_path)
+    if not _is_staging_scoped_rel(rel):
+        return resolved_workspace_path
+    staged = _resolve_stage_path_from_rel(rel)
+    _STAGING_STATE["written_relpaths"].add(rel)
+    return staged
+
+
+def list_staging_changes() -> list[str]:
+    """List staged relative paths currently present in the staging root."""
+    root = _staging_root()
+    if root is None or not root.exists():
+        return []
+    changes: list[str] = []
+    for p in root.rglob("*"):
+        if p.is_file():
+            changes.append(str(p.relative_to(root)).replace("\\", "/"))
+    return sorted(changes)
+
+
+def commit_staging_to_workspace() -> dict[str, Any]:
+    """Apply staged files atomically to workspace paths."""
+    root = _staging_root()
+    if root is None or not root.exists():
+        return {"applied": False, "changed_files": []}
+    changed: list[str] = []
+    for rel in list_staging_changes():
+        staged = (root / rel).resolve()
+        dst = (PROJECT_ROOT / rel).resolve()
+        before = dst.read_text(encoding="utf-8") if dst.exists() else None
+        after = staged.read_text(encoding="utf-8")
+        if before != after:
+            _atomic_write(dst, after)
+            changed.append(rel)
+    return {"applied": True, "changed_files": sorted(changed)}
+
+
+def discard_staging_changes() -> dict[str, Any]:
+    """Delete the staging root and disable barrier state."""
+    root = _staging_root()
+    removed = 0
+    if root and root.exists():
+        removed = len([p for p in root.rglob("*") if p.is_file()])
+        shutil.rmtree(root, ignore_errors=True)
+    _STAGING_STATE["enabled"] = False
+    _STAGING_STATE["root"] = None
+    _STAGING_STATE["written_relpaths"] = set()
+    return {"discarded": True, "removed_files": removed}
+
+
+@contextmanager
+def _workspace_overlay_from_staging() -> Any:
+    """Temporarily overlay staged files into workspace for verification tools."""
+    root = _staging_root()
+    if not _staging_enabled() or root is None or not root.exists():
+        yield
+        return
+    backups: dict[Path, str] = {}
+    created: list[Path] = []
+    try:
+        for rel in list_staging_changes():
+            staged = (root / rel).resolve()
+            dst = (PROJECT_ROOT / rel).resolve()
+            if dst.exists():
+                backups[dst] = dst.read_text(encoding="utf-8")
+            else:
+                created.append(dst)
+            _atomic_write(dst, staged.read_text(encoding="utf-8"))
+        yield
+    finally:
+        for dst, content in backups.items():
+            _atomic_write(dst, content)
+        for p in created:
+            if p.exists():
+                p.unlink(missing_ok=True)
 
 
 def _is_under(path: Path, root: Path) -> bool:
@@ -91,7 +256,8 @@ def read_file(
         Returns an error string (not an exception) for out-of-bounds requests.
     """
     resolved = _resolve_allowed_path(path, _READ_WRITE_ALLOWLIST)
-    lines = resolved.read_text(encoding="utf-8").splitlines(keepends=True)
+    read_path = _map_for_read(resolved)
+    lines = read_path.read_text(encoding="utf-8").splitlines(keepends=True)
     total = len(lines)
 
     # Resolve defaults
@@ -150,7 +316,8 @@ def search_in_file(
           matches (list of {line, content, context}).
     """
     resolved = _resolve_allowed_path(path, _READ_WRITE_ALLOWLIST)
-    lines = resolved.read_text(encoding="utf-8").splitlines()
+    read_path = _map_for_read(resolved)
+    lines = read_path.read_text(encoding="utf-8").splitlines()
 
     all_match_indices: list[int] = [
         i for i, line in enumerate(lines) if re.search(pattern, line)
@@ -215,7 +382,8 @@ def read_file_readonly(
         with_line_numbers: Prefix each line with its line number (default: True).
     """
     resolved = _resolve_allowed_path(path, _READ_ONLY_ALLOWLIST)
-    lines = resolved.read_text(encoding="utf-8").splitlines(keepends=True)
+    read_path = _map_for_read(resolved)
+    lines = read_path.read_text(encoding="utf-8").splitlines(keepends=True)
     total = len(lines)
 
     s = max(0, (start_line or 1) - 1)
@@ -267,7 +435,8 @@ def search_in_file_readonly(
         max_matches: Maximum number of matches to return (default 20).
     """
     resolved = _resolve_allowed_path(path, _READ_ONLY_ALLOWLIST)
-    lines = resolved.read_text(encoding="utf-8").splitlines()
+    read_path = _map_for_read(resolved)
+    lines = read_path.read_text(encoding="utf-8").splitlines()
 
     all_match_indices: list[int] = [
         i for i, line in enumerate(lines) if re.search(pattern, line)
@@ -322,10 +491,11 @@ def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, A
         raise ValueError("old_str must be non-empty for precise patching")
 
     resolved = _resolve_allowed_path(path, _READ_WRITE_ALLOWLIST)
-    if not resolved.exists():
+    write_path = _map_for_write(resolved)
+    if not write_path.exists():
         raise FileNotFoundError(f"Target file does not exist: {path}")
 
-    original = resolved.read_text(encoding="utf-8")
+    original = write_path.read_text(encoding="utf-8")
     occurrences = original.count(old_str)
     if occurrences == 0:
         old_lines = old_str.splitlines()
@@ -352,7 +522,7 @@ def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, A
         )
 
     updated = original.replace(old_str, new_str, 1)
-    _atomic_write(resolved, updated)
+    _atomic_write(write_path, updated)
 
     return {
         "path": str(resolved.relative_to(PROJECT_ROOT)),
@@ -371,11 +541,12 @@ def write_new_file(path: str | Path, content: str) -> dict[str, Any]:
     to modify an existing file.
     """
     resolved = _resolve_allowed_path(path, _READ_WRITE_ALLOWLIST)
-    if resolved.exists():
+    write_path = _map_for_write(resolved)
+    if write_path.exists():
         raise FileExistsError(
             f"File already exists: {path}. Use edit_file_patch to modify it."
         )
-    _atomic_write(resolved, content)
+    _atomic_write(write_path, content)
     return {
         "path": str(resolved.relative_to(PROJECT_ROOT)),
         "created": True,
@@ -387,10 +558,11 @@ def write_new_file(path: str | Path, content: str) -> dict[str, Any]:
 def overwrite_file(path: str | Path, content: str) -> dict[str, Any]:
     """Overwrite an existing file with content. Used for restore/rollback."""
     resolved = _resolve_allowed_path(path, _READ_WRITE_ALLOWLIST)
-    if not resolved.exists():
+    write_path = _map_for_write(resolved)
+    if not write_path.exists():
         raise FileNotFoundError(f"Target file does not exist: {path}")
-    original = resolved.read_text(encoding="utf-8")
-    _atomic_write(resolved, content)
+    original = write_path.read_text(encoding="utf-8")
+    _atomic_write(write_path, content)
     return {
         "path": str(resolved.relative_to(PROJECT_ROOT)),
         "overwritten": True,
@@ -491,9 +663,10 @@ def check_lean_have(
 
     # Allow reading from all allowed paths (read-write AND read-only)
     _all_readable = _READ_WRITE_ALLOWLIST + _READ_ONLY_ALLOWLIST
-    resolved = _resolve_allowed_path(file_path, _all_readable)
+    resolved_ws = _resolve_allowed_path(file_path, _all_readable)
+    source_path = _map_for_read(resolved_ws)
 
-    if not resolved.exists():
+    if not source_path.exists():
         return {
             "success": False,
             "exit_code": 1,
@@ -502,7 +675,7 @@ def check_lean_have(
             "have_statement": have_statement,
         }
 
-    content = resolved.read_text(encoding="utf-8")
+    content = source_path.read_text(encoding="utf-8")
     lines = content.splitlines(keepends=True)
 
     # Validate sorry_line (1-indexed)
@@ -548,17 +721,18 @@ def check_lean_have(
     tmp_path = PROJECT_ROOT / tmp_name
     try:
         tmp_path.write_text(modified_content, encoding="utf-8")
-        proc = subprocess.run(
-            ["lake", "env", "lean", tmp_name],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+        with _workspace_overlay_from_staging():
+            proc = subprocess.run(
+                ["lake", "env", "lean", tmp_name],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
         raw = proc.stdout + proc.stderr
         # Replace the temp filename with the original so Agent3 sees meaningful
         # line references in error messages.
-        orig_rel = str(resolved.relative_to(PROJECT_ROOT))
+        orig_rel = str(resolved_ws.relative_to(PROJECT_ROOT))
         raw_clean = raw.replace(tmp_name, orig_rel)
 
         error_lines = _extract_lean_error_lines(raw_clean)
@@ -638,20 +812,22 @@ def get_lean_goal(
 
     from orchestrator.lean_lsp import query_goal_at_sorry
 
-    return query_goal_at_sorry(
-        project_root=PROJECT_ROOT,
-        file_path=resolved,
-        sorry_line=sorry_line,
-        timeout=timeout,
-    )
+    with _workspace_overlay_from_staging():
+        return query_goal_at_sorry(
+            project_root=PROJECT_ROOT,
+            file_path=resolved,
+            sorry_line=sorry_line,
+            timeout=timeout,
+        )
 
 
 def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     """Run Lean verification and return a JSON-serializable result."""
     resolved = _resolve_allowed_path(file_path, _LEAN_VERIFY_ALLOWLIST)
+    source_path = _map_for_read(resolved)
 
     # Guard: do not run lake build if the target file does not yet exist.
-    if not resolved.exists():
+    if not source_path.exists():
         return {
             "target": str(file_path),
             "success": False,
@@ -668,24 +844,51 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
 
     # Invalidate Lake cache for this target so errors are re-emitted with
     # file:line:col locations instead of being silently replayed.
-    resolved.touch()
+    if resolved.exists():
+        resolved.touch()
 
-    build = lake_build(target=_path_to_lean_module(rel))
-    sorry_count = count_sorrys(rel)
+    raw_output = ""
+    build_returncode = 1
+    build_errors_for_parsing = ""
+    with _workspace_overlay_from_staging():
+        build = lake_build(target=_path_to_lean_module(rel))
+        build_returncode = int(build.returncode)
+        raw_output = build.errors
+        build_errors_for_parsing = build.errors
 
-    all_lines = [line.strip() for line in build.errors.splitlines() if line.strip()]
+        # Fallback: freshly-created modules can temporarily miss lake target
+        # registration; elaborate the file directly instead of failing hard.
+        if build_returncode != 0 and re.search(r"unknown target", build.errors, re.IGNORECASE):
+            import subprocess
+
+            proc = subprocess.run(
+                ["lake", "env", "lean", rel],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=LEAN_BUILD_TIMEOUT,
+            )
+            build_returncode = int(proc.returncode)
+            raw_output = (proc.stdout or "") + (proc.stderr or "")
+            build_errors_for_parsing = raw_output if build_returncode != 0 else ""
+
+        sorry_count = count_sorrys(rel)
+
+    all_lines = [line.strip() for line in raw_output.splitlines() if line.strip()]
     # Prefer lines that carry a specific file:line:col: error: location — these
     # are real Lean compiler errors.  Info/warning lines and the generic Lake
     # summary "error: build failed" are filtered into separate buckets so the
     # line-number extractor in main.py always sees the actionable errors first.
     # _extract_lean_error_lines handles both single-line and two-line Lake formats.
-    lean_error_lines = _extract_lean_error_lines(build.errors)
+    lean_error_lines = _extract_lean_error_lines(build_errors_for_parsing)
     warning_lines = [
         l for l in all_lines if re.search(r"\.lean:\d+:\d+:\s*warning:", l)
     ]
     # Fall back to error-keyword-filtered lines when no file:line:col errors found.
     # This avoids flooding Agent3 with noisy [N/M] Building ... progress lines.
-    if lean_error_lines:
+    if build_returncode == 0:
+        error_lines = []
+    elif lean_error_lines:
         error_lines = lean_error_lines
     else:
         error_lines = (
@@ -695,8 +898,8 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
 
     return {
         "target": rel,
-        "success": build.returncode == 0 and sorry_count == 0,
-        "exit_code": build.returncode,
+        "success": build_returncode == 0 and sorry_count == 0,
+        "exit_code": build_returncode,
         "sorry_count": sorry_count,
         "error_count": len(error_lines),
         "errors": error_lines,
@@ -706,12 +909,19 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
 
 def run_repo_verify() -> dict[str, Any]:
     """Run full-project Lean verification and measure total repo sorry count."""
-    build = lake_build()
-    total_sorry = 0
-    lean_files = list(PROJECT_ROOT.rglob("*.lean"))
-    for lean_file in lean_files:
-        rel = lean_file.relative_to(PROJECT_ROOT)
-        total_sorry += count_sorrys(rel)
+    with _workspace_overlay_from_staging():
+        build = lake_build()
+        total_sorry = 0
+        lean_files = list(PROJECT_ROOT.rglob("*.lean"))
+        _staging_root_local = _staging_root()
+        filtered_lean_files = []
+        for lean_file in lean_files:
+            if _staging_root_local and _is_under(lean_file.resolve(), _staging_root_local.resolve()):
+                continue
+            filtered_lean_files.append(lean_file)
+        for lean_file in filtered_lean_files:
+            rel = lean_file.relative_to(PROJECT_ROOT)
+            total_sorry += count_sorrys(rel)
 
     error_lines = [
         line.strip()
@@ -722,7 +932,7 @@ def run_repo_verify() -> dict[str, Any]:
         "success": build.returncode == 0 and total_sorry == 0,
         "exit_code": build.returncode,
         "total_sorry_count": total_sorry,
-        "lean_file_count": len(lean_files),
+        "lean_file_count": len(filtered_lean_files),
         "error_count": len(error_lines),
         "errors": error_lines,
     }
@@ -917,9 +1127,10 @@ def write_staging_lemma(
             }
 
     resolved = _resolve_allowed_path(staging_path, _STAGING_ALLOWLIST)
-    current = resolved.read_text(encoding="utf-8") if resolved.exists() else ""
+    write_path = _map_for_write(resolved)
+    current = write_path.read_text(encoding="utf-8") if write_path.exists() else ""
     separator = "\n" if current.endswith("\n") else "\n\n"
-    _atomic_write(resolved, current + separator + lean_code.strip() + "\n")
+    _atomic_write(write_path, current + separator + lean_code.strip() + "\n")
 
     return {
         "success": True,
@@ -942,10 +1153,11 @@ def apply_doc_patch(path: str | Path, anchor: str, new_content: str) -> dict[str
         raise ValueError("new_content must be non-empty")
 
     resolved = _resolve_allowed_path(path, _DOC_ALLOWLIST)
-    if not resolved.exists():
+    write_path = _map_for_write(resolved)
+    if not write_path.exists():
         raise FileNotFoundError(f"Target doc file does not exist: {path}")
 
-    original = resolved.read_text(encoding="utf-8")
+    original = write_path.read_text(encoding="utf-8")
     if new_content in original:
         return {
             "path": str(resolved.relative_to(PROJECT_ROOT)),
@@ -970,7 +1182,7 @@ def apply_doc_patch(path: str | Path, anchor: str, new_content: str) -> dict[str
     insert_at = matches[0].end()
     patch_body = "\n\n" + new_content.strip() + "\n"
     updated = original[:insert_at] + patch_body + original[insert_at:]
-    _atomic_write(resolved, updated)
+    _atomic_write(write_path, updated)
 
     return {
         "path": str(resolved.relative_to(PROJECT_ROOT)),

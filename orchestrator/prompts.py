@@ -637,6 +637,9 @@ You have access to the following tools.  Call them via JSON tool_calls.
    - After receiving Agent7 protocol, execute exactly one step at a time and call
      `run_lean_verify` after each step.
    - LIMIT: at most 2 escalations to Agent7 per attempt.
+   - If orchestrator returns `FORCE_GATE_ACTIVE`, you MUST prioritize
+     `request_agent7_interface_audit` immediately (or `request_agent2_help` only
+     as emergency fallback).
 
 1. **write_new_file(path, content)**
    - Use this FIRST when the target file does not yet exist.
