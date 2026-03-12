@@ -56,6 +56,8 @@ AGENT_CONFIGS: dict[str, dict] = {
     "sorry_closer":  {"provider": "qwen",     "model": "qwen3.5-plus", "max_tokens": 32768, "use_manifest": True},
     "persister":     {"provider": "qwen",     "model": "qwen3.5-plus", "max_tokens": 32768},
     "diagnostician": {"provider": "qwen",     "model": "qwen3.5-plus",  "max_tokens": 16384},
+    "glue_filler":   {"provider": "qwen",     "model": "qwen3.5-plus", "max_tokens": 32768, "use_manifest": True},
+    "interface_auditor": {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768},
 }
 
 # ---------------------------------------------------------------------------
@@ -133,9 +135,95 @@ LIB_GLUE_ANCHORS: dict[str, dict[str, dict[str, str]]] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Similar-algorithm references for cross-file comparison (Agent2 retry)
+# ---------------------------------------------------------------------------
+
+# Mapping: target algorithm stem (Path(target_file).stem) -> list of reference files.
+# References are similar algorithms (same archetype or structural relationship).
+ALGORITHM_REFERENCES: dict[str, list[str]] = {
+    "SVRGOuterLoop": [
+        "Algorithms/SGD.lean",
+        "Algorithms/SVRG.lean",
+        "Algorithms/WeightDecaySGD.lean",
+    ],
+    "SVRG": ["Algorithms/SGD.lean", "Algorithms/WeightDecaySGD.lean"],
+    "SGD": [],
+    "WeightDecaySGD": ["Algorithms/SGD.lean"],
+    "ProjectedGD": ["Algorithms/SGD.lean", "Algorithms/WeightDecaySGD.lean"],
+    "SubgradientMethod": ["Algorithms/SGD.lean"],
+    "ClippedSGD": ["Algorithms/SGD.lean"],
+}
+
+
+# Universal references: all algorithms can look these up.
+# Format: (path, one-line description). Excludes Lib/Glue/Staging/* (attempt-specific).
+REFERENCE_FILES_WITH_DESCRIPTIONS: list[tuple[str, str]] = [
+    (
+        "Lib/Glue/Probability.lean",
+        "概率/积分工具: probReal_univ, integral_const, IsProbabilityMeasure, HasBoundedVariance",
+    ),
+    (
+        "Lib/Glue/Algebra.lean",
+        "范数平方展开、梯度步内积代数 (norm_sq_sgd_step, proj_nonexp_sq)",
+    ),
+    (
+        "Lib/Glue/Measurable.lean",
+        "可测性与积分复合 (AEStronglyMeasurable, integrable_norm_sq_iterate_comp)",
+    ),
+    (
+        "Lib/Glue/Calculus.lean",
+        "Hilbert 空间 FTC、线段微积分 (integral_inner_gradient_segment)",
+    ),
+    (
+        "Lib/Layer0/ConvexFOC.lean",
+        "凸/强凸一阶条件 (convex_inner_lower_bound, strong_convex_inner_lower_bound)",
+    ),
+    (
+        "Lib/Layer0/GradientFTC.lean",
+        "L-smooth 梯度二次界 (lipschitz_gradient_quadratic_bound)",
+    ),
+    (
+        "Lib/Layer0/IndepExpect.lean",
+        "期望/独立性 (expectation_inner_gradL_eq, expectation_norm_sq_gradL_bound)",
+    ),
+    (
+        "Lib/Layer1/StochasticDescent.lean",
+        "StochasticDescentHyps 结构与收敛定理",
+    ),
+    (
+        "docs/GLUE_TRICKS.md",
+        "通用证明模式 (Pattern A–G, Gap Classification, Mathlib 搜索策略)",
+    ),
+]
+
+
+def _get_default_references(target_file: str) -> list[str]:
+    """Fallback when target not in ALGORITHM_REFERENCES: use all other Algorithms/*.lean."""
+    target_stem = Path(target_file).stem
+    algo_dir = PROJECT_ROOT / "Algorithms"
+    if not algo_dir.exists():
+        return []
+    refs: list[str] = []
+    for p in sorted(algo_dir.glob("*.lean")):
+        stem = p.stem
+        if stem != target_stem:
+            refs.append(str(p.relative_to(PROJECT_ROOT)))
+    return refs
+
+
 RETRY_LIMITS: dict[str, int] = {
     "MAX_PHASE2_APPROVAL_ROUNDS": 10,
     "MAX_PHASE3_RETRIES": 5,
+    "MAX_AGENT6_TOOL_TURNS": 70,
+    "MAX_AGENT6_RETRIES": 3,
+    "MAX_AGENT6_ESCALATIONS_PER_ATTEMPT": 2,
+    "AGENT6_SECOND_ESCALATION_MIN_PROGRESS": 1,
+    "AGENT6_SECOND_ESCALATION_REQUIRE_SAME_GOAL": 1,
+    "AGENT6_AUTO_ROUTE_REPEAT_THRESHOLD": 2,
+    "AGENT6_AUTO_ROUTE_MIN_TURN": 3,
+    "MAX_AGENT7_INVOCATIONS_PER_ATTEMPT": 2,
+    "AGENT7_STEP_NO_PROGRESS_THRESHOLD": 2,
 }
 
 TIMEOUTS: dict[str, int] = {

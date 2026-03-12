@@ -57,20 +57,6 @@ $$
 
 **Leverage score:** reused existing components = 10; new algorithm-specific items = 6 (`SubgradientSetup`, `process` alias, 3 process infrastructure lemmas, convergence theorem); reuse ratio = `$10/(10+6) = 62.5\%$`.
 
-### Phase 4 — SVRG Outer Loop (next)
-
-**Goal:** Formalize outer-loop snapshot update schedule and derive full SVRG convergence rate over multiple epochs.
-
-**Predicted gaps:**
-- Nested independence: snapshot `$w_k$` independent of inner-loop samples `$\xi_{k,t}$`
-- Epoch-wise expectation chaining: `$\mathbb{E}[\|w_{k+1}-w^*\|^2] \leq (1-\eta\mu)^m \mathbb{E}[\|w_k-w^*\|^2] + \text{variance term}$`
-- Two-level telescoping: combine inner-loop contraction with outer-loop snapshot variance reduction
-
-**Reuse estimate:** High — reuses SVRG inner-loop infrastructure, Layer 1 meta-theorems, independence factorization patterns (Pattern D), and `hasBoundedVariance_of_pointwise_bound`.
-**Critical dependency:** `svrg_variance_reduction` lemma (currently pending proof in `Lib/Glue/Probability.lean`).
-**Recommended next probe:** SVRG outer loop (maximizes reuse of existing infrastructure while exposing nested independence patterns).
-
-
 The Stub-Probe method is the core workflow for discovering and classifying gaps.
 
 ### Step 1: Write stubs

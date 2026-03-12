@@ -17,6 +17,8 @@ Or interactive mode::
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+from collections import Counter
 import functools
 import hashlib
 import json
@@ -45,10 +47,15 @@ from orchestrator.assumption_repair import (
     goals_to_patch_list,
 )
 from orchestrator.config import (
+    AGENT_CONFIGS,
+    ALGORITHM_REFERENCES,
     DOC_ANCHORS,
     LIB_GLUE_ANCHORS,
     MAX_PHASE3_RETRIES,
     PROJECT_ROOT,
+    REFERENCE_FILES_WITH_DESCRIPTIONS,
+    RETRY_LIMITS,
+    _get_default_references,
 )
 from orchestrator.file_io import (
     load_file,
@@ -61,7 +68,9 @@ from orchestrator.metrics import (
     count_glue_tricks_sections,
 )
 from orchestrator.prompts import (
+    AGENT_FILES,
     build_algorithm_card,
+    build_error_classification_prompt,
     load_meta_prompt_a,
     load_meta_prompt_b,
 )
@@ -72,6 +81,7 @@ from orchestrator.verify import (
     check_used_in_tags,
     lake_build,
 )
+from orchestrator.providers import call_llm
 
 console = Console()
 
@@ -96,6 +106,10 @@ _UNKNOWN_SYMBOL_RE = re.compile(
 
 # Type-class synthesis failures — always LOCAL_PROOF_ERROR, never hallucination.
 _TYPECLASS_FAIL_RE = re.compile(r"failed to synthesize instance", re.IGNORECASE)
+_TYPE_MISMATCH_RE = re.compile(
+    r"Application type mismatch|Type mismatch|Function expected",
+    re.IGNORECASE,
+)
 
 # Duplicate declarations always corrupt the target — full rewrite required.
 _DUPLICATE_DECL_RE = re.compile(r"has already been declared", re.IGNORECASE)
@@ -123,8 +137,8 @@ _LEAN_ERROR_LINE_RE = re.compile(
 _PROOF_BODY_LINE_THRESHOLD = 50
 
 # Minimum Agent2 lookup rounds required before guidance is forwarded to Agent3.
-# Set to 0 to revert to the old warning-only behaviour.
-_MIN_AGENT2_LOOKUP_ROUNDS = 2
+# Set to 0 to trust model judgment (no hard gate).
+_MIN_AGENT2_LOOKUP_ROUNDS = 0
 
 # Known Lean 4 API misspellings in staging files: wrong_pattern → correct_name_hint.
 _STAGING_API_MISSPELLINGS: dict[str, str] = {
@@ -231,11 +245,13 @@ def _classify_lean_error_structured(
     verify_text: str,
     target_file: str,
 ) -> tuple[str, list[dict]]:
-    """Four-way classifier of Lean build errors using structured error parsing.
+    """Classifier of Lean build errors using structured error parsing.
 
     Returns (classification, errors) where classification is one of:
       SIGNATURE_HALLUCINATION  — unknown symbol in the *declaration zone* of target_file
                                  (not proof body) → full rewrite allowed.
+      DEFINITION_ZONE_ERROR    — type mismatch in declaration/definition zone
+                                 (before proof body) → verify callee signature first.
       DEPENDENCY_COMPILE_ERROR — first/primary errors originate in a non-target file
                                  (e.g. staging/import dep) → fix dep, do NOT rewrite target.
       LOCAL_PROOF_ERROR        — errors are in target but in proof body, or typeclass
@@ -302,6 +318,14 @@ def _classify_lean_error_structured(
         # Typeclass failure — always a proof-body problem.
         if _TYPECLASS_FAIL_RE.search(msg):
             return "LOCAL_PROOF_ERROR", errors
+
+        # Type mismatch in declaration/definition zone usually means callee
+        # signature misuse, not a local tactic issue.
+        if _TYPE_MISMATCH_RE.search(msg):
+            tgt_path = PROJECT_ROOT / target_file
+            decl_zone_end = _get_decl_zone_end(tgt_path)
+            if line <= decl_zone_end:
+                return "DEFINITION_ZONE_ERROR", errors
 
         if _UNKNOWN_SYMBOL_RE.search(msg):
             # Only SIGNATURE_HALLUCINATION when error is in the declaration zone:
@@ -428,6 +452,52 @@ def _extract_imported_algo_sigs(target_file: str) -> str:
     return (
         "## Auto-injected API signatures from imported algorithm files\n\n"
         + "\n\n".join(sections)
+    )
+
+
+def _extract_staging_sigs(staging_path: "Path") -> str:
+    """Return a compact signature block for all theorem/lemma/def in a staging file.
+
+    Reuses the same parsing logic as _extract_imported_algo_sigs: collect declaration
+    lines until proof body, strip at `:=`. Generic — works for any staging file.
+    """
+    if not staging_path.exists():
+        return ""
+    try:
+        algo_lines = staging_path.read_text(encoding="utf-8").splitlines()
+    except Exception:  # noqa: BLE001
+        return ""
+    sigs: list[str] = []
+    i = 0
+    while i < len(algo_lines):
+        line = algo_lines[i]
+        if not _DECL_START.match(line):
+            i += 1
+            continue
+        sig: list[str] = [line]
+        j = i + 1
+        while j < len(algo_lines):
+            next_line = algo_lines[j]
+            if next_line.strip() == "" or _TOP_LEVEL_KEYWORDS.match(next_line):
+                break
+            stripped = next_line.lstrip()
+            if stripped.startswith("| ") or re.match(r"^\s*by\b", next_line):
+                break
+            sig.append(next_line)
+            j += 1
+        sig_text = "\n".join(sig)
+        if ":=" in sig_text:
+            sig_text = sig_text[: sig_text.index(":=")].rstrip()
+        if sig_text.strip():
+            sigs.append(sig_text)
+        i = j
+    if not sigs:
+        return ""
+    staging_rel = str(staging_path.relative_to(PROJECT_ROOT)) if PROJECT_ROOT in staging_path.parents else str(staging_path)
+    return (
+        f"## Staging lemma signatures (auto-extracted from {staging_rel})\n\n"
+        + "\n\n".join(sigs)
+        + "\n\n"
     )
 
 
@@ -674,6 +744,8 @@ def _infer_failure_class(error_type: str, message: str) -> str:
     """Map an error type + message to a human-readable failure class for history."""
     if error_type == "DEPENDENCY_COMPILE_ERROR":
         return "SymbolMissing"
+    if error_type == "DEFINITION_ZONE_ERROR":
+        return "DefinitionMismatch"
     if error_type == "SIGNATURE_HALLUCINATION":
         return "Structural"
     msg = message.lower()
@@ -686,6 +758,226 @@ def _infer_failure_class(error_type: str, message: str) -> str:
     if "unknown identifier" in msg or "unknown constant" in msg:
         return "UnknownIdent"
     return "Tactical"
+
+
+def _llm_classify_error(
+    primary_error: dict,
+    file_context: str,
+    target_file: str,
+) -> dict:
+    """Call LLM to classify error into locus, nature, suggested_strategy.
+
+    Returns {"locus": str, "nature": str, "suggested_strategy": str, "reasoning": str}.
+    Falls back to legacy _infer_failure_class-style values if LLM fails or times out.
+    """
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
+    cfg = AGENT_CONFIGS.get("planner", AGENT_CONFIGS.get("diagnostician", {}))
+    provider = cfg.get("provider", "qwen")
+    model = cfg.get("model", "qwen3.5-plus")
+    max_tokens = cfg.get("max_tokens", 2048)
+
+    prompt = build_error_classification_prompt(primary_error, file_context, target_file)
+
+    def _call() -> str:
+        return call_llm(
+            provider,
+            model,
+            "You are a Lean 4 error classifier. Reply with JSON only.",
+            [{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_call)
+            raw = fut.result(timeout=15)
+    except (FuturesTimeoutError, Exception) as exc:
+        fallback = _infer_failure_class(
+            "PROOF_ERROR", primary_error.get("message", "")
+        )
+        return {
+            "locus": "proof_body",
+            "nature": "other",
+            "suggested_strategy": "other",
+            "reasoning": f"LLM classification failed ({exc!r}); fallback to legacy.",
+        }
+
+    # Parse JSON from response
+    raw = raw.strip()
+    for candidate in _json_candidates(raw):
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return {
+                    "locus": str(obj.get("locus", "proof_body")),
+                    "nature": str(obj.get("nature", "other")),
+                    "suggested_strategy": str(obj.get("suggested_strategy", "other")),
+                    "reasoning": str(obj.get("reasoning", "")),
+                }
+        except json.JSONDecodeError:
+            continue
+    return {
+        "locus": "proof_body",
+        "nature": "other",
+        "suggested_strategy": "other",
+        "reasoning": "LLM returned invalid JSON; fallback.",
+    }
+
+
+def _should_route_to_agent6_for_infra(
+    last_verify_text: str,
+    target_file: str,
+    structured_errors: list[dict],
+    tool_turn: int,
+    last_local_error_sig: str | None,
+) -> tuple[bool, str]:
+    """Decide if we should auto-route to Agent6 for an infra gap.
+
+    Returns (should_route, diagnosis). Trigger when:
+    1. Error looks like infra-only (add_lemma / add_glue_lemma or pattern match)
+    2. We need to solve now (repeated error or turn >= min)
+
+    Uses pattern detection first; LLM fallback when uncertain.
+    """
+    from orchestrator.config import RETRY_LIMITS
+
+    repeat_threshold = RETRY_LIMITS.get("AGENT6_AUTO_ROUTE_REPEAT_THRESHOLD", 2)
+    min_turn = RETRY_LIMITS.get("AGENT6_AUTO_ROUTE_MIN_TURN", 3)
+
+    # Build error signature: (file, line, first 200 chars of msg)
+    primary = structured_errors[0] if structured_errors else {}
+    err_sig = (
+        f"{primary.get('file', '')}:{primary.get('line', 0)}:"
+        f"{str(primary.get('message', ''))[:200]}"
+    )
+    is_repeated = last_local_error_sig is not None and err_sig == last_local_error_sig
+    turn_ok = tool_turn >= min_turn
+
+    # Need to solve now: same error repeated OR we're past min turn
+    need_now = is_repeated or turn_ok
+
+    if not need_now:
+        return False, ""
+
+    # Infra detection: pattern-based first
+    _EXPECTED_TYPE_GOT_RE = re.compile(r"expected\s+type\s+.*\s+but\s+got", re.IGNORECASE)
+    _APP_MISMATCH_RE = re.compile(
+        r"application\s*(?:type\s+)?mismatch|type\s+mismatch",
+        re.IGNORECASE,
+    )
+    _OMEGA_E_TYPE_RE = re.compile(r"\b(?:Ω|omega)\s*(?:→|->)\s*E\b|E\s*(?:→|->)\s*(?:Ω|omega)", re.IGNORECASE)
+    _BRIDGE_KEYWORDS_RE = re.compile(
+        r"\b(integral|fubini|measur|aestronglymeasurable|aemeasurable|expectation|condexp|bochner)\b",
+        re.IGNORECASE,
+    )
+    _UNKNOWN_ID_LEMMA_LIKE_RE = re.compile(
+        r"unknown identifier[^`]*`([a-zA-Z][a-zA-Z0-9_]*(?:\.[a-zA-Z][a-zA-Z0-9_]*)*)`",
+        re.IGNORECASE,
+    )
+    # Exclude hypothesis-like names (h_xxx, hη, hL) — those are tactical
+    _HYPOTHESIS_LIKE_RE = re.compile(r"^h[a-zA-Z0-9_]*$")
+    # Local/binder-like identifiers (often tactical typos), including unicode subscripts
+    _LOCAL_OR_UNICODE_IDENT_RE = re.compile(
+        r"^[a-zA-Z](?:[a-zA-Z0-9']{0,2}|[₀₁₂₃₄₅₆₇₈₉]+|[a-zA-Z0-9']*[₀₁₂₃₄₅₆₇₈₉]+)$"
+    )
+    # External theorem/API-like identifier pattern
+    _API_LIKE_RE = re.compile(r"(?:\.)|(?:_[a-zA-Z0-9_]+)")
+
+    verify_lower = last_verify_text.lower()
+    has_type_mismatch = bool(
+        _EXPECTED_TYPE_GOT_RE.search(verify_lower) or _APP_MISMATCH_RE.search(verify_lower)
+    )
+    has_omega_e_bridge = bool(_OMEGA_E_TYPE_RE.search(last_verify_text))
+    has_bridge_keywords = bool(_BRIDGE_KEYWORDS_RE.search(verify_lower))
+    unknown_matches = list(_UNKNOWN_ID_LEMMA_LIKE_RE.finditer(last_verify_text))
+
+    pattern_infra = False
+    # Route type-mismatch to Agent6 only when it looks structural (bridge-level),
+    # not purely tactical.
+    if has_type_mismatch and (has_omega_e_bridge or has_bridge_keywords):
+        pattern_infra = True
+    for m in unknown_matches:
+        ident = m.group(1)
+        leaf = ident.split(".")[-1]
+        if _HYPOTHESIS_LIKE_RE.match(leaf):
+            continue
+        if _LOCAL_OR_UNICODE_IDENT_RE.match(leaf):
+            continue
+        if _API_LIKE_RE.search(ident):
+            pattern_infra = True
+            break
+
+    if pattern_infra:
+        diag = (
+            "Pattern: structural bridge mismatch (Ω/E, integral/measurability/expectation) "
+            "or unknown external API-like identifier requiring glue lemma."
+        )
+        return True, diag
+
+    # Optional LLM fallback for add_lemma / add_glue_lemma
+    err_line = primary.get("line")
+    try:
+        file_ctx = _build_escalation_file_context(target_file, int(err_line) if err_line else None)
+    except Exception:
+        file_ctx = ""
+    llm_result = _llm_classify_error(primary, file_ctx[:1500], target_file)
+    strategy = (llm_result.get("suggested_strategy") or "").lower()
+    if strategy in ("add_lemma", "add_glue_lemma"):
+        return True, f"LLM: suggested_strategy={strategy}"
+
+    return False, ""
+
+
+def _get_reference_files_with_descriptions(target_file: str) -> list[tuple[str, str]]:
+    """Merge universal refs (Lib/Glue, Layer0, Layer1, GLUE_TRICKS) + algorithm refs.
+
+    Returns list of (path, description). Algorithm refs get description '(similar algorithm)'.
+    """
+    result: list[tuple[str, str]] = list(REFERENCE_FILES_WITH_DESCRIPTIONS)
+    algo_refs = ALGORITHM_REFERENCES.get(
+        Path(target_file).stem, _get_default_references(target_file)
+    )
+    seen: set[str] = {p for p, _ in result}
+    for path in algo_refs:
+        if path not in seen:
+            seen.add(path)
+            result.append((path, "(similar algorithm)"))
+    return result
+
+
+def _format_ref_and_classification_blocks(
+    reference_files: list[tuple[str, str]],
+    llm_classification: dict | None,
+) -> str:
+    """Format REFERENCE FILES and ERROR CLASSIFICATION blocks for Agent2 context."""
+    parts: list[str] = []
+    if reference_files:
+        table_lines = [
+            "| File | Purpose |",
+            "|------|---------|",
+        ]
+        for path, desc in reference_files:
+            table_lines.append(f"| {path} | {desc} |")
+        parts.append(
+            "## REFERENCE FILES (compare with working examples)\n"
+            "Use search_codebase or read_file to fetch relevant sections.\n\n"
+            + "\n".join(table_lines)
+            + "\n"
+        )
+    if llm_classification:
+        parts.append(
+            "## ERROR CLASSIFICATION (from diagnostician)\n"
+            f"Locus: {llm_classification['locus']} | Nature: {llm_classification['nature']} | "
+            f"Suggested strategy: {llm_classification['suggested_strategy']}\n"
+            f"Reasoning: {llm_classification['reasoning']}\n"
+            "Follow the Cross-File Comparison Protocol. Use the suggested_strategy to choose "
+            "your approach. For add_instance: suggest adding haveI/letI before the failing line. "
+            "For compare_with_reference: use the reference files above.\n"
+        )
+    if parts:
+        return "\n" + "\n".join(parts) + "\n"
+    return ""
 
 
 def _format_failed_approaches(approaches: list[dict]) -> str:
@@ -708,12 +1000,200 @@ def _format_failed_approaches(approaches: list[dict]) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+def _extract_error_identifiers(error_text: str, limit: int = 8) -> list[str]:
+    """Extract likely function/lemma identifiers from Lean error text."""
+    if not error_text:
+        return []
+    candidates: list[str] = []
+    patterns = [
+        r"Function `([A-Za-z_]\w*)`",
+        r"`([A-Za-z_]\w*)`",
+        r"unknown (?:identifier|constant|theorem) ['`]?([A-Za-z_]\w*)['`]?",
+    ]
+    for pat in patterns:
+        candidates.extend(re.findall(pat, error_text))
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in candidates:
+        lname = name.lower()
+        if (
+            name in seen
+            or len(name) < 3
+            or lname in {"error", "line", "type", "function", "argument"}
+        ):
+            continue
+        seen.add(name)
+        out.append(name)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _infer_definition_file_from_registry(
+    registry: "ToolRegistry",
+    identifier: str,
+    target_file: str,
+) -> str | None:
+    """Infer likely definition file for an identifier via search_codebase."""
+    try:
+        result = registry.call("search_codebase", query=identifier)
+    except Exception:  # noqa: BLE001
+        return None
+    text = str(result or "")
+    if not text:
+        return None
+    paths = re.findall(r"([A-Za-z0-9_./-]+\.lean)", text)
+    if not paths:
+        return None
+    for p in paths:
+        if Path(p).name != Path(target_file).name:
+            return p
+    return paths[0]
+
+
+def _build_stale_error_hint(
+    registry: "ToolRegistry",
+    target_file: str,
+    error_text: str,
+    err_line_no: int | None,
+    stale_count: int,
+) -> str:
+    """Build forced-read guidance when the same failing line repeats."""
+    identifiers = _extract_error_identifiers(error_text, limit=1)
+    ident = identifiers[0] if identifiers else "the called function"
+    inferred = (
+        _infer_definition_file_from_registry(registry, ident, target_file)
+        if identifiers
+        else None
+    )
+    suggested_read = (
+        f'{{"tool": "read_file", "arguments": {{"path": "{inferred}"}}}}'
+        if inferred
+        else '{"tool": "search_codebase", "arguments": {"query": "<failing function name>"}}'
+    )
+    line_display = str(err_line_no) if err_line_no is not None else "unknown"
+    return (
+        "## STALE ERROR GUARD\n"
+        f"Line {line_display} has failed {stale_count} consecutive verify turns unchanged.\n"
+        f"Before editing again, you MUST read the definition of `{ident}` to confirm its exact signature.\n"
+        "Repeated patching without reading dependency definitions will not converge.\n"
+        f"Suggested next action: {suggested_read}\n"
+    )
+
+
+def _prequery_dependency_signatures(
+    errors_text: str,
+    target_file: str,
+    max_symbols: int = 3,
+) -> str:
+    """Attach key dependency signatures extracted from recent Lean errors."""
+    identifiers = _extract_error_identifiers(errors_text, limit=max_symbols * 2)
+    if not identifiers:
+        return ""
+
+    candidate_files = [target_file] + AGENT_FILES.get("sorry_closer", [])
+    seen_files: set[str] = set()
+    lean_files: list[Path] = []
+    for rel in candidate_files:
+        if not isinstance(rel, str) or not rel.endswith(".lean"):
+            continue
+        if rel in seen_files:
+            continue
+        seen_files.add(rel)
+        p = PROJECT_ROOT / rel
+        if p.exists():
+            lean_files.append(p)
+
+    snippets: list[str] = []
+    seen_syms: set[str] = set()
+    for ident in identifiers:
+        if ident in seen_syms:
+            continue
+        pat = re.compile(
+            rf"^\s*(?:noncomputable\s+)?(?:def|theorem|lemma|abbrev|structure|class|instance)\s+{re.escape(ident)}\b"
+        )
+        found = False
+        for fp in lean_files:
+            try:
+                lines = fp.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for i, ln in enumerate(lines):
+                if not pat.match(ln):
+                    continue
+                start = max(0, i - 5)
+                end = min(len(lines), i + 6)
+                snippet = "\n".join(lines[start:end])
+                rel = str(fp.relative_to(PROJECT_ROOT))
+                snippets.append(f"-- Source: {rel}:{i + 1}\n{snippet}")
+                seen_syms.add(ident)
+                found = True
+                break
+            if found:
+                break
+        if len(snippets) >= max_symbols:
+            break
+
+    if not snippets:
+        return ""
+    return (
+        "## Dependency Signatures (auto-extracted from errors)\n"
+        + "\n\n".join(snippets)
+        + "\n\n"
+    )
+
+
+def _generate_attempt_diagnosis(
+    attempt: int,
+    attempt_failures_current: list[dict],
+    tools_used: set[str],
+    registry: "ToolRegistry",
+    target_file: str,
+) -> str:
+    """Generate deterministic attempt-level diagnosis summary for Agent2."""
+    if not attempt_failures_current:
+        return ""
+    line_counts = Counter(
+        int(a.get("line", -1))
+        for a in attempt_failures_current
+        if isinstance(a.get("line"), int) and int(a.get("line", -1)) > 0
+    )
+    persistent_line = None
+    persistent_count = 0
+    if line_counts:
+        persistent_line, persistent_count = line_counts.most_common(1)[0]
+
+    initial_sorry = int(attempt_failures_current[0].get("sorry_count", 0))
+    final_sorry = int(attempt_failures_current[-1].get("sorry_count", 0))
+    delta = final_sorry - initial_sorry
+    primary_msg = str(attempt_failures_current[-1].get("message", ""))[:120]
+    identifiers = _extract_error_identifiers(primary_msg, limit=1)
+    ident = identifiers[0] if identifiers else "unknown"
+    inferred = (
+        _infer_definition_file_from_registry(registry, ident, target_file)
+        if identifiers
+        else None
+    )
+    inferred_display = inferred or "(unresolved)"
+    line_display = str(persistent_line) if persistent_line is not None else "unknown"
+    tools_display = ", ".join(sorted(tools_used)) if tools_used else "(none recorded)"
+    return (
+        f"[ATTEMPT {attempt} DIAGNOSIS]\n"
+        f"- Persistent error: line {line_display} appeared {persistent_count}/{len(attempt_failures_current)} failing verifies "
+        f"(latest: {primary_msg or 'n/a'})\n"
+        f"- Sorry trajectory: {initial_sorry} -> {final_sorry} (net change: {delta:+d})\n"
+        f"- Approaches tried (tools): {tools_display}\n"
+        f"- Recommended focus: read definition of `{ident}` in {inferred_display} before next patch.\n\n"
+    )
+
+
 def _prequery_sorry_goals(
     registry: "ToolRegistry",
     target_file: str,
     guidance: str,
     goal_cache: dict,
     staging_has_errors: bool,
+    errors_text: str = "",
 ) -> str:
     """Query Lean LSP for proof goals at all sorry locations in the target file.
 
@@ -766,8 +1246,9 @@ def _prequery_sorry_goals(
     # Merge: file-scan first (deterministic ordering), guidance as supplement.
     sorry_lines = list(dict.fromkeys(file_sorry_lines + guidance_sorry_lines))
 
+    dep_block = _prequery_dependency_signatures(errors_text, target_file)
     if not sorry_lines:
-        return ""
+        return dep_block
 
     results: list[str] = []
     for line in sorry_lines[:6]:  # cap at 6 lines to limit total LSP time
@@ -796,12 +1277,12 @@ def _prequery_sorry_goals(
         results.append(entry)
 
     if not results:
-        return ""
+        return dep_block
 
     header = "## Pre-queried Lean Goal States (from LSP — authoritative)\n"
     header += "Use these exact types when formulating `have` steps.\n"
     body = "\n".join(results)
-    return header + body + "\n\n"
+    return header + body + "\n\n" + dep_block
 
 
 def _retrieve_catalog_context(
@@ -1060,15 +1541,24 @@ def _parse_persister_json(raw: str) -> list:
     Coerces a bare JSON object into a single-element list for forward compatibility."""
     text = raw.strip()
     # Step 1: Strip markdown code block if present.
-    # Use flexible regex: \s* allows no newline between ``` and JSON; (.*?)\s* allows
-    # content with or without trailing newline before closing ```.
     match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
     if match:
         text = match.group(1).strip()
-    # Step 2: Parse first complete JSON value only (ignore trailing commentary)
+    text = text.strip()
+    if not text:
+        raise ValueError("Persister output is empty")
+    # Step 2: If text doesn't start with { or [, find first occurrence (Agent4 may return prose before JSON)
+    start_idx = 0
+    for i, c in enumerate(text):
+        if c in ('{', '['):
+            start_idx = i
+            break
+    else:
+        raise ValueError("No JSON object or array found in persister output")
+    # Step 3: Parse from the first { or [
     decoder = json.JSONDecoder()
-    obj, _ = decoder.raw_decode(text)
-    # Step 3: Coerce bare object to list (Agent4 sometimes returns a single op as an object)
+    obj, _ = decoder.raw_decode(text, start_idx)
+    # Step 4: Coerce bare object to list (Agent4 sometimes returns a single op as an object)
     if isinstance(obj, dict):
         obj = [obj]
     return obj
@@ -1151,50 +1641,7 @@ def _call_agent2_with_tools(
         )
 
         if not is_lookup:
-            # Agent2 declared final guidance.  Apply hard gate first.
-            if _lookup_rounds_performed < _MIN_AGENT2_LOOKUP_ROUNDS:
-                remaining = _MIN_AGENT2_LOOKUP_ROUNDS - _lookup_rounds_performed
-                forced_prompt = (
-                    f"[LOOKUP GATE] You have only performed {_lookup_rounds_performed} "
-                    f"lookup round(s). At least {_MIN_AGENT2_LOOKUP_ROUNDS} are required "
-                    "before guidance can be forwarded to Agent3.\n\n"
-                    f"You must perform {remaining} more lookup round(s). "
-                    "Issue a search_codebase or read_file lookup for each identifier "
-                    "appearing in your proposed patch that you have not yet verified. "
-                    "Reply with a lookup JSON block:\n"
-                    '{"type": "lookup", "tool_calls": [{"tool": "search_codebase", '
-                    '"arguments": {"query": "<identifier>"}}]}'
-                )
-                reply = agent2.call(forced_prompt)
-                continue  # re-enter loop to process the forced lookup
-
-            # Symbol evidence gate: verify patch identifiers against lookup results.
-            candidate_names = _extract_new_identifiers_from_guidance(reply)
-            unverified = [
-                name for name in candidate_names
-                if name not in _accumulated_lookup_text
-            ]
-            # Only demand re-check for names that really look like project/Mathlib APIs.
-            unverified_significant = [
-                n for n in unverified
-                if "." in n or (
-                    len(n.split("_")) >= 2 and n not in _LEAN_KEYWORDS
-                )
-            ]
-            if unverified_significant and _round < max_tool_rounds - 1:
-                sample = ", ".join(unverified_significant[:5])
-                evidence_prompt = (
-                    f"[SYMBOL EVIDENCE GATE] The following identifiers appear in your "
-                    f"guidance/patch but were NOT found in your lookup results: {sample}.\n\n"
-                    "You must search for each one before guidance can be forwarded. "
-                    "Issue lookup tool_calls now:\n"
-                    '{"type": "lookup", "tool_calls": [{"tool": "search_codebase", '
-                    '"arguments": {"query": "<name>"}}]}'
-                )
-                reply = agent2.call(evidence_prompt)
-                continue  # re-enter to process symbol evidence lookups
-
-            # All gates passed — return final guidance.
+            # Agent2 declared final guidance.  No hard gate — trust model judgment.
             break
 
         # Execute the lookup round.
@@ -1237,18 +1684,253 @@ def _call_agent2_with_tools(
             + "\n\nContinue planning or issue more lookups if still needed."
         )
 
-    # If the loop ended without any lookups at all, attach an unverified warning
-    # (this can happen if the agent never produced a parseable lookup despite prompting).
-    if _lookup_rounds_performed == 0:
-        reply = (
-            "⚠ WARNING: Agent2 produced guidance without performing any "
-            "signature lookups (hard gate was not enforced this round). "
-            "All lemma/theorem names are UNVERIFIED. "
-            "Before applying any patch, call search_in_file to confirm each "
-            "lemma exists with the expected signature.\n\n"
-        ) + reply
-
     return reply
+
+
+def _call_agent7_with_tools(
+    agent7: "Agent",
+    registry: "ToolRegistry",
+    user_msg: str,
+    max_tool_rounds: int = 6,
+) -> tuple[dict | None, str]:
+    """Call Agent7 with read-only lookup support and parse strict JSON protocol."""
+    reply = agent7.call(user_msg)
+    for _ in range(max_tool_rounds):
+        payload = None
+        try:
+            payload = json.loads(reply)
+        except (json.JSONDecodeError, ValueError):
+            payload = None
+        is_lookup = (
+            isinstance(payload, dict)
+            and payload.get("type") == "lookup"
+            and isinstance(payload.get("tool_calls"), list)
+            and len(payload["tool_calls"]) > 0
+        )
+        if not is_lookup:
+            break
+        results: list[dict] = []
+        for tc in payload["tool_calls"]:
+            if not isinstance(tc, dict):
+                continue
+            tool_name = tc.get("tool", "")
+            args = tc.get("arguments", {}) if isinstance(tc.get("arguments"), dict) else {}
+            try:
+                result = registry.call(tool_name, **args)
+            except Exception as exc:  # noqa: BLE001
+                result = {"error": str(exc)}
+            results.append({"tool": tool_name, "arguments": args, "result": result})
+        results_text = json.dumps(results, indent=2, ensure_ascii=False)
+        reply = agent7.call(
+            "Lookup results:\n"
+            + results_text
+            + "\n\nReturn the final strict JSON protocol now (no prose)."
+        )
+
+    for candidate in _json_candidates(reply.strip()):
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(obj, dict)
+            and isinstance(obj.get("ordered_steps"), list)
+            and obj.get("root_cause")
+        ):
+            return obj, reply
+    return None, reply
+
+
+def _run_agent6_glue_loop(
+    agent6: "Agent",
+    registry: "ToolRegistry",
+    target_file: str,
+    staging_path: Path,
+    staging_rel: str,
+    goal: str,
+    error_message: str,
+    diagnosis: str,
+    target_algo: str,
+    *,
+    hypotheses: list[str] | None = None,
+    extra_context: str | None = None,
+    stuck_line: int | None = None,
+    max_tool_turns: int = 70,
+    max_retries: int = 3,
+) -> tuple[bool, str]:
+    """Run Agent6 (Glue Filler) to prove a glue lemma that bridges to the given goal.
+
+    Returns (success, message). On success, staging compiles (exit_code=0); sorry in body OK.
+    """
+    from orchestrator.config import RETRY_LIMITS
+    from orchestrator.tools import check_lean_have, get_lean_goal
+
+    max_tool_turns = RETRY_LIMITS.get("MAX_AGENT6_TOOL_TURNS", 70)
+    max_retries = RETRY_LIMITS.get("MAX_AGENT6_RETRIES", 3)
+
+    ref_files = _get_reference_files_with_descriptions(target_file)
+    ref_block = _format_ref_and_classification_blocks(ref_files, None)
+    target_snippet = _build_escalation_file_context(target_file, stuck_line)
+    staging_content = staging_path.read_text(encoding="utf-8") if staging_path.exists() else "(empty)"
+
+    prompt_parts = [
+        "## GLUE LEMMA REQUEST\n"
+        "Agent3 is stuck on a structural gap. Prove a glue lemma that bridges to this goal.\n\n"
+        f"### Goal (⊢ T) from the stuck sorry\n```\n{goal}\n```\n\n"
+        f"### Error message\n```\n{error_message}\n```\n\n"
+        f"### Diagnosis\n{diagnosis}\n\n"
+    ]
+    if hypotheses:
+        hyp_text = "\n".join(hypotheses)
+        prompt_parts.append(f"### Hypotheses at sorry\n```\n{hyp_text}\n```\n\n")
+    if extra_context:
+        prompt_parts.append(f"### Agent3 extra context (what was tried, why lemma needed)\n```\n{extra_context}\n```\n\n")
+    prompt_parts.extend([
+        (
+            f"### Target file context (read-only; focus around stuck line {stuck_line})\n"
+            f"```lean\n{target_snippet[:8000]}\n```\n\n"
+            if stuck_line is not None
+            else f"### Target file context (read-only)\n```lean\n{target_snippet[:8000]}\n```\n\n"
+        ),
+        f"### Staging file (edit this)\n```lean\n{staging_content}\n```\n"
+        f"{ref_block}\n"
+        "### Tool parameter contract (MUST follow exactly)\n"
+        "- write_staging_lemma arguments must be exactly:\n"
+        "  {\"staging_path\": \"Lib/Glue/Staging/<Algo>.lean\", \"lean_code\": \"theorem ... := by ...\"}\n"
+        "- edit_file_patch arguments must be exactly:\n"
+        "  {\"path\": \"Lib/Glue/Staging/<Algo>.lean\", \"old_str\": \"...\", \"new_str\": \"...\"}\n"
+        "  (Do NOT send unified diff `patch`)\n"
+        "- read_file arguments: {\"path\": \"...\", \"start_line\": N, \"end_line\": M}\n"
+        "- run_lean_verify arguments: {\"file_path\": \"...\"}\n"
+        "- get_lean_goal arguments: {\"file_path\": \"...\", \"sorry_line\": N}\n\n"
+        "Prove a glue lemma. Write it to staging via write_staging_lemma or edit_file_patch. "
+        "After run_lean_verify returns exit_code=0 for staging, immediately return tool=done. "
+        "Signature must typecheck; sorry in body is OK; admit is FORBIDDEN. "
+        "Return valid JSON: thought, tool, arguments. Output ONE action per response."
+    ])
+    initial_prompt = "".join(prompt_parts)
+
+    for retry in range(max_retries):
+        staging_touched = False
+        agent6.messages = []
+        raw_reply = agent6.call(initial_prompt)
+        for turn in range(max_tool_turns):
+            try:
+                payload = json.loads(raw_reply)
+            except json.JSONDecodeError:
+                raw_reply = agent6.call(
+                    "Invalid JSON. Return valid JSON with thought, tool, arguments."
+                )
+                continue
+            if not isinstance(payload, dict):
+                raw_reply = agent6.call("JSON must be an object. Retry.")
+                continue
+
+            tool_name = str(payload.get("tool", ""))
+            arguments = payload.get("arguments", {}) or {}
+
+            if tool_name == "done":
+                verify = registry.call("run_lean_verify", staging_rel)
+                exit_code = int(verify.get("exit_code", 1))
+                if exit_code == 0:
+                    return True, (
+                        "## Agent6 succeeded\n"
+                        "Glue lemma added to staging. Build is clean. Continue with your proof."
+                    )
+                raw_reply = agent6.call(
+                    f"## done rejected — staging build failed\n"
+                    f"```\n{verify.get('errors', [])}\n```\n"
+                    "Fix staging errors, then signal done again."
+                )
+                continue
+
+            # Normalize path → file_path for tools that accept both
+            args = dict(arguments)
+            if "path" in args and "file_path" not in args:
+                for k in ("get_lean_goal", "check_lean_have", "run_lean_verify"):
+                    if tool_name == k or k in tool_name:
+                        args["file_path"] = args.pop("path", args.get("path"))
+                        break
+            if tool_name in ("edit_file_patch", "write_staging_lemma"):
+                if "path" in args and args["path"] != staging_rel:
+                    args["path"] = staging_rel
+                if "staging_path" in args:
+                    args["staging_path"] = staging_rel
+
+            try:
+                result = registry.call(tool_name, **args)
+            except KeyError:
+                raw_reply = agent6.call(
+                    f"Tool `{tool_name}` not registered. Use: read_file, search_codebase, "
+                    "write_staging_lemma, edit_file_patch, run_lean_verify, get_lean_goal, check_lean_have."
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                if tool_name == "write_staging_lemma":
+                    raw_reply = agent6.call(
+                        "Tool error: "
+                        + err
+                        + "\nUse EXACT arguments:\n"
+                        '{"tool":"write_staging_lemma","arguments":{"staging_path":"'
+                        + staging_rel
+                        + '","lean_code":"theorem ... := by ..."}}'
+                    )
+                elif tool_name == "edit_file_patch":
+                    if isinstance(arguments, dict) and "patch" in arguments:
+                        raw_reply = agent6.call(
+                            "Tool error: edit_file_patch does NOT accept `patch` unified diff.\n"
+                            "Use EXACT arguments:\n"
+                            '{"tool":"edit_file_patch","arguments":{"path":"'
+                            + staging_rel
+                            + '","old_str":"<exact existing text>","new_str":"<replacement text>"}}'
+                        )
+                    else:
+                        raw_reply = agent6.call(
+                            "Tool error: "
+                            + err
+                            + "\nedit_file_patch requires {path, old_str, new_str}."
+                        )
+                elif tool_name == "read_file":
+                    if isinstance(arguments, dict) and "file_path" in arguments:
+                        raw_reply = agent6.call(
+                            "Tool error: read_file expects `path` (not `file_path`).\n"
+                            "Use: "
+                            '{"tool":"read_file","arguments":{"path":"'
+                            + str(arguments.get("file_path"))
+                            + '"}}'
+                        )
+                    else:
+                        raw_reply = agent6.call(f"Tool error: {err}")
+                else:
+                    raw_reply = agent6.call(f"Tool error: {err}")
+                continue
+
+            if tool_name == "write_staging_lemma" and isinstance(result, dict):
+                if bool(result.get("success")):
+                    staging_touched = True
+            elif tool_name == "edit_file_patch" and isinstance(result, dict):
+                if bool(result.get("changed")) or int(result.get("replacements", 0)) > 0:
+                    staging_touched = True
+
+            if (
+                tool_name == "run_lean_verify"
+                and isinstance(result, dict)
+                and staging_touched
+                and int(result.get("exit_code", 1)) == 0
+            ):
+                return True, (
+                    "## Agent6 succeeded\n"
+                    "Glue lemma added to staging. Build is clean. Continue with your proof."
+                )
+
+            if isinstance(result, dict):
+                result_text = json.dumps(result, indent=2, ensure_ascii=False)
+            else:
+                result_text = str(result)
+            raw_reply = agent6.call(f"## {tool_name} result\n```\n{result_text}\n```\n")
+
+    return False, "Agent6 could not prove glue. Escalating to Agent2."
 
 
 # ---------------------------------------------------------------------------
@@ -1284,7 +1966,7 @@ def _execute_single_tool_and_format(
             f"## Tool error\ntool `{tool_name}` is not registered. "
             f"Available: read_file, search_in_file, edit_file_patch, write_new_file, "
             f"write_staging_lemma, get_lean_goal, check_lean_have, run_lean_verify, "
-            f"request_agent2_help.\nError: {exc}\n"
+            f"request_agent6_glue, request_agent2_help, request_agent7_interface_audit.\nError: {exc}\n"
             "Choose a valid tool.",
             None,
             False,
@@ -1793,6 +2475,17 @@ def phase3_prove(
     # Staging registry: read tools + write_staging_lemma for Agent2 mid-proof escalation.
     staging_registry = ToolRegistry()
     staging_registry.register_staging_tools(target_algo=_algo_name_for_staging)
+    # Agent6 (Glue Filler): staging tools + get_lean_goal + check_lean_have for glue proof.
+    agent6 = Agent("glue_filler", extra_files=[target_file])
+    agent6_registry = ToolRegistry()
+    agent6_registry.register_staging_tools(target_algo=_algo_name_for_staging)
+    # Agent7 (Interface Auditor): read-only lookup + strict execution protocol output.
+    agent7 = Agent("interface_auditor", extra_files=[target_file])
+    agent7_registry = ToolRegistry()
+    agent7_registry.register_readonly_tools()
+    from orchestrator.tools import check_lean_have, get_lean_goal
+    agent6_registry.register("get_lean_goal", get_lean_goal)
+    agent6_registry.register("check_lean_have", check_lean_have)
     diag_log: list[str] = []
 
     # Pre-check: if the target file already has 0 sorry and builds clean,
@@ -1809,6 +2502,10 @@ def phase3_prove(
             return True, 0, "", {
                 "execution_history": [],
                 "attempt_failures": [],
+                "agent7_invocations": [],
+                "agent7_step_execution_log": [],
+                "agent7_plan_revisions": [],
+                "agent7_blocked_actions": [],
                 "estimated_token_consumption": 0,
                 "retry_count": 0,
             }
@@ -1915,6 +2612,10 @@ def phase3_prove(
     attempts = 0
     execution_history: list[ExecutionResult] = []
     attempt_failures: list[dict] = []
+    agent7_invocations: list[dict] = []
+    agent7_step_execution_log: list[dict] = []
+    agent7_plan_revisions: list[dict] = []
+    agent7_blocked_actions: list[dict] = []
     token_char_budget = 0
 
     # Circuit breaker: track consecutive repeat error signatures.
@@ -2000,7 +2701,8 @@ def phase3_prove(
             '{"thought": "...", "tool": "done", "arguments": {}}\n'
             "Allowed tools: read_file, read_file_readonly, search_in_file, search_in_file_readonly, "
             "search_codebase, edit_file_patch, write_new_file, write_staging_lemma, get_lean_goal, "
-            "check_lean_have, run_lean_verify, request_agent2_help.\n"
+            "check_lean_have, run_lean_verify, request_agent6_glue, request_agent2_help, "
+            "request_agent7_interface_audit.\n"
             "SITUATIONAL BEHAVIOR:\n"
             "- If guidance contains PATCH blocks (<<<SEARCH>>>/<<<REPLACE>>>): "
             "execute them exactly — copy old_str and new_str verbatim.\n"
@@ -2030,6 +2732,7 @@ def phase3_prove(
             + "\n"
             f"Target file: {target_file}\n"
             + (_imported_sigs_block.lstrip("\n") + "\n" if _imported_sigs_block else "")
+            + (_extract_staging_sigs(_staging_path) if _staging_path.exists() else "")
             + (
                 "\n## Staging file (writable — add new glue lemmas here)\n"
                 f"File: {_staging_rel}\n"
@@ -2051,7 +2754,12 @@ def phase3_prove(
             and any("Staging" in e.get("file", "") for e in _parse_lean_errors(last_verify_text))
         ) if attempt > 1 else False  # no prior error on attempt 1
         _goal_block = _prequery_sorry_goals(
-            registry, target_file, guidance, _goal_cache, _staging_has_errors
+            registry,
+            target_file,
+            guidance,
+            _goal_cache,
+            _staging_has_errors,
+            errors_text=last_verify_text,
         )
         if _goal_block:
             console.print(
@@ -2100,6 +2808,26 @@ def phase3_prove(
         # -------------------------------------------------------------------
         _inner_break_reason = ""
         _escalation_count = 0  # limit Agent3→Agent2 escalations per attempt
+        _agent6_escalation_count = 0  # limit request_agent6_glue per attempt
+        _last_local_error_sig: str | None = None  # for Agent6 auto-route repeat detection
+        _agent6_first_goal_sig: str | None = None
+        _agent6_first_progress_ok: bool = False
+        _agent6_second_min_progress = RETRY_LIMITS.get("AGENT6_SECOND_ESCALATION_MIN_PROGRESS", 1)
+        _agent6_second_require_same_goal = bool(
+            RETRY_LIMITS.get("AGENT6_SECOND_ESCALATION_REQUIRE_SAME_GOAL", 1)
+        )
+        _agent7_invocations_this_attempt = 0
+        _agent7_max_invocations = RETRY_LIMITS.get("MAX_AGENT7_INVOCATIONS_PER_ATTEMPT", 2)
+        _agent7_no_progress_threshold = RETRY_LIMITS.get("AGENT7_STEP_NO_PROGRESS_THRESHOLD", 2)
+        _active_agent7_plan: dict | None = None
+        _agent7_current_step_idx = 0
+        _agent7_pending_verify = False
+        _agent7_last_step_id: str | None = None
+        _agent7_prev_sorry = last_sorry_count
+        _agent7_no_progress_count = 0
+        _stale_err_line: int | None = None
+        _stale_err_count: int = 0
+        _tools_used_this_attempt: set[str] = set()
         for tool_turn in range(max_tool_turns):
             # Parse Agent3's single action
             try:
@@ -2131,6 +2859,178 @@ def phase3_prove(
             arguments = payload.get("arguments", {})
             if not isinstance(arguments, dict):
                 arguments = {}
+            if tool_name:
+                _tools_used_this_attempt.add(tool_name)
+
+            # ---------------------------------------------------------------
+            # Agent3 → Agent7 interface-audit escalation
+            # ---------------------------------------------------------------
+            if tool_name == "request_agent7_interface_audit":
+                if _agent7_invocations_this_attempt >= _agent7_max_invocations:
+                    raw_reply = agent3.call(
+                        "## request_agent7_interface_audit rejected — limit reached\n"
+                        f"At most {_agent7_max_invocations} Agent7 invocations per attempt."
+                    )
+                    token_char_budget += len(raw_reply)
+                    continue
+                _agent7_invocations_this_attempt += 1
+                stuck_at_line = arguments.get("stuck_at_line") or arguments.get("sorry_line") or "unknown"
+                error_message = str(arguments.get("error_message", ""))[:1200]
+                diagnosis = str(arguments.get("diagnosis", ""))[:1600]
+                attempts_tried = int(arguments.get("attempts_tried", tool_turn + 1))
+                primary_error = arguments.get("primary_error")
+                dependency_symbols = arguments.get("dependency_symbols")
+                recent_failures = arguments.get("recent_failures")
+                _line_int = int(stuck_at_line) if str(stuck_at_line).isdigit() else _extract_first_error_line(last_verify_text) or 1
+                current_snippet = _build_escalation_file_context(target_file, _line_int)
+                dep_sigs = _prequery_dependency_signatures(last_verify_text, target_file)
+                if isinstance(primary_error, (dict, list)):
+                    _primary_err_text = json.dumps(primary_error, ensure_ascii=False)[:1200]
+                else:
+                    _primary_err_text = str(primary_error or "")[:1200]
+                if isinstance(dependency_symbols, list):
+                    _dep_syms_text = ", ".join(str(s) for s in dependency_symbols[:20])
+                else:
+                    _dep_syms_text = str(dependency_symbols or "")[:600]
+                if isinstance(recent_failures, list):
+                    _recent_failures_text = json.dumps(recent_failures[-8:], ensure_ascii=False)[:3000]
+                else:
+                    _recent_failures_text = str(recent_failures or "")[:2000]
+                if not _recent_failures_text:
+                    _recent_failures_text = json.dumps(
+                        [a for a in attempt_failures if a.get("attempt") == attempt][-8:],
+                        ensure_ascii=False,
+                    )[:3000]
+                agent7_prompt = (
+                    "Produce a strict interface-audit protocol JSON for Agent3.\n"
+                    f"Target file: {target_file}\n"
+                    f"Stuck at line: {_line_int}\n"
+                    f"Attempts tried: {attempts_tried}\n\n"
+                    f"Primary error:\n```\n{_primary_err_text or error_message}\n```\n\n"
+                    f"Diagnosis:\n{diagnosis}\n\n"
+                    f"Dependency symbols hint:\n{_dep_syms_text}\n\n"
+                    f"Recent failures:\n```\n{_recent_failures_text}\n```\n\n"
+                    f"Current snippet:\n```lean\n{current_snippet[:8000]}\n```\n\n"
+                    f"Dependency signatures:\n```lean\n{dep_sigs[:4000]}\n```\n\n"
+                    "Return strict JSON only as specified in your system prompt."
+                )
+                plan_obj, raw_plan = _call_agent7_with_tools(
+                    agent7,
+                    agent7_registry,
+                    agent7_prompt,
+                )
+                agent7_invocations.append({
+                    "attempt": attempt,
+                    "turn": tool_turn + 1,
+                    "stuck_at_line": _line_int,
+                    "error_message": error_message[:300],
+                    "diagnosis": diagnosis[:300],
+                    "success": plan_obj is not None,
+                })
+                if not plan_obj:
+                    raw_reply = agent3.call(
+                        "## Agent7 returned invalid protocol JSON\n"
+                        "Continue with local fixes or escalate to Agent2/Agent6."
+                    )
+                    token_char_budget += len(raw_reply)
+                    continue
+                _active_agent7_plan = plan_obj
+                _agent7_current_step_idx = 0
+                _agent7_pending_verify = False
+                _agent7_last_step_id = None
+                _agent7_prev_sorry = last_sorry_in_attempt
+                _agent7_no_progress_count = 0
+                agent7_plan_revisions.append({
+                    "attempt": attempt,
+                    "turn": tool_turn + 1,
+                    "plan_size": len(plan_obj.get("ordered_steps", [])),
+                    "root_cause": str(plan_obj.get("root_cause", ""))[:400],
+                    "raw_excerpt": raw_plan[:800],
+                })
+                _steps = plan_obj.get("ordered_steps", [])
+                _first_step_id = str(_steps[0].get("step_id", "S1")) if isinstance(_steps, list) and _steps else "S1"
+                exec_results.append(ExecutionResult(
+                    status_code="SUCCESS",
+                    message=f"AGENT7_PLAN_APPLIED step={_first_step_id}",
+                    attempt=attempt,
+                ))
+                raw_reply = agent3.call(
+                    "## Agent7 protocol applied\n"
+                    f"Root cause: {plan_obj.get('root_cause', '')}\n"
+                    f"Next required step: {_first_step_id}\n"
+                    "Execute exactly one step and include `executed_step_id` in your arguments.\n"
+                    "After that step, call run_lean_verify before any other edit.\n"
+                )
+                token_char_budget += len(raw_reply)
+                continue
+
+            # ---------------------------------------------------------------
+            # Agent7 execution gate
+            # ---------------------------------------------------------------
+            if _active_agent7_plan is not None:
+                _steps = _active_agent7_plan.get("ordered_steps", [])
+                _has_steps = isinstance(_steps, list) and len(_steps) > 0
+                if _has_steps:
+                    _step_idx = min(_agent7_current_step_idx, len(_steps) - 1)
+                    _cur_step = _steps[_step_idx]
+                    _cur_step_id = str(_cur_step.get("step_id", f"S{_step_idx + 1}"))
+                    _cur_tool = str(_cur_step.get("tool", "")).strip()
+                else:
+                    _cur_step = {}
+                    _cur_step_id = "S1"
+                    _cur_tool = ""
+
+                if _agent7_pending_verify and tool_name != "run_lean_verify":
+                    agent7_blocked_actions.append({
+                        "attempt": attempt,
+                        "turn": tool_turn + 1,
+                        "reason": "verify_required",
+                        "requested_tool": tool_name,
+                        "expected_step_id": _agent7_last_step_id,
+                    })
+                    raw_reply = agent3.call(
+                        "## AGENT7_STEP_REJECTED\n"
+                        f"You must call run_lean_verify now to validate step {_agent7_last_step_id} "
+                        "before any further action."
+                    )
+                    token_char_budget += len(raw_reply)
+                    continue
+
+                if not _agent7_pending_verify and _has_steps:
+                    if _cur_tool and tool_name != _cur_tool:
+                        agent7_blocked_actions.append({
+                            "attempt": attempt,
+                            "turn": tool_turn + 1,
+                            "reason": "wrong_step_tool",
+                            "requested_tool": tool_name,
+                            "expected_tool": _cur_tool,
+                            "expected_step_id": _cur_step_id,
+                        })
+                        raw_reply = agent3.call(
+                            "## AGENT7_STEP_REJECTED\n"
+                            f"Current protocol step is {_cur_step_id} and requires tool `{_cur_tool}`. "
+                            "Execute that step first."
+                        )
+                        token_char_budget += len(raw_reply)
+                        continue
+                    _executed_step_id = str(arguments.get("executed_step_id", "")).strip()
+                    if _executed_step_id != _cur_step_id:
+                        agent7_blocked_actions.append({
+                            "attempt": attempt,
+                            "turn": tool_turn + 1,
+                            "reason": "step_id_mismatch",
+                            "requested_tool": tool_name,
+                            "executed_step_id": _executed_step_id,
+                            "expected_step_id": _cur_step_id,
+                        })
+                        raw_reply = agent3.call(
+                            "## AGENT7_STEP_REJECTED\n"
+                            f"Include `executed_step_id: \"{_cur_step_id}\"` in arguments and retry."
+                        )
+                        token_char_budget += len(raw_reply)
+                        continue
+                    arguments = dict(arguments)
+                    arguments.pop("executed_step_id", None)
 
             # "done" signal: force verify, NEVER trust Agent3's self-report
             if tool_name == "done":
@@ -2162,6 +3062,10 @@ def phase3_prove(
                         return True, attempts, "", {
                             "execution_history": [r.__dict__ for r in execution_history],
                             "attempt_failures": attempt_failures,
+                            "agent7_invocations": agent7_invocations,
+                            "agent7_step_execution_log": agent7_step_execution_log,
+                            "agent7_plan_revisions": agent7_plan_revisions,
+                            "agent7_blocked_actions": agent7_blocked_actions,
                             "estimated_token_consumption": max(1, token_char_budget // 4),
                             "retry_count": sum(
                                 1 for r in execution_history
@@ -2188,7 +3092,135 @@ def phase3_prove(
                     rejection = _format_done_rejection(forced_verify, target_file)
                     raw_reply = agent3.call(rejection)
                     token_char_budget += len(raw_reply)
+                continue
+
+            # ---------------------------------------------------------------
+            # Agent3 → Agent6 glue escalation: infrastructure gap handoff
+            # ---------------------------------------------------------------
+            if tool_name == "request_agent6_glue":
+                max_agent6 = RETRY_LIMITS.get("MAX_AGENT6_ESCALATIONS_PER_ATTEMPT", 1)
+                stuck_at_line = arguments.get("stuck_at_line") or arguments.get("sorry_line") or "unknown"
+                error_message = str(arguments.get("error_message", ""))[:600]
+                diagnosis = str(arguments.get("diagnosis", ""))[:800]
+                extra_context = str(arguments.get("extra_context", ""))[:600]
+                try:
+                    _line_int = int(stuck_at_line) if str(stuck_at_line).isdigit() else 1
+                    g = registry.call("get_lean_goal", file_path=target_file, sorry_line=_line_int)
+                    goal = (g.get("goal") or g.get("raw") or "").strip()
+                    hypotheses = g.get("hypotheses")
+                    if not isinstance(hypotheses, list):
+                        hypotheses = []
+                except Exception:
+                    goal = ""
+                    hypotheses = []
+                if not goal:
+                    raw_reply = agent3.call(
+                        "## request_agent6_glue rejected — could not obtain goal from LSP\n"
+                        "Call get_lean_goal first, then retry request_agent6_glue."
+                    )
+                    token_char_budget += len(raw_reply)
                     continue
+                _candidate_escalation = _agent6_escalation_count + 1
+                if _candidate_escalation > max_agent6:
+                    raw_reply = agent3.call(
+                        "## request_agent6_glue rejected — limit reached\n"
+                        f"At most {max_agent6} handoff(s) to Agent6 per attempt. "
+                        "Use request_agent2_help instead."
+                    )
+                    token_char_budget += len(raw_reply)
+                    continue
+                _current_goal_sig = hashlib.md5(goal[:1000].encode("utf-8")).hexdigest()
+                if _candidate_escalation == 2:
+                    _same_goal_ok = (not _agent6_second_require_same_goal) or (
+                        _agent6_first_goal_sig is not None and _current_goal_sig == _agent6_first_goal_sig
+                    )
+                    _progress_ok = _agent6_first_progress_ok
+                    if not (_same_goal_ok and _progress_ok):
+                        raw_reply = agent3.call(
+                            "## request_agent6_glue rejected — second escalation gate\n"
+                            "Second Agent6 escalation is allowed only when:\n"
+                            f"1) first Agent6 call reduced sorry_count by at least {_agent6_second_min_progress}; and\n"
+                            "2) current goal is the same structural goal.\n"
+                            "Continue local/tactical repair or call request_agent2_help."
+                        )
+                        token_char_budget += len(raw_reply)
+                        continue
+                _agent6_escalation_count = _candidate_escalation
+                console.print(
+                    f"  [Agent3→Agent6] Glue handoff #{_agent6_escalation_count} at turn "
+                    f"{tool_turn + 1}: stuck at line {stuck_at_line}"
+                )
+                _pre_agent6_sorry = last_sorry_in_attempt
+                success, msg = _run_agent6_glue_loop(
+                    agent6,
+                    agent6_registry,
+                    target_file,
+                    _staging_path,
+                    _staging_rel,
+                    goal,
+                    error_message,
+                    diagnosis,
+                    _algo_name_for_staging,
+                    hypotheses=hypotheses,
+                    extra_context=extra_context or None,
+                    stuck_line=_line_int,
+                )
+                if success:
+                    exec_results.append(ExecutionResult(
+                        status_code="SUCCESS",
+                        message=f"request_agent6_glue: succeeded (turn {tool_turn + 1})",
+                        attempt=attempt,
+                    ))
+                    # Immediate target regression verify so Agent3 knows whether glue fixed target.
+                    _target_verify_after_agent6 = registry.call("run_lean_verify", target_file)
+                    _tv_exit = int(_target_verify_after_agent6.get("exit_code", 1))
+                    _tv_sorry = int(_target_verify_after_agent6.get("sorry_count", 0))
+                    _tv_errors = _target_verify_after_agent6.get("errors", [])
+                    _tv_error_text = (
+                        "\n".join(_tv_errors[:5]) if isinstance(_tv_errors, list) else str(_tv_errors)
+                    )
+                    _progress_delta = max(0, _pre_agent6_sorry - _tv_sorry)
+                    if _candidate_escalation == 1:
+                        _agent6_first_goal_sig = _current_goal_sig
+                        _agent6_first_progress_ok = _progress_delta >= _agent6_second_min_progress
+                    raw_reply = agent3.call(
+                        msg
+                        + "\n\n## Target regression verify after Agent6\n"
+                        + f"exit_code: {_tv_exit} | sorry_count: {_tv_sorry}\n"
+                        + (
+                            f"Top errors:\n```\n{_tv_error_text[:1200]}\n```\n"
+                            if _tv_error_text else ""
+                        )
+                        + (
+                            "Glue helped but target is still failing. Continue fixing target file.\n"
+                            if not (_tv_exit == 0 and _tv_sorry == 0)
+                            else "Target is now clean.\n"
+                        )
+                    )
+                else:
+                    _stuck_line_int = int(stuck_at_line) if str(stuck_at_line).isdigit() else None
+                    _current_snippet = _build_escalation_file_context(target_file, _stuck_line_int)
+                    _staging_snippet = (
+                        _staging_path.read_text(encoding="utf-8")
+                        if _staging_path.exists() else "(staging file is empty)"
+                    )
+                    new_guidance = _call_agent2_with_tools(
+                        agent2,
+                        staging_registry,
+                        f"[AGENT6 FALLBACK — Agent6 could not prove glue]\n"
+                        f"Agent3 escalated with infrastructure diagnosis. Agent6 failed.\n\n"
+                        f"Error: {error_message}\nDiagnosis: {diagnosis}\n\n"
+                        f"Target: {target_file} line {stuck_at_line}. Goal: {goal[:500]}...\n\n"
+                        f"=== CURRENT FILE ({target_file}) ===\n```lean\n{_current_snippet}\n```\n\n"
+                        f"=== STAGING FILE ({_staging_rel}) ===\n```lean\n{_staging_snippet}\n```\n\n"
+                        f"Provide revised guidance. Agent3 continues in the SAME attempt.",
+                    )
+                    raw_reply = agent3.call(
+                        f"## Agent6 could not fill glue — Agent2 guidance\n{new_guidance}\n\n"
+                        "Apply this guidance now. Continue with tool calls."
+                    )
+                token_char_budget += len(raw_reply)
+                continue
 
             # ---------------------------------------------------------------
             # Agent3 → Agent2 escalation: mid-attempt help request
@@ -2203,8 +3235,7 @@ def phase3_prove(
                     )
                     raw_reply = agent3.call(esc_msg)
                     token_char_budget += len(esc_msg) + len(raw_reply)
-                    continue
-
+                continue
                 stuck_at_line = arguments.get("stuck_at_line", "unknown")
                 error_message = str(arguments.get("error_message", ""))[:600]
                 diagnosis = str(arguments.get("diagnosis", ""))[:800]
@@ -2280,8 +3311,7 @@ def phase3_prove(
                             "You are about to apply a patch without having called "
                             "search_codebase, search_in_file, or read_file since the "
                             "last edit in this attempt.\n\n"
-                            "Per the MANDATORY PRE-PATCH SYMBOL VERIFICATION rule, you MUST "
-                            "verify each new identifier before patching.\n\n"
+                            "We STRONGLY RECOMMEND verifying identifiers before patching.\n\n"
                             "Call search_codebase or search_in_file for the identifiers in "
                             "your REPLACE block NOW, then re-issue your edit_file_patch.\n\n"
                             "Exception: if these are Lean built-in tactics (simp, ring, etc.) "
@@ -2307,6 +3337,17 @@ def phase3_prove(
                 registry, tool_name, arguments, target_file
             )
             token_char_budget += len(result_msg)
+            if (
+                _active_agent7_plan is not None
+                and not _agent7_pending_verify
+                and tool_name != "run_lean_verify"
+            ):
+                _steps = _active_agent7_plan.get("ordered_steps", [])
+                if isinstance(_steps, list) and _steps:
+                    _idx = min(_agent7_current_step_idx, len(_steps) - 1)
+                    _agent7_last_step_id = str(_steps[_idx].get("step_id", f"S{_idx + 1}"))
+                    _agent7_pending_verify = True
+                    _agent7_prev_sorry = last_sorry_in_attempt
 
             if edited:
                 edited_this_attempt = True
@@ -2352,6 +3393,99 @@ def phase3_prove(
                 last_sorry_count = last_sorry_in_attempt
                 last_errors = last_verify_text
 
+                # Agent7 execution gate: evaluate current step only on verify.
+                if _active_agent7_plan is not None and _agent7_pending_verify:
+                    _current_line = _extract_first_error_line(last_verify_text)
+                    _progress = (
+                        last_sorry_in_attempt < _agent7_prev_sorry
+                        or (last_exit_code == 0 and last_sorry_in_attempt == 0)
+                    )
+                    _regress = last_sorry_in_attempt > _agent7_prev_sorry
+                    if _regress:
+                        _agent7_no_progress_count += 1
+                    elif _progress:
+                        _agent7_no_progress_count = 0
+                    else:
+                        _agent7_no_progress_count += 1
+                    agent7_step_execution_log.append({
+                        "attempt": attempt,
+                        "turn": tool_turn + 1,
+                        "step_id": _agent7_last_step_id,
+                        "exit_code": last_exit_code,
+                        "sorry_before": _agent7_prev_sorry,
+                        "sorry_after": last_sorry_in_attempt,
+                        "error_line": _current_line,
+                        "accepted": bool(_progress and not _regress),
+                    })
+                    if _progress and not _regress:
+                        exec_results.append(ExecutionResult(
+                            status_code="SUCCESS",
+                            message=f"AGENT7_STEP_ACCEPTED {(_agent7_last_step_id or '')}",
+                            attempt=attempt,
+                        ))
+                        _steps = _active_agent7_plan.get("ordered_steps", [])
+                        if isinstance(_steps, list):
+                            _agent7_current_step_idx = min(
+                                _agent7_current_step_idx + 1, max(0, len(_steps) - 1)
+                            )
+                        _agent7_pending_verify = False
+                    elif _agent7_no_progress_count >= _agent7_no_progress_threshold:
+                        exec_results.append(ExecutionResult(
+                            status_code="BLOCKED",
+                            message=(
+                                f"AGENT7_STEP_REJECTED {(_agent7_last_step_id or '')} "
+                                "no progress threshold reached"
+                            ),
+                            attempt=attempt,
+                        ))
+                        _agent7_pending_verify = False
+                        _agent7_no_progress_count = 0
+                        _agent7_invocations_this_attempt += 1
+                        _line_int = _current_line or 1
+                        current_snippet = _build_escalation_file_context(target_file, _line_int)
+                        dep_sigs = _prequery_dependency_signatures(last_verify_text, target_file)
+                        _recent_failures = json.dumps(
+                            [a for a in attempt_failures if a.get("attempt") == attempt][-8:],
+                            ensure_ascii=False,
+                        )[:3000]
+                        revised_prompt = (
+                            "Revise prior interface-audit protocol due to no progress.\n"
+                            f"Target file: {target_file}\n"
+                            f"Line: {_line_int}\n"
+                            f"Latest verify errors:\n```\n{last_verify_text[:2000]}\n```\n\n"
+                            f"Recent failures:\n```\n{_recent_failures}\n```\n\n"
+                            f"Current snippet:\n```lean\n{current_snippet[:8000]}\n```\n\n"
+                            f"Dependency signatures:\n```lean\n{dep_sigs[:4000]}\n```\n\n"
+                            "Return strict JSON protocol only."
+                        )
+                        _revised_plan, _raw = _call_agent7_with_tools(
+                            agent7, agent7_registry, revised_prompt
+                        )
+                        if _revised_plan:
+                            _active_agent7_plan = _revised_plan
+                            _agent7_current_step_idx = 0
+                            _agent7_last_step_id = None
+                            _agent7_prev_sorry = last_sorry_in_attempt
+                            agent7_plan_revisions.append({
+                                "attempt": attempt,
+                                "turn": tool_turn + 1,
+                                "reason": "no_progress",
+                                "plan_size": len(_revised_plan.get("ordered_steps", [])),
+                            })
+                            raw_reply = agent3.call(
+                                "## Agent7 protocol revised due to no progress\n"
+                                "Execute the new first step with executed_step_id and verify immediately."
+                            )
+                            token_char_budget += len(raw_reply)
+                            continue
+                    else:
+                        exec_results.append(ExecutionResult(
+                            status_code="BLOCKED",
+                            message=f"AGENT7_STEP_REJECTED {(_agent7_last_step_id or '')}",
+                            attempt=attempt,
+                        ))
+                        _agent7_pending_verify = False
+
                 # Checkpoint: save verified state whenever sorry count improves.
                 # Only verified (compilable) states are checkpointed.
                 if (
@@ -2369,6 +3503,29 @@ def phase3_prove(
                     console.print(
                         f"  [Checkpoint] Updated: sorry={last_sorry_in_attempt}"
                     )
+                elif (
+                    last_exit_code == 0
+                    and last_sorry_in_attempt > best_checkpoint["sorry_count"]
+                    and best_checkpoint["content"] is not None
+                    and _tgt.exists()
+                ):
+                    _tgt.write_text(best_checkpoint["content"], encoding="utf-8")
+                    if best_checkpoint.get("staging_content") is not None:
+                        _staging_path.write_text(
+                            best_checkpoint["staging_content"], encoding="utf-8"
+                        )
+                    result_msg = (
+                        "## REGRESSION DETECTED\n"
+                        f"Sorry count regressed from {best_checkpoint['sorry_count']} to {last_sorry_in_attempt}. "
+                        f"Auto-restored checkpoint (sorry={best_checkpoint['sorry_count']}).\n"
+                        "Do NOT repeat the previous patch. Try a different strategy.\n\n"
+                    ) + result_msg
+                    last_sorry_in_attempt = int(best_checkpoint["sorry_count"])
+                    last_sorry_count = last_sorry_in_attempt
+                    console.print(
+                        f"  [Checkpoint] REGRESSION: sorry {verify_result.get('sorry_count', '?')} "
+                        f"> {best_checkpoint['sorry_count']} — auto-restored"
+                    )
 
                 console.print(
                     f"  [Agent3] attempt {attempt}/{max_retries} "
@@ -2383,10 +3540,13 @@ def phase3_prove(
                 _inner_err_line = _extract_first_error_line(last_verify_text)
 
                 if last_exit_code != 0:
+                    _primary_inner = _structured_errors_inner[0] if _structured_errors_inner else {}
                     attempt_failures.append({
                         "attempt": attempt,
                         "exit_code": last_exit_code,
                         "sorry_count": last_sorry_in_attempt,
+                        "line": _primary_inner.get("line"),
+                        "message": str(_primary_inner.get("message", "")),
                         "lean_errors": _prioritize_error_text(
                             _structured_errors_inner, last_verify_text,
                             _inner_err_line, target_file
@@ -2402,6 +3562,15 @@ def phase3_prove(
                 )
                 err_line_no = _extract_first_error_line(last_verify_text)
                 line_no_display = str(err_line_no) if err_line_no is not None else "unknown"
+                if last_exit_code != 0:
+                    if err_line_no is not None and err_line_no == _stale_err_line:
+                        _stale_err_count += 1
+                    else:
+                        _stale_err_line = err_line_no
+                        _stale_err_count = 1
+                else:
+                    _stale_err_line = None
+                    _stale_err_count = 0
 
                 if error_type == "SIGNATURE_HALLUCINATION":
                     console.print(
@@ -2464,12 +3633,141 @@ def phase3_prove(
                     _inner_break_reason = "hallucination"
                     break  # start next attempt with fresh guidance
 
+                if error_type == "DEFINITION_ZONE_ERROR":
+                    _stale_err_count = max(_stale_err_count, 3)
+                    result_msg = (
+                        "## DEFINITION ZONE ERROR\n"
+                        "Type mismatch occurs in declaration/definition zone (before proof tactics).\n"
+                        "This usually means a called function is being applied with the wrong signature.\n"
+                        "Read the callee definition first, then patch.\n\n"
+                    ) + result_msg
+                    error_type = "LOCAL_PROOF_ERROR"
+
                 if error_type == "LOCAL_PROOF_ERROR":
                     console.print(
                         f"  [Agent3] attempt {attempt}/{max_retries} — "
                         f"[yellow]LOCAL_PROOF_ERROR at line {line_no_display} "
                         f"(turn {tool_turn + 1}) — Agent3 continues self-fix"
                     )
+                    # Build error signature for repeat detection (pass previous to detector)
+                    _primary_local = _structured_errors_inner[0] if _structured_errors_inner else {}
+                    _err_sig = (
+                        f"{_primary_local.get('file', '')}:{_primary_local.get('line', 0)}:"
+                        f"{str(_primary_local.get('message', ''))[:200]}"
+                    )
+                    # System-driven Agent6 auto-route: infra gap detected and need to solve now
+                    should_route, infra_diag = _should_route_to_agent6_for_infra(
+                        last_verify_text,
+                        target_file,
+                        _structured_errors_inner,
+                        tool_turn,
+                        _last_local_error_sig,
+                    )
+                    _last_local_error_sig = _err_sig
+                    max_agent6 = RETRY_LIMITS.get("MAX_AGENT6_ESCALATIONS_PER_ATTEMPT", 1)
+                    if should_route:
+                        _line_int = int(err_line_no) if err_line_no is not None else 1
+                        try:
+                            g = registry.call("get_lean_goal", file_path=target_file, sorry_line=_line_int)
+                            goal = (g.get("goal") or g.get("raw") or "").strip()
+                            hypotheses = g.get("hypotheses")
+                            if not isinstance(hypotheses, list):
+                                hypotheses = []
+                        except Exception:
+                            goal = ""
+                            hypotheses = []
+                        if goal:
+                            _candidate_escalation = _agent6_escalation_count + 1
+                            if _candidate_escalation > max_agent6:
+                                # exhausted Agent6 budget in this attempt
+                                goal = ""
+                            _current_goal_sig = hashlib.md5(goal[:1000].encode("utf-8")).hexdigest()
+                            if _candidate_escalation == 2:
+                                _same_goal_ok = (not _agent6_second_require_same_goal) or (
+                                    _agent6_first_goal_sig is not None and _current_goal_sig == _agent6_first_goal_sig
+                                )
+                                _progress_ok = _agent6_first_progress_ok
+                                if not (_same_goal_ok and _progress_ok):
+                                    goal = ""
+                            if not goal:
+                                continue
+                            _agent6_escalation_count = _candidate_escalation
+                            console.print(
+                                f"  [System→Agent6] Auto-route #{_agent6_escalation_count} at turn "
+                                f"{tool_turn + 1}: infra gap detected — {infra_diag}"
+                            )
+                            _pre_agent6_sorry = last_sorry_in_attempt
+                            success, agent6_msg = _run_agent6_glue_loop(
+                                agent6,
+                                agent6_registry,
+                                target_file,
+                                _staging_path,
+                                _staging_rel,
+                                goal,
+                                str(_primary_local.get("message", ""))[:600],
+                                infra_diag,
+                                _algo_name_for_staging,
+                                hypotheses=hypotheses,
+                                stuck_line=_line_int,
+                            )
+                            if success:
+                                exec_results.append(ExecutionResult(
+                                    status_code="SUCCESS",
+                                    message=f"Agent6 auto-route: succeeded (turn {tool_turn + 1})",
+                                    attempt=attempt,
+                                ))
+                                _target_verify_after_agent6 = registry.call("run_lean_verify", target_file)
+                                _tv_exit = int(_target_verify_after_agent6.get("exit_code", 1))
+                                _tv_sorry = int(_target_verify_after_agent6.get("sorry_count", 0))
+                                _tv_errors = _target_verify_after_agent6.get("errors", [])
+                                _tv_error_text = (
+                                    "\n".join(_tv_errors[:5]) if isinstance(_tv_errors, list) else str(_tv_errors)
+                                )
+                                _progress_delta = max(0, _pre_agent6_sorry - _tv_sorry)
+                                if _candidate_escalation == 1:
+                                    _agent6_first_goal_sig = _current_goal_sig
+                                    _agent6_first_progress_ok = _progress_delta >= _agent6_second_min_progress
+                                result_msg = (
+                                    "## System routed to Agent6 (infra gap detected).\n"
+                                    f"{agent6_msg}\n\n"
+                                    "## Target regression verify after Agent6\n"
+                                    f"exit_code: {_tv_exit} | sorry_count: {_tv_sorry}\n"
+                                    + (
+                                        f"Top errors:\n```\n{_tv_error_text[:1200]}\n```\n\n"
+                                        if _tv_error_text else "\n"
+                                    )
+                                    + "Original verify result:\n" + result_msg
+                                )
+                            else:
+                                _current_snippet = _build_escalation_file_context(target_file, _line_int)
+                                _staging_snippet = (
+                                    _staging_path.read_text(encoding="utf-8")
+                                    if _staging_path.exists() else "(staging file is empty)"
+                                )
+                                new_guidance = _call_agent2_with_tools(
+                                    agent2,
+                                    staging_registry,
+                                    f"[AGENT6 AUTO-ROUTE FALLBACK — Agent6 could not prove glue]\n"
+                                    f"System detected infra gap: {infra_diag}\n\n"
+                                    f"Error: {_primary_local.get('message', '')}\n\n"
+                                    f"Target: {target_file} line {err_line_no}. Goal: {goal[:500]}...\n\n"
+                                    f"=== CURRENT FILE ({target_file}) ===\n```lean\n{_current_snippet}\n```\n\n"
+                                    f"=== STAGING FILE ({_staging_rel}) ===\n```lean\n{_staging_snippet}\n```\n\n"
+                                    f"Provide revised guidance. Agent3 continues in the SAME attempt.",
+                                )
+                                result_msg = (
+                                    "## System routed to Agent6 — Agent6 could not fill glue. Agent2 guidance:\n"
+                                    f"{new_guidance}\n\n"
+                                    "Apply this guidance now. Original verify result:\n" + result_msg
+                                )
+                    if _stale_err_count >= 3:
+                        result_msg = result_msg + "\n\n" + _build_stale_error_hint(
+                            registry,
+                            target_file,
+                            last_verify_text,
+                            err_line_no,
+                            _stale_err_count,
+                        )
 
                 if error_type == "DEPENDENCY_COMPILE_ERROR":
                     # Errors originate from a staging/dependency file, not target.
@@ -2496,9 +3794,21 @@ def phase3_prove(
                         _inner_break_reason = "dep_compile_error"
                         break
                     execution_history.extend(exec_results)
+                    _attempt_failures_current = [
+                        a for a in attempt_failures if a.get("attempt") == attempt
+                    ]
+                    _attempt_diag = _generate_attempt_diagnosis(
+                        attempt,
+                        _attempt_failures_current,
+                        _tools_used_this_attempt,
+                        registry,
+                        target_file,
+                    )
                     guidance = _call_agent2_with_tools(
                         agent2,
                         staging_registry,
+                        _attempt_diag
+                        +
                         f"[DEPENDENCY COMPILE ERROR — STAGING/IMPORT FILE BROKEN]\n"
                         f"Errors are in a dependency or staging file, NOT in {target_file}.\n\n"
                         f"Failing dependency errors:\n```\n{_dep_errors_text}\n```\n\n"
@@ -2560,6 +3870,17 @@ def phase3_prove(
         # (guidance already set by the break handler above)
         if _inner_break_reason in ("hallucination", "dep_compile_error"):
             continue
+
+        _attempt_failures_current = [
+            a for a in attempt_failures if a.get("attempt") == attempt
+        ]
+        _attempt_diag = _generate_attempt_diagnosis(
+            attempt,
+            _attempt_failures_current,
+            _tools_used_this_attempt,
+            registry,
+            target_file,
+        )
 
         # Classify the final error state for this attempt
         error_type_final, _structured_errors_final = (
@@ -2662,10 +3983,15 @@ def phase3_prove(
                 _staging_path.read_text(encoding="utf-8")
                 if _staging_path.exists() else "(staging file is empty)"
             )
+            _ref_files_dep = _get_reference_files_with_descriptions(target_file)
+            _ref_class_dep = _format_ref_and_classification_blocks(
+                _ref_files_dep, None
+            )
             guidance = _call_agent2_with_tools(
                 agent2,
                 staging_registry,
-                _format_failed_approaches(_failed_approaches[-5:])
+                _attempt_diag
+                + _format_failed_approaches(_failed_approaches[-5:])
                 + (
                     f"[DEP-ERROR STREAK: {_dep_error_streak} consecutive identical staging errors]\n"
                     "You MUST change your approach — previous fixes did not work.\n\n"
@@ -2682,7 +4008,8 @@ def phase3_prove(
                 "unknown identifier shown above.\n"
                 "2. Fix the staging file using write_staging_lemma or edit_file_patch.\n"
                 "3. Output a PATCH block (<<<SEARCH>>>/<<<REPLACE>>>) with exact correct API.\n"
-                "Use only API names you have verified via search_codebase.",
+                "Use only API names you have verified via search_codebase."
+                + _ref_class_dep,
             )
             continue
 
@@ -2706,10 +4033,21 @@ def phase3_prove(
                 _staging_path.read_text(encoding="utf-8")
                 if _staging_path.exists() else "(staging file is empty)"
             )
+            _primary_local = _structured_errors_final[0] if _structured_errors_final else None
+            _ref_files_local = _get_reference_files_with_descriptions(target_file)
+            _llm_class_local = (
+                _llm_classify_error(_primary_local, _escalation_file_ctx, target_file)
+                if _primary_local else None
+            )
+            _ref_class_local = _format_ref_and_classification_blocks(
+                _ref_files_local, _llm_class_local
+            )
             guidance = _call_agent2_with_tools(
                 agent2,
                 staging_registry,
-                _format_failed_approaches(_failed_approaches[-5:])
+                _attempt_diag
+                + _format_failed_approaches(_failed_approaches[-5:])
+                + _ref_class_local
                 + f"[LOCAL PROOF ERROR — DIAGNOSIS REQUIRED]\n"
                 f"Build exit code: {last_exit_code} | Sorry count: {last_sorry_in_attempt}\n"
                 f"Error at line {line_no_display_final}:\n```\n"
@@ -2733,7 +4071,9 @@ def phase3_prove(
                 f"    → Sorry-degrade line {line_no_display_final} using:\n"
                 f"        sorry -- LOCAL_ERROR: {err_summary}\n"
                 f"    → Provide the corrected tactic in your next-attempt guidance.\n\n"
-                f"STATE YOUR CLASSIFICATION (A or B) EXPLICITLY before any patch or strategy.\n\n"
+                f"STATE YOUR CLASSIFICATION (A or B) EXPLICITLY before any patch or strategy.\n"
+                f"PREFER the suggested_strategy from ERROR CLASSIFICATION above over A/B when present.\n"
+                f"For add_instance: do NOT sorry-degrade; produce a PATCH that adds haveI/letI.\n\n"
                 f"STRICT RULES (both cases):\n"
                 f"1. Do NOT use write_new_file — the file must NOT be deleted or overwritten.\n"
                 f"2. Use edit_file_patch with <<<SEARCH>>>/<<<REPLACE>>> for any patch.\n"
@@ -2826,16 +4166,27 @@ def phase3_prove(
             _consecutive_repeat_count = 0
         _last_error_sig = _err_sig
 
+        # Compute file context and LLM classification for general failure (for injection into Agent2).
+        _gen_file_ctx = _build_escalation_file_context(target_file, _err_line_int)
+        _ref_files_gen = _get_reference_files_with_descriptions(target_file)
+        _llm_class = (
+            _llm_classify_error(_primary_err, _gen_file_ctx, target_file)
+            if _primary_err else None
+        )
+
         # Append to failed approaches history.
         if last_verify_text and _primary_err:
-            _failed_approaches.append({
+            _entry = {
                 "attempt": attempt,
                 "error_type": error_type_final,
                 "file": _primary_err["file"],
                 "line": _primary_err["line"],
                 "message_summary": _primary_err["message"][:100],
                 "failure_class": _infer_failure_class(error_type_final, _primary_err["message"]),
-            })
+            }
+            if _llm_class:
+                _entry["llm_classification"] = _llm_class
+            _failed_approaches.append(_entry)
 
         _surgeon_mode_forced = _consecutive_repeat_count >= 2
         if _surgeon_mode_forced:
@@ -2892,7 +4243,7 @@ def phase3_prove(
         guidance = _call_agent2_with_tools(
             agent2,
             staging_registry,
-            _surgeon_prefix + _assumption_context_prefix + _history_prefix + mismatch_prefix
+            _attempt_diag + _surgeon_prefix + _assumption_context_prefix + _history_prefix + mismatch_prefix
             + f"Attempt {attempt} failed.\n"
             f"Build exit code: {last_exit_code} | Sorry count: {last_sorry_in_attempt}\n"
             f"Error first occurs at line {line_no_display_final}.\n"
@@ -2967,6 +4318,10 @@ def phase3_prove(
             return True, attempts, "", {
                 "execution_history": [r.__dict__ for r in execution_history],
                 "attempt_failures": attempt_failures,
+                "agent7_invocations": agent7_invocations,
+                "agent7_step_execution_log": agent7_step_execution_log,
+                "agent7_plan_revisions": agent7_plan_revisions,
+                "agent7_blocked_actions": agent7_blocked_actions,
                 "estimated_token_consumption": max(1, token_char_budget // 4),
                 "retry_count": sum(
                     1
@@ -2995,6 +4350,10 @@ def phase3_prove(
         return False, attempts, last_errors, {
             "execution_history": [r.__dict__ for r in execution_history],
             "attempt_failures": attempt_failures,
+            "agent7_invocations": agent7_invocations,
+            "agent7_step_execution_log": agent7_step_execution_log,
+            "agent7_plan_revisions": agent7_plan_revisions,
+            "agent7_blocked_actions": agent7_blocked_actions,
             "estimated_token_consumption": max(1, token_char_budget // 4),
             "retry_count": sum(
                 1
@@ -3006,6 +4365,10 @@ def phase3_prove(
     return False, attempts, last_errors, {
         "execution_history": [r.__dict__ for r in execution_history],
         "attempt_failures": attempt_failures,
+        "agent7_invocations": agent7_invocations,
+        "agent7_step_execution_log": agent7_step_execution_log,
+        "agent7_plan_revisions": agent7_plan_revisions,
+        "agent7_blocked_actions": agent7_blocked_actions,
         "estimated_token_consumption": max(1, token_char_budget // 4),
         "retry_count": sum(
             1
@@ -3504,6 +4867,10 @@ def run(
     merged_phase3_audit = {
         "execution_history": [],
         "attempt_failures": [],
+        "agent7_invocations": [],
+        "agent7_step_execution_log": [],
+        "agent7_plan_revisions": [],
+        "agent7_blocked_actions": [],
         "estimated_token_consumption": 0,
         "retry_count": 0,
     }
@@ -3558,6 +4925,18 @@ def run(
                 )
                 merged_phase3_audit["attempt_failures"].extend(
                     phase3_audit.get("attempt_failures", [])
+                )
+                merged_phase3_audit["agent7_invocations"].extend(
+                    phase3_audit.get("agent7_invocations", [])
+                )
+                merged_phase3_audit["agent7_step_execution_log"].extend(
+                    phase3_audit.get("agent7_step_execution_log", [])
+                )
+                merged_phase3_audit["agent7_plan_revisions"].extend(
+                    phase3_audit.get("agent7_plan_revisions", [])
+                )
+                merged_phase3_audit["agent7_blocked_actions"].extend(
+                    phase3_audit.get("agent7_blocked_actions", [])
                 )
                 merged_phase3_audit["estimated_token_consumption"] += int(
                     phase3_audit.get("estimated_token_consumption", 0)

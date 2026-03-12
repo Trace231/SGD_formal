@@ -64,7 +64,7 @@ def lake_build(target: str | None = None) -> BuildResult:
 
 
 def count_sorrys(filepath: str | Path) -> int:
-    """Count occurrences of ``sorry`` in a Lean source file."""
+    """Count sorry and admit (both are proof placeholders) in a Lean source file."""
     p = Path(filepath)
     if not p.is_absolute():
         p = PROJECT_ROOT / p
@@ -75,6 +75,7 @@ def count_sorrys(filepath: str | Path) -> int:
 
 
 _SORRY_SOURCE_RE = re.compile(r"\bsorry\b")
+_ADMIT_SOURCE_RE = re.compile(r"\badmit\b")
 # Only match the Lean compiler's semantic warning, not raw "sorry" strings in
 # build output prose.  This avoids counting sorry occurrences in error messages,
 # documentation echoes, or user-visible strings.
@@ -91,6 +92,7 @@ def _count_sorry_in_source(text: str) -> int:
         # 2. Strip inline line comment (everything after the first "--").
         code_part = line.split("--")[0]
         count += len(_SORRY_SOURCE_RE.findall(code_part))
+        count += len(_ADMIT_SOURCE_RE.findall(code_part))
     return count
 
 

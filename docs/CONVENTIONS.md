@@ -297,5 +297,4 @@ process t         -- also OK (Lean fills setup from variable context)
 The error message (`m has type ℕ but expected FooSetup`) does not mention the
 missing `setup.` prefix. Agents typically respond by changing argument types or
 adding explicit type annotations, which never resolves the root cause. This bug
-was observed to persist for 15+ agent turns without progress (SVRGOuterLoop,
-March 2026).
+was observed to persist for 15+ agent turns without progress.
