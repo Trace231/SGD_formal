@@ -244,6 +244,42 @@ class AuditLogger:
         """Append Phase 4 patch ops summary."""
         self._phase4_patch_ops_summary = patch_ops_summary
 
+    def flush_audit_incremental(
+        self,
+        execution_history: list[dict[str, Any]],
+        attempt_failures: list[dict[str, Any]],
+        agent3_turns: list[dict[str, Any]],
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Write current Phase 3 state to audit file (incremental, does not finalize run)."""
+        if not self.enabled or not self.run_id:
+            return
+        payload: dict[str, Any] = {
+            "run_id": self.run_id,
+            "algorithm": self.algorithm,
+            "started_at": self.started_at,
+            "finished_at": None,
+            "in_progress": True,
+            "success": False,
+            "prompt_hashes": self.prompt_hashes,
+            "events": self.events,
+            "phase1_detail": self._phase1_detail,
+            "phase2_rounds": self._phase2_rounds,
+            "phase3_execution_history": execution_history,
+            "phase3_attempt_failures": attempt_failures,
+            "phase3_agent3_turns": agent3_turns,
+            "phase4_patch_ops_summary": self._phase4_patch_ops_summary,
+            "files_modified": [],
+        }
+        if extra:
+            payload.update(extra)
+        self.audit_dir.mkdir(parents=True, exist_ok=True)
+        audit_path = self.audit_dir / f"audit_{self.run_id}.json"
+        audit_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
     def finish_run(
         self,
         success: bool,

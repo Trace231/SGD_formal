@@ -19,6 +19,8 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 from collections import Counter
+import time
+from datetime import datetime, timezone
 import functools
 import hashlib
 import json
@@ -47,7 +49,9 @@ from orchestrator.assumption_repair import (
     goals_to_patch_list,
 )
 from orchestrator.config import (
+    AGENT6_AUTO_ROUTE_ENABLED,
     AGENT_CONFIGS,
+    AUDIT_FLUSH_INTERVAL_SECONDS,
     ALGORITHM_REFERENCES,
     DOC_ANCHORS,
     LIB_GLUE_ANCHORS,
@@ -55,6 +59,7 @@ from orchestrator.config import (
     PROJECT_ROOT,
     REFERENCE_FILES_WITH_DESCRIPTIONS,
     RETRY_LIMITS,
+    UNKNOWN_IDENTIFIER_RENAME_MAP,
     _get_default_references,
 )
 from orchestrator.file_io import (
@@ -63,11 +68,6 @@ from orchestrator.file_io import (
 )
 from orchestrator.tools import (
     _path_to_lean_module,
-    commit_staging_to_workspace,
-    configure_staging_barrier,
-    discard_staging_changes,
-    get_staging_barrier_status,
-    list_staging_changes,
     write_staging_lemma,
 )
 from orchestrator.metrics import (
@@ -144,8 +144,8 @@ _LEAN_ERROR_LINE_RE = re.compile(
 _PROOF_BODY_LINE_THRESHOLD = 50
 
 # Minimum Agent2 lookup rounds required before guidance is forwarded to Agent3.
-# Set to 0 to trust model judgment (no hard gate).
-_MIN_AGENT2_LOOKUP_ROUNDS = 0
+# Set to 0 to revert to the old warning-only behaviour.
+_MIN_AGENT2_LOOKUP_ROUNDS = 2
 
 # Known Lean 4 API misspellings in staging files: wrong_pattern → correct_name_hint.
 _STAGING_API_MISSPELLINGS: dict[str, str] = {
@@ -1472,6 +1472,110 @@ def _capture_lean_baseline() -> tuple[set[str], set[str]]:
     return tracked, untracked
 
 
+@dataclass
+class GitRunSnapshot:
+    """Git snapshot captured at run start for safe rollback."""
+
+    start_sha: str
+    pre_run_dirty: bool
+    stash_used: bool
+    stash_ref: str | None
+
+
+def _git_head_sha() -> str:
+    """Return current HEAD commit SHA."""
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def _git_is_dirty() -> bool:
+    """Return True when tracked or untracked changes are present."""
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return bool(result.stdout.strip())
+
+
+def _capture_git_run_snapshot(run_id: str) -> GitRunSnapshot:
+    """Capture HEAD and optionally stash local dirt for rollback safety."""
+    start_sha = _git_head_sha()
+    pre_run_dirty = _git_is_dirty()
+    if not pre_run_dirty:
+        return GitRunSnapshot(
+            start_sha=start_sha,
+            pre_run_dirty=False,
+            stash_used=False,
+            stash_ref=None,
+        )
+
+    # Save all local modifications (tracked + untracked) so run rollback can
+    # safely reset and then restore user state.
+    stash_msg = f"orchestrator-pre-run-{run_id}"
+    subprocess.run(
+        ["git", "stash", "push", "-u", "-m", stash_msg],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return GitRunSnapshot(
+        start_sha=start_sha,
+        pre_run_dirty=True,
+        stash_used=True,
+        stash_ref="stash@{0}",
+    )
+
+
+def _restore_snapshot_on_success(snapshot: GitRunSnapshot) -> None:
+    """Restore pre-run user state after successful run."""
+    if not snapshot.stash_used:
+        return
+    subprocess.run(
+        ["git", "stash", "pop", "--index", snapshot.stash_ref or "stash@{0}"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
+def _rollback_to_snapshot(snapshot: GitRunSnapshot) -> None:
+    """Rollback workspace to run-start commit and restore pre-run dirt."""
+    subprocess.run(
+        ["git", "reset", "--hard", snapshot.start_sha],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    # Remove untracked files generated during this run.
+    subprocess.run(
+        ["git", "clean", "-fd"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    if snapshot.stash_used:
+        subprocess.run(
+            ["git", "stash", "pop", "--index", snapshot.stash_ref or "stash@{0}"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+
 def _get_modified_lean_files(
     baseline_tracked: set[str],
     baseline_untracked: set[str],
@@ -1639,6 +1743,7 @@ def _call_agent2_with_tools(
     reply = agent2.call(user_msg)
     _lookup_rounds_performed = 0
     _accumulated_lookup_text = ""
+    _guidance_without_sufficient_lookups = 0
 
     for _round in range(max_tool_rounds):
         # Try to parse as JSON lookup request.
@@ -1655,8 +1760,19 @@ def _call_agent2_with_tools(
         )
 
         if not is_lookup:
-            # Agent2 declared final guidance.  No hard gate — trust model judgment.
-            break
+            if _lookup_rounds_performed >= _MIN_AGENT2_LOOKUP_ROUNDS:
+                break
+            _guidance_without_sufficient_lookups += 1
+            if _guidance_without_sufficient_lookups > 3:
+                break  # avoid infinite loop
+            reply = agent2.call(
+                "## Minimum lookup requirement\n"
+                f"You have performed {_lookup_rounds_performed} lookup round(s). "
+                f"At least {_MIN_AGENT2_LOOKUP_ROUNDS} are required before final guidance.\n"
+                "Issue a lookup ({\"type\": \"lookup\", \"tool_calls\": [{\"tool\": \"search_codebase\" or \"read_file\", ...}]}) "
+                "to verify key identifiers, then provide your final guidance."
+            )
+            continue
 
         # Execute the lookup round.
         tool_calls: list[dict] = payload["tool_calls"]
@@ -2554,6 +2670,14 @@ def phase3_prove(
     _tgt = Path(target_file) if Path(target_file).is_absolute() else PROJECT_ROOT / target_file
 
     # --- Glue Staging setup (Fix B1) ---
+    # Architecture: algorithm vs staging separation
+    # - Algorithm file: target_file (e.g. Algorithms/<Algo>.lean) — main definitions, theorems.
+    #   Created by Agent3 write_new_file or pre-existing. Always lives in Algorithms/.
+    # - Staging file: Lib/Glue/Staging/<Algo>.lean — glue/bridge lemmas only, added by
+    #   Agent3/Agent6 via write_staging_lemma. Algorithm imports staging; never the reverse.
+    # - run_lean_verify(target_file) builds the algorithm module (lake build Algorithms.<Algo>),
+    #   which pulls in staging as a dependency. Build target is always the algorithm, never staging.
+    #
     # Create a per-algorithm staging file under Lib/Glue/Staging/ so Agent3
     # never needs to touch the shared Lib/Glue/*.lean infrastructure.
     _algo_name = Path(target_file).stem  # e.g. "SVRGOuterLoop"
@@ -2574,13 +2698,7 @@ def phase3_prove(
             return default
 
     def _staging_physical_path() -> Path:
-        """Return concrete file path used by low-level patch helpers."""
-        _status = get_staging_barrier_status()
-        _root = _status.get("staging_root")
-        if isinstance(_root, str) and _root:
-            _candidate = (Path(_root) / _staging_rel).resolve()
-            if _candidate.exists():
-                return _candidate
+        """Return concrete staging glue path in workspace."""
         return _staging_path
 
     if not snapshot_file(_staging_rel):
@@ -2670,6 +2788,8 @@ def phase3_prove(
     attempts = 0
     execution_history: list[ExecutionResult] = []
     attempt_failures: list[dict] = []
+    agent3_turns: list[dict] = []
+    _last_audit_flush_time: float = time.time()
     agent7_invocations: list[dict] = []
     agent7_step_execution_log: list[dict] = []
     agent7_plan_revisions: list[dict] = []
@@ -2886,6 +3006,7 @@ def phase3_prove(
         _agent7_invocations_this_attempt = 0
         _agent7_max_invocations = RETRY_LIMITS.get("MAX_AGENT7_INVOCATIONS_PER_ATTEMPT", 2)
         _agent7_no_progress_threshold = RETRY_LIMITS.get("AGENT7_STEP_NO_PROGRESS_THRESHOLD", 2)
+        _agent7_approved_agent6 = False  # True when Agent7 plan includes route_to agent6 or step request_agent6_glue
         _active_agent7_plan: dict | None = None
         _agent7_current_step_idx = 0
         _agent7_pending_verify = False
@@ -2936,6 +3057,19 @@ def phase3_prove(
                 arguments = {}
             if tool_name:
                 _tools_used_this_attempt.add(tool_name)
+
+            _thought = str(payload.get("thought", "")).strip()
+            _args_safe = {k: (v[:200] if isinstance(v, str) else v) for k, v in (arguments or {}).items() if k != "path"}
+            if "path" in (arguments or {}):
+                _args_safe["path"] = str(arguments.get("path", ""))[:100]
+            agent3_turns.append({
+                "attempt": attempt,
+                "turn": tool_turn + 1,
+                "thought": _thought[:8000] if _thought else "",
+                "tool": tool_name,
+                "arguments": _args_safe,
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            })
 
             # ---------------------------------------------------------------
             # Forced Agent7 gate: when stuck too long, restrict next actions
@@ -3042,6 +3176,16 @@ def phase3_prove(
                 _agent7_last_step_id = None
                 _agent7_prev_sorry = last_sorry_in_attempt
                 _agent7_no_progress_count = 0
+                # Agent7 gatekeeper: allow Agent6 only when Agent7 says infra is missing.
+                _ft = plan_obj.get("fallback_trigger") or {}
+                _agent7_approved_agent6 = (
+                    str(_ft.get("route_to", "")).strip().lower() == "agent6"
+                    or any(
+                        str(s.get("tool", "")).strip() == "request_agent6_glue"
+                        for s in (plan_obj.get("ordered_steps") or [])
+                        if isinstance(s, dict)
+                    )
+                )
                 if _agent7_force_gate_active:
                     _agent7_force_gate_active = False
                     exec_results.append(ExecutionResult(
@@ -3211,8 +3355,17 @@ def phase3_prove(
 
             # ---------------------------------------------------------------
             # Agent3 → Agent6 glue escalation: infrastructure gap handoff
+            # Agent6 is used only when Agent7's interface audit indicates a missing glue lemma.
             # ---------------------------------------------------------------
             if tool_name == "request_agent6_glue":
+                if not _agent7_approved_agent6:
+                    raw_reply = agent3.call(
+                        "## request_agent6_glue rejected — Agent7 gate\n"
+                        "Agent6 is used only when Agent7's interface audit indicates a missing glue lemma. "
+                        "Call request_agent7_interface_audit first."
+                    )
+                    token_char_budget += len(raw_reply)
+                    continue
                 max_agent6 = RETRY_LIMITS.get("MAX_AGENT6_ESCALATIONS_PER_ATTEMPT", 1)
                 stuck_at_line = arguments.get("stuck_at_line") or arguments.get("sorry_line") or "unknown"
                 error_message = str(arguments.get("error_message", ""))[:600]
@@ -3489,6 +3642,29 @@ def phase3_prove(
                 attempt=attempt,
             ))
 
+            if time.time() - _last_audit_flush_time >= AUDIT_FLUSH_INTERVAL_SECONDS:
+                _last_audit_flush_time = time.time()
+                try:
+                    _audit = AuditLogger.get()
+                    _exec_full = [r.__dict__ for r in execution_history] + [r.__dict__ for r in exec_results]
+                    _audit.flush_audit_incremental(
+                        execution_history=_exec_full,
+                        attempt_failures=attempt_failures,
+                        agent3_turns=agent3_turns,
+                        extra={
+                            "agent7_invocations": agent7_invocations,
+                            "agent7_step_execution_log": agent7_step_execution_log,
+                            "agent7_plan_revisions": agent7_plan_revisions,
+                            "agent7_blocked_actions": agent7_blocked_actions,
+                            "agent7_forced_trigger_count": agent7_forced_trigger_count,
+                            "agent7_force_gate_entries": agent7_force_gate_entries,
+                            "agent7_force_gate_rejections": agent7_force_gate_rejections,
+                            "agent7_force_gate_reason_samples": agent7_force_gate_reason_samples,
+                        },
+                    )
+                except Exception:
+                    pass
+
             # Process run_lean_verify results inline
             if tool_name == "run_lean_verify" and verify_result is not None:
                 last_verify_result = verify_result
@@ -3757,7 +3933,7 @@ def phase3_prove(
                     break  # start next attempt with fresh guidance
 
                 if error_type == "DEFINITION_ZONE_ERROR":
-                    _stale_err_count = max(_stale_err_count, 3)
+                    # Do NOT bump _stale_err_count to 3 — let normal stale logic apply
                     result_msg = (
                         "## DEFINITION ZONE ERROR\n"
                         "Type mismatch occurs in declaration/definition zone (before proof tactics).\n"
@@ -3778,7 +3954,9 @@ def phase3_prove(
                         f"{_primary_local.get('file', '')}:{_primary_local.get('line', 0)}:"
                         f"{str(_primary_local.get('message', ''))[:200]}"
                     )
-                    # System-driven Agent6 auto-route: infra gap detected and need to solve now
+                    # System-driven Agent6 auto-route: infra gap detected and need to solve now.
+                    # When AGENT6_AUTO_ROUTE_ENABLED is False, Agent6 is invoked only when
+                    # Agent7's protocol explicitly indicates a missing glue lemma.
                     should_route, infra_diag = _should_route_to_agent6_for_infra(
                         last_verify_text,
                         target_file,
@@ -3787,8 +3965,22 @@ def phase3_prove(
                         _last_local_error_sig,
                     )
                     _last_local_error_sig = _err_sig
+                    # Inject known identifier correction hint before escalation.
+                    _unknown_ident_re = re.compile(
+                        r"unknown (?:identifier|constant)[^`]*`([a-zA-Z][a-zA-Z0-9_.]*)`",
+                        re.IGNORECASE,
+                    )
+                    for _um in _unknown_ident_re.finditer(last_verify_text):
+                        _ident = _um.group(1)
+                        if _ident in UNKNOWN_IDENTIFIER_RENAME_MAP:
+                            _correct = UNKNOWN_IDENTIFIER_RENAME_MAP[_ident]
+                            result_msg = (
+                                f"## Known identifier correction\n"
+                                f"Use `{_correct}` instead of `{_ident}`. Apply via edit_file_patch.\n\n"
+                            ) + result_msg
+                            break
                     max_agent6 = RETRY_LIMITS.get("MAX_AGENT6_ESCALATIONS_PER_ATTEMPT", 1)
-                    if should_route:
+                    if should_route and AGENT6_AUTO_ROUTE_ENABLED:
                         _line_int = int(err_line_no) if err_line_no is not None else 1
                         try:
                             g = registry.call("get_lean_goal", file_path=target_file, sorry_line=_line_int)
@@ -5041,8 +5233,12 @@ def run(
     success = False
     _lakefile_added_by_us = False
     files_modified: list[str] = []
-    _staging_root = PROJECT_ROOT / "orchestrator" / "staging_runs" / run_id
-    configure_staging_barrier(_staging_root, enabled=True)
+    git_snapshot: GitRunSnapshot | None = None
+    rollback_applied = False
+    rollback_reason: str | None = None
+    success_restore_ok = True
+    success_restore_error: str | None = None
+    git_snapshot = _capture_git_run_snapshot(run_id)
     merged_phase3_audit = {
         "execution_history": [],
         "attempt_failures": [],
@@ -5054,10 +5250,13 @@ def run(
         "agent7_force_gate_entries": [],
         "agent7_force_gate_rejections": [],
         "agent7_force_gate_reason_samples": [],
-        "staging_root": str(_staging_root.relative_to(PROJECT_ROOT)),
-        "staging_changes": [],
-        "commit_applied": False,
-        "discard_reason": None,
+        "git_run_start_sha": git_snapshot.start_sha,
+        "git_pre_run_dirty": git_snapshot.pre_run_dirty,
+        "git_stash_used": git_snapshot.stash_used,
+        "git_rollback_applied": False,
+        "git_rollback_reason": None,
+        "git_success_restore_ok": True,
+        "git_success_restore_error": None,
         "estimated_token_consumption": 0,
         "retry_count": 0,
     }
@@ -5177,14 +5376,6 @@ def run(
                 )
             progress.advance(task)
 
-            # Commit staging barrier to workspace only after Phase 4 succeeds.
-            _staging_changes = list_staging_changes()
-            _commit_result = commit_staging_to_workspace()
-            merged_phase3_audit["staging_changes"] = _staging_changes
-            merged_phase3_audit["commit_applied"] = bool(_commit_result.get("applied", False))
-            merged_phase3_audit["discard_reason"] = "committed"
-            discard_staging_changes()
-
             # Phase 5
             audit.set_phase(5)
             progress.update(task, description="Phase 5/5: Finalizing metrics...")
@@ -5204,15 +5395,33 @@ def run(
             docs_in_diff = {f for f in _git_diff_files() if f.startswith("docs/")}
             files_modified = sorted(set(all_modified) | docs_in_diff)
     finally:
-        _stage_status = get_staging_barrier_status()
-        if _stage_status.get("enabled", False):
-            merged_phase3_audit["staging_changes"] = list_staging_changes()
-            if not merged_phase3_audit.get("commit_applied", False):
-                merged_phase3_audit["discard_reason"] = (
-                    merged_phase3_audit.get("discard_reason")
-                    or ("run_failed" if not success else "cleanup")
-                )
-            discard_staging_changes()
+        if git_snapshot is not None:
+            if success:
+                try:
+                    _restore_snapshot_on_success(git_snapshot)
+                except Exception as exc:  # noqa: BLE001
+                    success_restore_ok = False
+                    success_restore_error = str(exc)
+                    console.print(
+                        "[yellow][Git] Run succeeded but failed to restore pre-run stash: "
+                        f"{success_restore_error}"
+                    )
+            else:
+                try:
+                    _rollback_to_snapshot(git_snapshot)
+                    rollback_applied = True
+                    rollback_reason = "run_failed"
+                except Exception as exc:  # noqa: BLE001
+                    rollback_applied = False
+                    rollback_reason = f"rollback_failed: {exc}"
+                    console.print(
+                        "[red][Git] Automatic rollback failed: "
+                        f"{rollback_reason}"
+                    )
+        merged_phase3_audit["git_rollback_applied"] = rollback_applied
+        merged_phase3_audit["git_rollback_reason"] = rollback_reason
+        merged_phase3_audit["git_success_restore_ok"] = success_restore_ok
+        merged_phase3_audit["git_success_restore_error"] = success_restore_error
         audit.add_phase3_data(
             merged_phase3_audit.get("execution_history", []),
             merged_phase3_audit.get("attempt_failures", []),
@@ -5224,7 +5433,7 @@ def run(
             console.print(
                 f"[dim][Audit] Files modified: {', '.join(files_modified)}[/dim]"
             )
-        if not success and _lakefile_added_by_us:
+        if not success and _lakefile_added_by_us and not rollback_applied:
             _remove_algorithm_from_lakefile(Path(target_file).stem)
 
 

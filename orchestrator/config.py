@@ -24,13 +24,14 @@ AUDIT_ENABLED = os.getenv("ORCHESTRATOR_AUDIT", "1") != "0"
 # Full-audit controls (default ON; can be disabled via env for privacy/volume).
 AUDIT_FULL_PROMPTS_ENABLED = os.getenv("SGD_AUDIT_FULL_PROMPTS", "1") != "0"
 AUDIT_CODE_PATCH_ENABLED = os.getenv("SGD_AUDIT_CODE_PATCH", "1") != "0"
+AUDIT_FLUSH_INTERVAL_SECONDS = int(os.getenv("ORCHESTRATOR_AUDIT_FLUSH_INTERVAL", "60"))
 
 # ---------------------------------------------------------------------------
 # API keys (loaded from .env or environment)
 # ---------------------------------------------------------------------------
 
 API_KEYS: dict[str, str] = {
-    "qwen": os.getenv("QWEN_API_KEY", "sk-71231aa14faa4a319a61d4c59208f9a4"),
+    "qwen": os.getenv("QWEN_API_KEY", "sk-sp-4626175acf3049baa139a39a53b87105"),
     "deepseek": os.getenv("DEEPSEEK_API_KEY", "sk-2f6d72eb427d44d8b96b96da7c6f9b5c"),
     "anthropic": os.getenv("ANTHROPIC_API_KEY", ""),
 }
@@ -40,7 +41,7 @@ API_KEYS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 PROVIDER_URLS: dict[str, str] = {
-    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "qwen": "https://coding.dashscope.aliyuncs.com/v1",
     "deepseek": "https://api.deepseek.com",
 }
 
@@ -212,6 +213,16 @@ def _get_default_references(target_file: str) -> list[str]:
     return refs
 
 
+# Agent6 auto-route: when False, system never auto-routes to Agent6 from pattern detection.
+# Agent6 is invoked only when Agent7's protocol explicitly indicates a missing glue lemma.
+AGENT6_AUTO_ROUTE_ENABLED = False
+
+# Known Mathlib name corrections: wrong identifier -> correct replacement.
+# Applied before escalation to avoid routing trivial fixes to Agent6/Agent7.
+UNKNOWN_IDENTIFIER_RENAME_MAP: dict[str, str] = {
+    "pow_le_one": "Left.pow_le_one_of_le",
+}
+
 RETRY_LIMITS: dict[str, int] = {
     "MAX_PHASE2_APPROVAL_ROUNDS": 10,
     "MAX_PHASE3_RETRIES": 5,
@@ -224,8 +235,8 @@ RETRY_LIMITS: dict[str, int] = {
     "AGENT6_AUTO_ROUTE_MIN_TURN": 3,
     "MAX_AGENT7_INVOCATIONS_PER_ATTEMPT": 2,
     "AGENT7_STEP_NO_PROGRESS_THRESHOLD": 2,
-    "AGENT7_FORCE_STALE_LINE_THRESHOLD": 3,
-    "AGENT7_FORCE_NO_PROGRESS_TURNS": 2,
+    "AGENT7_FORCE_STALE_LINE_THRESHOLD": 5,
+    "AGENT7_FORCE_NO_PROGRESS_TURNS": 4,
     "AGENT7_FORCE_AFTER_SOFT_WARN": 1,
 }
 

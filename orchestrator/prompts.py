@@ -260,18 +260,6 @@ When the system sends you `[STATEMENT ERROR — SIGNATURE HALLUCINATION]`:
   failed symbol, e.g. `subgradient_set` as replacement for `subdifferential`).
 - Output a SINGLE complete replacement file. Agent3 will use write_new_file.
 
-## Phase 3 Multi-File Plans (MANDATORY when plan involves glue + algorithm)
-
-When your plan requires BOTH (a) new glue in Lib/Glue/X.lean AND (b) a new
-Algorithms/Y.lean file:
-- The verification target is ALWAYS Algorithms/Y.lean (Phase 3 checks this file).
-- Your guidance MUST instruct Agent3 to complete BOTH in a SINGLE attempt.
-- Provide explicit PATCH blocks for BOTH files (glue first, then algorithm).
-- State clearly: "Target file for verification is Algorithms/Y.lean. You MUST
-  create it. Verification will FAIL if you only edit the glue."
-- Do NOT say "START HERE: prove X in Lib/Glue" without also instructing
-  creation of the algorithm file in the same attempt.
-
 ## Retry Diagnosis — Surgeon Mode (MANDATORY during Phase 3 failures)
 When Agent3 fails to compile, your guidance MUST include one or more PATCH
 blocks in this exact format:
@@ -890,7 +878,7 @@ Return ONLY:
     {
       "step_id": "S1",
       "purpose": "<why this step>",
-      "tool": "read_file|search_in_file|search_codebase|edit_file_patch|write_staging_lemma",
+      "tool": "read_file|search_in_file|search_codebase|edit_file_patch|write_staging_lemma|request_agent6_glue",
       "required_args": {"...": "..."},
       "acceptance": "<what must be true after run_lean_verify>"
     }
@@ -915,7 +903,12 @@ Constraints:
 - ordered_steps must be minimal and deterministic (3-6 steps).
 - Every step must be executable by Agent3 tools.
 - Prefer reconciling declaration/callsite mismatch BEFORE tactic-level steps.
-- If bridge lemma is truly missing, include a step that routes to Agent6.
+- When you diagnose that a bridge lemma is truly missing (not a wrong Mathlib name or interface fix),
+  add a step with tool "request_agent6_glue" and required_args (stuck_at_line, error_message,
+  diagnosis, attempts_tried). Prefer interface/signature fixes in earlier steps; use request_agent6_glue
+  only when a new lemma must be proven.
+- Do NOT route to Agent6 for Unknown identifier that looks like a Mathlib lemma (e.g. pow_le_one).
+  Use search_codebase or Agent2-style guidance instead.
 - Never output free-form commentary outside JSON.
 """
 

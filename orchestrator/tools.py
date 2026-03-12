@@ -38,12 +38,9 @@ _STAGING_STATE: dict[str, Any] = {
     "written_relpaths": set(),  # set[str]
 }
 
-_STAGING_PREFIXES = (
-    "Lib/Glue/Staging/",
-    "Lib/Glue/",
-    "Lib/Layer0/",
-    "docs/",
-)
+# File-level staging barrier is deprecated. Keep API surface for compatibility,
+# but do not remap workspace files through staging roots.
+_STAGING_PREFIXES: tuple[str, ...] = ()
 
 
 def _to_rel(path: Path) -> str:
