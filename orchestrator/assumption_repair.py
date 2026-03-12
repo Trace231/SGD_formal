@@ -414,6 +414,37 @@ def _fix_exact_needs_funext(line: str) -> str | None:
     return m.group(1) + "exact funext " + name + m.group(4)
 
 
+def _find_actual_tactic_line(lines: list[str], error_lineno: int, error_msg: str) -> int:
+    """Resolve the Lean error line to the actual failing tactic.
+
+    Lean reports "unsolved goals" / "No goals to be solved" at the position of
+    the ``by`` keyword that opens a tactic block (e.g. the end of a long
+    ``have ... := by`` declaration), NOT at the failing tactic inside.
+
+    This helper scans forward from *error_lineno* up to 10 lines to find the
+    first line whose content matches the expected failing tactic:
+    - ``simp`` for "unsolved goals"
+    - ``exact`` for "No goals to be solved"
+
+    If the error line does not end with ``by``, it is returned unchanged.
+    """
+    if error_lineno < 1 or error_lineno > len(lines):
+        return error_lineno
+    line = lines[error_lineno - 1]
+    if not line.rstrip().endswith("by"):
+        return error_lineno
+    for offset in range(1, 10):
+        idx = error_lineno - 1 + offset
+        if idx >= len(lines):
+            break
+        candidate = lines[idx]
+        if "unsolved goals" in error_msg and "simp" in candidate:
+            return error_lineno + offset
+        if "No goals to be solved" in error_msg and "exact" in candidate:
+            return error_lineno + offset
+    return error_lineno
+
+
 def apply_staging_rules(
     staging_path: Path,
     error_text: str,
@@ -439,8 +470,11 @@ def apply_staging_rules(
         error_by_line[lineno] = msg
 
     if not error_by_line:
-        # Also try relative path match
-        rel = str(staging_path.relative_to(PROJECT_ROOT))
+        # Also try relative path match (skip if outside project root)
+        try:
+            rel = str(staging_path.relative_to(PROJECT_ROOT))
+        except ValueError:
+            rel = staging_path.name
         for m in re.finditer(
             re.escape(rel) + r":(\d+):\d+: error: (.+?)(?=\n\S|\Z)",
             error_text,
@@ -456,16 +490,46 @@ def apply_staging_rules(
     for lineno, msg in error_by_line.items():
         if lineno < 1 or lineno > len(lines):
             continue
-        idx = lineno - 1
+        # Lean reports errors at the `by` keyword, not at the failing tactic.
+        # Resolve to the actual tactic line before applying any fix.
+        actual_lineno = _find_actual_tactic_line(lines, lineno, msg)
+        if actual_lineno < 1 or actual_lineno > len(lines):
+            actual_lineno = lineno
+        idx = actual_lineno - 1
         original = lines[idx]
 
-        if "unsolved goals" in msg:
+        # Simp over-specification: "simp made no progress", "unknown identifier … simp",
+        # or residual "unsolved goals" after a bad simp call.
+        _simp_related = (
+            "simp made no progress" in msg
+            or "unknown identifier" in msg and "simp" in msg
+            or "unsolved goals" in msg
+        )
+        if _simp_related:
             fixed_line = _fix_overspecified_simp(original)
             if fixed_line is not None:
                 lines[idx] = fixed_line
                 fixed += 1
 
-        elif "No goals to be solved" in msg:
+        # "No goals to be solved" has two distinct meanings depending on context:
+        #   (a) Lean hinted "try 'exact funext h'" → the exact needs funext wrapping
+        #   (b) No funext hint → `convert` already closed all goals; the `exact` is
+        #       redundant and should be deleted
+        if "No goals to be solved" in msg:
+            if "exact funext" in msg:
+                # Case (a): Lean suggested funext
+                fixed_line = _fix_exact_needs_funext(original)
+                if fixed_line is not None:
+                    lines[idx] = fixed_line
+                    fixed += 1
+            elif original.strip().startswith("exact "):
+                # Case (b): redundant exact — replace with empty string
+                lines[idx] = ""
+                fixed += 1
+
+        # `exact h` that should be `exact funext h` due to "type mismatch" with
+        # an explicit funext hint in the error message.
+        elif "exact funext" in msg or ("type mismatch" in msg and "exact" in original):
             fixed_line = _fix_exact_needs_funext(original)
             if fixed_line is not None:
                 lines[idx] = fixed_line
@@ -473,17 +537,57 @@ def apply_staging_rules(
             else:
                 # Also try the line immediately before the error line
                 # (the `exact` might be on the same line as `convert` output)
-                if lineno >= 2:
-                    prev_line = lines[lineno - 2]
+                if actual_lineno >= 2:
+                    prev_line = lines[actual_lineno - 2]
                     fixed_prev = _fix_exact_needs_funext(prev_line.rstrip("\n"))
                     if fixed_prev is not None:
-                        lines[lineno - 2] = fixed_prev + "\n"
+                        lines[actual_lineno - 2] = fixed_prev + "\n"
                         fixed += 1
 
     if fixed > 0:
         staging_path.write_text("".join(lines), encoding="utf-8")
 
     return fixed
+
+
+# ---------------------------------------------------------------------------
+# LM staging patch application — for when rule engine returns 0
+# ---------------------------------------------------------------------------
+
+def apply_lm_staging_patches(
+    staging_path: Path,
+    patches: list[dict[str, Any]],
+) -> int:
+    """Apply LLM-generated search/replace patches to the staging file.
+
+    Each patch entry must have ``search`` (exact verbatim text to replace) and
+    ``replace`` (corrected Lean code).  Only patches whose ``search`` string is
+    found exactly once in the file are applied.
+
+    Returns the number of patches successfully applied.
+    """
+    if not staging_path.exists() or not patches:
+        return 0
+
+    content = staging_path.read_text(encoding="utf-8")
+    applied = 0
+    for patch in patches:
+        if not isinstance(patch, dict):
+            continue
+        search = patch.get("search", "")
+        replace = patch.get("replace", "")
+        if not search:
+            continue
+        occurrences = content.count(search)
+        if occurrences != 1:
+            # Skip ambiguous or missing patches
+            continue
+        content = content.replace(search, replace, 1)
+        applied += 1
+
+    if applied > 0:
+        staging_path.write_text(content, encoding="utf-8")
+    return applied
 
 
 # ---------------------------------------------------------------------------
@@ -497,12 +601,94 @@ def parse_diagnosis_json(diagnosis_text: str) -> dict[str, Any]:
     """Extract and parse the structured JSON block from Agent5's diagnosis.
 
     Returns the parsed dict, or {"auto_repairable": False} if no valid JSON.
+    Required keys validated: classification (str), auto_repairable (bool).
     """
     for m in _JSON_BLOCK_RE.finditer(diagnosis_text):
         try:
             data = json.loads(m.group(1))
-            if isinstance(data, dict):
-                return data
+            if not isinstance(data, dict):
+                continue
+            # Enforce required keys
+            if "classification" not in data:
+                data["classification"] = "UNKNOWN"
+            if "auto_repairable" not in data:
+                data["auto_repairable"] = False
+            # Validate assumptions_to_add entries
+            if "assumptions_to_add" in data:
+                valid = []
+                for entry in data["assumptions_to_add"]:
+                    if not isinstance(entry, dict):
+                        continue
+                    if not entry.get("theorem") or not entry.get("hyp_name") or not entry.get("hyp_type"):
+                        continue
+                    valid.append(entry)
+                data["assumptions_to_add"] = valid
+                if not valid:
+                    data["auto_repairable"] = False
+            return data
         except json.JSONDecodeError:
             continue
-    return {"auto_repairable": False}
+    return {"auto_repairable": False, "classification": "UNKNOWN"}
+
+
+# ---------------------------------------------------------------------------
+# Theorem-location helpers — find which theorem contains a given line
+# ---------------------------------------------------------------------------
+
+def detect_theorem_at_line(file_path: Path, line_no: int) -> str | None:
+    """Find the theorem/lemma name that contains the given 1-based line number.
+
+    Searches backwards from *line_no* for the nearest `theorem`/`lemma`
+    declaration.  Returns the declaration name, or None if not found.
+    """
+    try:
+        lines = file_path.read_text(encoding="utf-8").split("\n")
+    except OSError:
+        return None
+    decl_re = re.compile(r"\b(?:theorem|lemma)\s+(\w+)\b")
+    limit = min(line_no - 1, len(lines) - 1)
+    for i in range(limit, -1, -1):
+        m = decl_re.search(lines[i])
+        if m:
+            return m.group(1)
+    return None
+
+
+def goals_to_patch_list(
+    goals: list[dict[str, Any]],
+    file_path: Path,
+    *,
+    existing_names: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Convert extracted unsolved goals into patch entries for apply_assumption_patches.
+
+    Only MISSING_ASSUMPTION goals are included.  Duplicate types are deduplicated.
+    Each entry has: theorem, hyp_name, hyp_type, insert_after (None).
+    """
+    patches: list[dict[str, Any]] = []
+    seen_types: set[str] = set()
+    _names: set[str] = set(existing_names) if existing_names else set()
+
+    for g in goals:
+        if classify_goal(g["goal"]) != "MISSING_ASSUMPTION":
+            continue
+        hyp_type = g["goal"].lstrip("⊢ ").strip()
+        if not hyp_type or hyp_type in seen_types:
+            continue
+        seen_types.add(hyp_type)
+
+        theorem_name = detect_theorem_at_line(file_path, g["line"])
+        if not theorem_name:
+            continue
+
+        hyp_name = generate_hyp_name(hyp_type, _names)
+        _names.add(hyp_name)
+
+        patches.append({
+            "theorem": theorem_name,
+            "hyp_name": hyp_name,
+            "hyp_type": hyp_type,
+            "insert_after": None,
+        })
+
+    return patches

@@ -325,7 +325,11 @@ Example — epoch contraction sorry:
    - `path`: the staging file path (e.g. `"Lib/Glue/Staging/SVRGOuterLoop.lean"`)
    - `lean_code`: the full Lean block including docstring and `sorry` body.
    - NEVER include `import Algorithms.*` in the lemma — this causes a build cycle.
-3. Only after writing the lemma, provide guidance for Agent3 that references it.
+3. Check `staging_compile_ok` in the write_staging_lemma result. If false, fix the
+   type signature with `edit_file_patch` on the staging file (sorry proof bodies
+   are OK — only type errors must be resolved) before issuing any guidance.
+4. Only after writing the lemma (and fixing any type errors), provide guidance
+   for Agent3 that references it.
 Skipping step 2 will cause Agent3 to fail immediately when it tries to use a
 lemma that does not exist.
 
@@ -346,7 +350,8 @@ or type class, you MUST verify its exact signature.  Use a lookup request:
 
 Rules:
 - Available tools: `read_file`, `read_file_readonly`, `search_in_file`,
-  `search_in_file_readonly`, `search_codebase`, `write_staging_lemma`.
+  `search_in_file_readonly`, `search_codebase`, `write_staging_lemma`,
+  `edit_file_patch`, `run_lean_verify`.
 - Output the JSON above (with `"type": "lookup"`) to request file lookups or
   to invoke `write_staging_lemma`.  The system will execute the tools and
   return the results.
@@ -401,6 +406,10 @@ the Planner (Agent2).  You receive:
   search_in_file to verify the correct identifier/API before applying any patch.**
 - **When errors are deep in proof body**: You may reason locally (tactic
   choice, lemma application) within the guidance's strategy.
+- **When a tactic reports "made no progress" or "did not simplify"**: Prefer
+  switching to a different tactic family (e.g. from simp to ring, convert, calc,
+  or manual rewrite) rather than repeatedly tweaking the same tactic's arguments
+  (e.g. different simp lemmas).
 - **When the theorem statement itself is broken** (unknown symbol in signature):
   Do not rewrite the whole file — escalate by outputting a minimal tool_calls
   that signals you need Planner (Agent2) guidance.
@@ -587,6 +596,32 @@ You have access to the following tools.  Call them via JSON tool_calls.
    - NOTE: If elaboration times out, the file likely has import errors.
      Fix those first with run_lean_verify, then retry get_lean_goal.
 
+3d. **write_staging_lemma(staging_path, lean_code)** — ADD GLUE LEMMA TO STAGING
+   - Append a new Lean declaration (theorem, lemma, noncomputable def) to the
+     staging file (e.g. Lib/Glue/Staging/SVRGOuterLoop.lean).
+   - Arguments: staging_path (path to the staging file), lean_code (complete
+     Lean block; may use `sorry` as proof body).
+   - The result includes staging_compile_ok. If False, the staging file has
+     type errors — fix them with edit_file_patch on the staging file before
+     escalating.
+   - USE WHEN: You diagnose a "missing glue lemma" — unknown identifier, type
+     mismatch at ω/Ω, goal needing a bridge lemma. Try adding it via
+     write_staging_lemma BEFORE escalating to Agent2.
+   - WORKFLOW: (1) Add lemma with write_staging_lemma; (2) If staging_compile_ok
+     is False, fix type errors with edit_file_patch on the staging file;
+     (3) Call request_agent2_help only if you cannot correct the types after trying.
+
+## Infrastructure discovery — when to add glue lemmas yourself
+Signs of a MISSING INFRASTRUCTURE (glue lemma) rather than a tactical error:
+- "unknown identifier" for a concept you need (e.g. condExp, expectation of X given Y)
+- Type mismatch involving ω : Ω or Ω → E — goal expects deterministic type
+- "expected type X but got Y" where the bridge between X and Y is a known
+  mathematical step (integral, Fubini, measurability transfer)
+Before escalating: (1) Check Lib/Glue/*.lean and the staging file for similar
+lemmas; (2) If none exist, add the lemma via write_staging_lemma; (3) If
+staging_compile_ok is False, fix the signature with edit_file_patch; (4)
+Escalate only when you cannot materialize a correct Lean declaration locally.
+
 **RULE**: When starting a new algorithm proof, you MUST call `write_new_file`
 first to create the initial file scaffold, then use `edit_file_patch` for
 subsequent edits.  Calling `run_lean_verify` on a non-existent file will
@@ -614,8 +649,8 @@ output `"tool": "done"` and will tell you the real result.  Do NOT rely on
 your own belief that the build is clean — only `run_lean_verify` is authoritative.
 
 Allowed tools: read_file, read_file_readonly, search_in_file, search_in_file_readonly,
-search_codebase, edit_file_patch, write_new_file, get_lean_goal, check_lean_have,
-run_lean_verify, request_agent2_help.
+search_codebase, edit_file_patch, write_new_file, write_staging_lemma, get_lean_goal,
+check_lean_have, run_lean_verify, request_agent2_help.
 
 **Convention 4 (Used-in tags):** EVERY ``theorem``, ``lemma``, and
 ``noncomputable def`` you write MUST have a Lean docstring (``/-- ... -/``)
@@ -855,8 +890,7 @@ missing hypotheses exactly:
 }
 ```
 
-When the errors are in a `Lib/Glue/Staging/` file and match a mechanical
-pattern (over-specified simp set, or `exact h` needing `funext`):
+When the errors are in a `Lib/Glue/Staging/` file:
 
 ```json
 {
@@ -868,9 +902,22 @@ pattern (over-specified simp set, or `exact h` needing `funext`):
       "pattern": "over_specified_simp",
       "description": "Remove SVRGSetup.svrgProcess from simp set"
     }
+  ],
+  "staging_patches": [
+    {
+      "search": "<exact verbatim lines from the staging file to replace — must match file content character-for-character>",
+      "replace": "<corrected Lean code to substitute>"
+    }
   ]
 }
 ```
+
+**Rules for `staging_patches`:**
+- `search` must be copied VERBATIM from the staging file (exact whitespace, indentation, newlines).
+- `search` must appear **exactly once** in the file; do not include surrounding context that would make it ambiguous.
+- `replace` must be valid Lean 4 code that fixes the error.
+- Provide one patch entry per distinct error.
+- Always include `staging_patches` when `auto_repairable` is true — the system tries rule-based fixes first; `staging_patches` is the fallback when rules cannot fix the error automatically.
 
 For all other classifications output:
 

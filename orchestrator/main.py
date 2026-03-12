@@ -17,6 +17,7 @@ Or interactive mode::
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import re
@@ -35,7 +36,14 @@ from orchestrator.agents import (
     auto_repair_loop,
     escalate,
 )
-from orchestrator.assumption_repair import apply_staging_rules
+from orchestrator.assumption_repair import (
+    apply_assumption_patches,
+    apply_staging_rules,
+    all_goals_are_assumptions,
+    classify_goal,
+    extract_unsolved_goals,
+    goals_to_patch_list,
+)
 from orchestrator.config import (
     DOC_ANCHORS,
     LIB_GLUE_ANCHORS,
@@ -46,7 +54,7 @@ from orchestrator.file_io import (
     load_file,
     snapshot_file,
 )
-from orchestrator.tools import _path_to_lean_module
+from orchestrator.tools import _path_to_lean_module, write_staging_lemma
 from orchestrator.metrics import (
     MetricsStore,
     capture_physical_metrics,
@@ -199,6 +207,24 @@ def _parse_lean_errors(verify_text: str) -> list[dict]:
             })
 
     return errors
+
+
+def _json_candidates(text: str) -> list[str]:
+    """Return candidate JSON strings to try parsing, in priority order.
+
+    1. The full text (LLM followed instructions exactly).
+    2. From the first ``{`` to the last ``}`` (LLM prepended prose).
+    3. Content inside a ```json ... ``` or ``` ... ``` fenced block.
+    """
+    candidates = [text]
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        candidates.append(text[first_brace : last_brace + 1])
+    import re as _re
+    for m in _re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, _re.DOTALL):
+        candidates.append(m.group(1))
+    return candidates
 
 
 def _classify_lean_error_structured(
@@ -1184,6 +1210,22 @@ def _call_agent2_with_tools(
                 result = registry.call(tool_name, **args)
             except Exception as exc:  # noqa: BLE001
                 result = {"error": str(exc)}
+            # Auto-verify staging after write_staging_lemma; embed compile result
+            if tool_name == "write_staging_lemma" and result.get("success"):
+                _stg_path = result.get("path", "")
+                if _stg_path:
+                    _stg_verify = registry.call("run_lean_verify", _stg_path)
+                    if _stg_verify.get("exit_code", 0) != 0:
+                        result["staging_compile_ok"] = False
+                        result["staging_compile_errors"] = _stg_verify.get("errors", [])
+                        result["note"] = (
+                            "STAGING COMPILE ERROR: type errors found (sorry is OK, "
+                            "type errors are NOT). Fix the signature with edit_file_patch "
+                            "before providing guidance to Agent3."
+                        )
+                    else:
+                        result["staging_compile_ok"] = True
+                        result["staging_sorry_count"] = _stg_verify.get("sorry_count", 0)
             results.append({"tool": tool_name, "arguments": args, "result": result})
 
         results_text = json.dumps(results, indent=2, ensure_ascii=False)
@@ -1240,8 +1282,9 @@ def _execute_single_tool_and_format(
     except KeyError as exc:
         return (
             f"## Tool error\ntool `{tool_name}` is not registered. "
-            f"Available: read_file, search_in_file, edit_file_patch, "
-            f"write_new_file, run_lean_verify.\nError: {exc}\n"
+            f"Available: read_file, search_in_file, edit_file_patch, write_new_file, "
+            f"write_staging_lemma, get_lean_goal, check_lean_have, run_lean_verify, "
+            f"request_agent2_help.\nError: {exc}\n"
             "Choose a valid tool.",
             None,
             False,
@@ -1332,6 +1375,46 @@ def _execute_single_tool_and_format(
             f"SUCCESS. File updated.\n"
             "Call run_lean_verify to check the build."
         )
+    elif tool_name == "write_staging_lemma":
+        edited = True
+        # Auto-verify staging after append (mirrors _call_agent2_with_tools logic)
+        if result.get("success") and result.get("path"):
+            _stg_verify = registry.call("run_lean_verify", result["path"])
+            if _stg_verify.get("exit_code", 0) != 0:
+                result["staging_compile_ok"] = False
+                result["staging_compile_errors"] = _stg_verify.get("errors", [])
+                result["note"] = (
+                    "STAGING COMPILE ERROR: type errors found (sorry is OK, "
+                    "type errors are NOT). Fix the signature with edit_file_patch "
+                    "on the staging file. If you cannot fix locally, escalate via request_agent2_help."
+                )
+            else:
+                result["staging_compile_ok"] = True
+                result["staging_sorry_count"] = _stg_verify.get("sorry_count", 0)
+        if result.get("staging_compile_ok") is True:
+            result_msg = (
+                f"## write_staging_lemma result\n"
+                f"SUCCESS. Lemma appended. staging_compile_ok=true.\n"
+                f"Call run_lean_verify on the target file to check the full build."
+            )
+        elif result.get("staging_compile_ok") is False:
+            err_list = result.get("staging_compile_errors", [])
+            err_text = "\n".join(err_list) if isinstance(err_list, list) else str(err_list)
+            result_msg = (
+                f"## write_staging_lemma result\n"
+                f"Lemma appended but staging_compile_ok=false — type errors in staging file.\n\n"
+                f"### Staging compile errors\n```\n{err_text[:2000]}\n```\n\n"
+                f"Fix the type errors with edit_file_patch on the staging file. "
+                f"If you cannot fix after trying, call request_agent2_help."
+            )
+        elif not result.get("success"):
+            result_msg = f"## write_staging_lemma result\nFAILED: {result.get('error', 'unknown error')}"
+        else:
+            result_msg = (
+                f"## write_staging_lemma result\n"
+                f"SUCCESS. Lemma appended (path={result.get('path', '')}). "
+                f"Call run_lean_verify on the target file."
+            )
     else:
         # read_file, search_in_file, overwrite_file, etc.
         if isinstance(result, dict):
@@ -1483,20 +1566,42 @@ def phase2_plan_and_approve(
                     f"(attempt {_retry + 1}/3)"
                 )
                 continue
-            try:
-                review = json.loads(review_raw)
+            # Extract the JSON object even if the LLM prepended prose text.
+            # Try three strategies in order:
+            #   1. Direct parse (LLM followed instructions exactly)
+            #   2. Find first '{' and parse from there
+            #   3. Extract a ```json ... ``` fenced block
+            _parsed: dict | None = None
+            _parse_err: json.JSONDecodeError | None = None
+            for _candidate in _json_candidates(review_raw):
+                try:
+                    _obj = json.loads(_candidate)
+                    if isinstance(_obj, dict):
+                        _parsed = _obj
+                        break
+                except json.JSONDecodeError as _exc:
+                    _parse_err = _exc
+            if _parsed is not None:
+                review = _parsed
                 break
-            except json.JSONDecodeError as exc:
-                if _retry < 2:
-                    console.print(
-                        f"[yellow][Phase 2] Reviewer returned invalid JSON "
-                        f"(attempt {_retry + 1}/3): {exc.msg}"
-                    )
-                    continue
-                raise RuntimeError(
-                    "[Phase 2] Reviewer returned invalid JSON after 3 attempts. "
-                    f"line={exc.lineno}, col={exc.colno}, msg={exc.msg}"
-                ) from exc
+            exc = _parse_err or json.JSONDecodeError("no JSON found", review_raw, 0)
+            if _retry < 2:
+                console.print(
+                    f"[yellow][Phase 2] Reviewer returned invalid JSON "
+                    f"(attempt {_retry + 1}/3): {exc.msg}"
+                )
+                review_prompt = (
+                    "Your previous response could not be parsed as JSON. "
+                    "Return ONLY a single JSON object with NO surrounding text:\n"
+                    '{"decision": "APPROVED" | "AMEND" | "REJECTED", "feedback": "..."}\n\n'
+                    "Do NOT include any explanation, markdown, or code fences.\n\n"
+                    f"Plan to review:\n{plan}"
+                )
+                continue
+            raise RuntimeError(
+                "[Phase 2] Reviewer returned invalid JSON after 3 attempts. "
+                f"line={exc.lineno}, col={exc.colno}, msg={exc.msg}"
+            ) from exc
         else:
             raise RuntimeError("[Phase 2] Reviewer returned empty response after 3 attempts.")
 
@@ -1677,13 +1782,15 @@ def phase3_prove(
     agent3 = Agent("sorry_closer", extra_files=[target_file])
     registry = ToolRegistry()
     registry.register_default_tools()
+    _algo_name_for_staging = Path(target_file).stem  # e.g. "SVRGOuterLoop"
+    registry.register(
+        "write_staging_lemma",
+        functools.partial(write_staging_lemma, target_algo=_algo_name_for_staging),
+    )
     # Read-only registry for Agent2 lookup rounds (no write tools exposed).
     readonly_registry = ToolRegistry()
     readonly_registry.register_readonly_tools()
     # Staging registry: read tools + write_staging_lemma for Agent2 mid-proof escalation.
-    # target_algo is extracted from the target file stem and passed as a partial so that
-    # the circular-dependency guard in write_staging_lemma knows which algorithm to block.
-    _algo_name_for_staging = Path(target_file).stem  # e.g. "SVRGOuterLoop"
     staging_registry = ToolRegistry()
     staging_registry.register_staging_tools(target_algo=_algo_name_for_staging)
     diag_log: list[str] = []
@@ -1816,6 +1923,14 @@ def phase3_prove(
     _last_error_sig: str | None = None
     _consecutive_repeat_count: int = 0
 
+    # Loop guard: track which attempt numbers have already had assumption auto-patching
+    # applied, to avoid re-patching the same theorem with the same hypothesis.
+    _assumption_patch_tried: set[str] = set()
+
+    # Loop guard: consecutive DEPENDENCY_COMPILE_ERROR streak (same staging error).
+    _dep_error_streak: int = 0
+    _last_dep_error_sig: str | None = None
+
     # Failed approaches history: accumulates structured failure records across attempts.
     # Injected into Agent2 prompts so it avoids repeating strategies that already failed.
     _failed_approaches: list[dict] = []
@@ -1868,8 +1983,14 @@ def phase3_prove(
             )
             else ""
         )
+        _attempt_awareness = (
+            f"[Attempt {attempt} of {max_retries}. Current sorry_count: {last_sorry_count}.]\n\n"
+            if attempt > 1
+            else ""
+        )
         prover_prompt = (
-            _file_absent_prefix
+            _attempt_awareness
+            + _file_absent_prefix
             + "Use tools to close sorry placeholders.\n"
             "Return ONLY valid JSON with exactly three keys: thought, tool, arguments.\n"
             "Output ONE action per response. After each action you will receive its "
@@ -1878,8 +1999,8 @@ def phase3_prove(
             "To signal no further actions are needed: "
             '{"thought": "...", "tool": "done", "arguments": {}}\n'
             "Allowed tools: read_file, read_file_readonly, search_in_file, search_in_file_readonly, "
-            "search_codebase, edit_file_patch, write_new_file, get_lean_goal, check_lean_have, "
-            "run_lean_verify, request_agent2_help.\n"
+            "search_codebase, edit_file_patch, write_new_file, write_staging_lemma, get_lean_goal, "
+            "check_lean_have, run_lean_verify, request_agent2_help.\n"
             "SITUATIONAL BEHAVIOR:\n"
             "- If guidance contains PATCH blocks (<<<SEARCH>>>/<<<REPLACE>>>): "
             "execute them exactly — copy old_str and new_str verbatim.\n"
@@ -1916,7 +2037,8 @@ def phase3_prove(
                 + (_staging_path.read_text(encoding="utf-8") if _staging_path.exists() else "")
                 + "\n```\n"
                 "If a lemma is NOT in Lib/Glue/*.lean but IS in this staging file, use it directly.\n"
-                f"To add a new lemma: edit_file_patch on {_staging_rel}.\n\n"
+                f"To add a new lemma: use write_staging_lemma(staging_path=\"{_staging_rel}\", "
+                f"lean_code=\"...\") to append, or edit_file_patch to modify existing content.\n\n"
             )
             + f"Guidance:\n{guidance}"
         )
@@ -2476,21 +2598,35 @@ def phase3_prove(
             )
             continue
 
-        # No-op trap: file unchanged but build was already clean (no progress made)
-        if not attempt_file_changed and last_exit_code == 0 and last_sorry_in_attempt == 0:
-            guidance = _call_agent2_with_tools(
-                agent2,
-                staging_registry,
-                f"Attempt {attempt} NOOP — Agent3 made no file changes.\n"
-                f"Target file: {target_file}\n"
-                "SURGEON MODE: Output a PATCH block (<<<SEARCH>>>/<<<REPLACE>>>) with the "
-                "exact Lean code Agent3 must write. Be specific — no natural language.",
-            )
-            console.print(
-                f"  [Agent3] attempt {attempt}/{max_retries} — "
-                "build=NOOP (file unchanged)"
-            )
-            continue
+        # No-op trap: file unchanged regardless of build status.
+        # NOTE: DEPENDENCY_COMPILE_ERROR is excluded — when staging is broken
+        # Agent3 correctly leaves the target file untouched; falling through to
+        # the dep-error handler below is the right behaviour.
+        if not attempt_file_changed and _tgt.exists():
+            if error_type_final == "DEPENDENCY_COMPILE_ERROR":
+                pass  # dep handler below will deal with it
+            elif last_exit_code == 0 and last_sorry_in_attempt == 0:
+                # File was already clean at attempt start — break to success gate.
+                console.print(
+                    f"  [Agent3] attempt {attempt}/{max_retries} — "
+                    "build=OK, sorry=0, file unchanged — target already met."
+                )
+                break
+            else:
+                _noop_ctx = (
+                    f"Attempt {attempt} NOOP — Agent3 made NO changes to {target_file}.\n"
+                    f"Build exit code: {last_exit_code} | Sorry count: {last_sorry_in_attempt}\n"
+                    f"Last error: {last_verify_text[:300]}\n\n"
+                    "SURGEON MODE: Agent3 must change the file. Output a PATCH block "
+                    "(<<<SEARCH>>>/<<<REPLACE>>>) with the exact Lean code to apply. "
+                    "Be specific — no natural language, no explanation without a patch."
+                )
+                guidance = _call_agent2_with_tools(agent2, staging_registry, _noop_ctx)
+                console.print(
+                    f"  [Agent3] attempt {attempt}/{max_retries} — "
+                    f"build={last_exit_code} (file UNCHANGED — NOOP forced)"
+                )
+                continue
 
         # DEPENDENCY_COMPILE_ERROR: staging/dep broken — fix dep, never rewrite target
         if error_type_final == "DEPENDENCY_COMPILE_ERROR":
@@ -2506,6 +2642,13 @@ def phase3_prove(
                 f"  [Agent3] attempt {attempt}/{max_retries} — "
                 "[cyan]DEPENDENCY_COMPILE_ERROR (post-attempt) — routing to dep-fix"
             )
+            # Track dep-error streak for loop-guard.
+            _dep_sig_now = hashlib.md5(_dep_errors_final[:200].encode()).hexdigest()[:16]
+            if _dep_sig_now == _last_dep_error_sig:
+                _dep_error_streak += 1
+            else:
+                _dep_error_streak = 0
+            _last_dep_error_sig = _dep_sig_now
             # Try deterministic rule-based staging fix first (no LLM call).
             _staging_rule_fixes_post = apply_staging_rules(_staging_path, last_verify_text)
             if _staging_rule_fixes_post > 0:
@@ -2513,6 +2656,7 @@ def phase3_prove(
                     f"  [Auto-fix] Applied {_staging_rule_fixes_post} rule-based "
                     f"fix(es) to {_staging_path.name} — retrying without Agent2 call."
                 )
+                _dep_error_streak = 0  # reset streak after a fix
                 continue
             _dep_staging_ctx = (
                 _staging_path.read_text(encoding="utf-8")
@@ -2522,6 +2666,11 @@ def phase3_prove(
                 agent2,
                 staging_registry,
                 _format_failed_approaches(_failed_approaches[-5:])
+                + (
+                    f"[DEP-ERROR STREAK: {_dep_error_streak} consecutive identical staging errors]\n"
+                    "You MUST change your approach — previous fixes did not work.\n\n"
+                    if _dep_error_streak >= 2 else ""
+                )
                 + f"[DEPENDENCY COMPILE ERROR — ATTEMPT {attempt} FAILED]\n"
                 f"Errors are in a dependency/staging file, NOT in {target_file}.\n\n"
                 f"Dependency errors:\n```\n{_dep_errors_final}\n```\n\n"
@@ -2597,6 +2746,49 @@ def phase3_prove(
             )
             continue
 
+        # ---- Assumption-type shortcut (routing table: Todo 2) ----
+        # If ALL unsolved goals in the error are assumption-shaped (Integrable,
+        # Measurable, etc.) try a deterministic hypothesis patch BEFORE calling
+        # Agent2.  This avoids burning an Agent2 LLM call on a mechanical fix.
+        _unsolved_goals_now = extract_unsolved_goals(last_verify_text)
+        if _unsolved_goals_now and all_goals_are_assumptions(_unsolved_goals_now):
+            # Build a stable key for this error signature to avoid re-patching.
+            _assm_err_key = hashlib.md5(
+                (last_verify_text[:300]).encode()
+            ).hexdigest()[:16]
+            if _assm_err_key not in _assumption_patch_tried:
+                _assumption_patch_tried.add(_assm_err_key)
+                _auto_patches = goals_to_patch_list(_unsolved_goals_now, _tgt)
+                if _auto_patches:
+                    _n_auto = apply_assumption_patches(target_file, _auto_patches)
+                    if _n_auto > 0:
+                        console.print(
+                            f"  [AssumptionRoute] Auto-patched {_n_auto} "
+                            "missing assumption(s) — re-verifying."
+                        )
+                        _re_verify_assm = registry.call("run_lean_verify", target_file)
+                        last_exit_code = int(_re_verify_assm.get("exit_code", 1))
+                        last_sorry_in_attempt = int(_re_verify_assm.get("sorry_count", -1))
+                        last_verify_text = str(_re_verify_assm.get("errors", ""))
+                        if last_exit_code == 0 and last_sorry_in_attempt == 0:
+                            # Full success — break to outer success gate
+                            last_verify_result = _re_verify_assm
+                            break
+                        if last_exit_code == 0:
+                            # Build clean but sorries remain — send Agent3 back in
+                            guidance = (
+                                f"[Auto-repair] Patched {_n_auto} missing assumption(s). "
+                                f"Build now clean with {last_sorry_in_attempt} sorry(s). "
+                                "Focus Agent3 on closing the remaining sorry placeholders."
+                            )
+                            continue
+                        # Patch applied but build still broken — use updated errors
+                        # and fall through to Agent2 with improved context
+                        console.print(
+                            "  [AssumptionRoute] Build still broken after patch — "
+                            "forwarding to Agent2 with assumption context."
+                        )
+
         # General failure: give Agent2 full context for new guidance
         mismatch_prefix = ""
         if patch_mismatch_in_attempt:
@@ -2669,11 +2861,38 @@ def phase3_prove(
             "5. Agent3 is forbidden from free exploration — patch only.\n\n"
             if _surgeon_mode_forced else ""
         )
+
+        # Gate Agent2 for assumption-shaped errors: if the error has only
+        # assumption-type goals, the problem is a missing hypothesis in the
+        # theorem signature — NOT a proof strategy issue.  Tell Agent2 to add
+        # the missing hypotheses rather than change the proof body.
+        _assumption_goals_detected = bool(
+            _unsolved_goals_now and all_goals_are_assumptions(_unsolved_goals_now)
+        )
+        _assumption_context_prefix = ""
+        if _assumption_goals_detected:
+            _missing_types = [
+                g["goal"].lstrip("⊢ ").strip()
+                for g in _unsolved_goals_now
+                if classify_goal(g["goal"]) == "MISSING_ASSUMPTION"
+            ]
+            _missing_list = "\n".join(f"  • {t}" for t in _missing_types[:6])
+            _assumption_context_prefix = (
+                "[ROUTING: MISSING ASSUMPTIONS — NOT A PROOF OBLIGATION]\n"
+                "All unsolved goals are missing hypothesis types that should be added "
+                "to the theorem signature, not fixed in the proof body.\n"
+                "Automatic patching was attempted but the build is still broken.\n"
+                "Missing hypothesis types:\n"
+                f"{_missing_list}\n\n"
+                "ACTION REQUIRED: Add the above as explicit hypotheses to the relevant "
+                "theorem signature (using `(h_foo : <type>)` parameters), then confirm "
+                "Agent3 does NOT change proof tactics for these — just add the params.\n\n"
+            )
         _history_prefix = _format_failed_approaches(_failed_approaches[-5:])
         guidance = _call_agent2_with_tools(
             agent2,
             staging_registry,
-            _surgeon_prefix + _history_prefix + mismatch_prefix
+            _surgeon_prefix + _assumption_context_prefix + _history_prefix + mismatch_prefix
             + f"Attempt {attempt} failed.\n"
             f"Build exit code: {last_exit_code} | Sorry count: {last_sorry_in_attempt}\n"
             f"Error first occurs at line {line_no_display_final}.\n"

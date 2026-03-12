@@ -89,9 +89,11 @@ class ToolRegistry:
         """Read-only tools + write_staging_lemma.  Used by Agent2 during mid-proof escalation."""
         import functools
 
-        from orchestrator.tools import write_staging_lemma
+        from orchestrator.tools import edit_file_patch, run_lean_verify, write_staging_lemma
 
         self.register_readonly_tools()
+        self.register("run_lean_verify", run_lean_verify)
+        self.register("edit_file_patch", edit_file_patch)
         if target_algo:
             self.register(
                 "write_staging_lemma",
@@ -288,6 +290,7 @@ def auto_repair_loop(
     from pathlib import Path
     from orchestrator.assumption_repair import (
         apply_assumption_patches,
+        apply_lm_staging_patches,
         apply_staging_rules,
     )
     from orchestrator.tools import run_lean_verify
@@ -326,9 +329,22 @@ def auto_repair_loop(
 
         elif classification == "STAGING_FIX" and _staging_path:
             patched = apply_staging_rules(_staging_path, current_errors)
-            console.print(
-                f"[green][Agent5] Applied {patched} staging fix(es) to {_staging_path.name}"
-            )
+            if patched > 0:
+                console.print(
+                    f"[green][Agent5] Applied {patched} rule-based staging fix(es) to {_staging_path.name}"
+                )
+            else:
+                # Rule engine found nothing to fix — try LM-generated patches from JSON
+                lm_patches = structured.get("staging_patches", [])
+                if lm_patches:
+                    patched = apply_lm_staging_patches(_staging_path, lm_patches)
+                    console.print(
+                        f"[green][Agent5] Applied {patched} LM staging patch(es) to {_staging_path.name}"
+                    )
+                else:
+                    console.print(
+                        f"[yellow][Agent5] Rule engine returned 0 fixes and no LM patches provided."
+                    )
 
         else:
             console.print(

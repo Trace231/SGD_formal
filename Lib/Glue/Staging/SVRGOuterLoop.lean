@@ -33,26 +33,10 @@ theorem svrgProcess_measurable_random_snapshot
   induction m with
   | zero =>
       -- Base case: svrgProcess wTilde gradLTilde 0 = w₀ (constant)
-      have h_zero : (fun ω => setup.svrgProcess (w_fun ω) (g_fun ω) 0 ω) = fun _ => setup.toSGDSetup.w₀ := by
-        funext ω
-        simp [SVRGSetup.svrgProcess, SVRGSetup.process_zero]
-      rw [h_zero]
+      simp [SVRGSetup.svrgProcess, SVRGSetup.process_zero]
       exact measurable_const
   | succ m ih =>
       -- Inductive step: use process_succ recursion
-      have h_succ : ∀ ω, setup.svrgProcess (w_fun ω) (g_fun ω) (m + 1) ω =
-          setup.svrgProcess (w_fun ω) (g_fun ω) m ω
-            - setup.toSGDSetup.η m •
-              (setup.toSGDSetup.gradL (setup.svrgProcess (w_fun ω) (g_fun ω) m ω) (setup.toSGDSetup.ξ m ω)
-                - setup.toSGDSetup.gradL (w_fun ω) (setup.toSGDSetup.ξ m ω) + g_fun ω) := by
-        intro ω
-        simp [SVRGSetup.svrgProcess, SVRGSetup.process_succ]
-      -- The function is built from measurable components:
-      -- - setup.svrgProcess (w_fun ω) (g_fun ω) m ω (measurable by ih)
-      -- - w_fun ω (measurable by hw)
-      -- - g_fun ω (measurable by hg)
-      -- - ξ m ω (measurable by setup.hξ_meas)
-      -- - gradL (jointly measurable by hgL)
       have hξ_meas : Measurable (setup.toSGDSetup.ξ m) := setup.toSGDSetup.hξ_meas m
       -- Composition: ω ↦ (svrgProcess ... m ω, ξ m ω) is measurable
       have h_pair1 : Measurable (fun ω => (setup.svrgProcess (w_fun ω) (g_fun ω) m ω, setup.toSGDSetup.ξ m ω)) :=
@@ -78,6 +62,17 @@ theorem svrgProcess_measurable_random_snapshot
               (setup.toSGDSetup.gradL (setup.svrgProcess (w_fun ω) (g_fun ω) m ω) (setup.toSGDSetup.ξ m ω)
                 - setup.toSGDSetup.gradL (w_fun ω) (setup.toSGDSetup.ξ m ω) + g_fun ω)) :=
         ih.sub (measurable_const.smul h_body)
-      -- Rewrite using h_succ
-      convert h_step using 1
-      exact h_succ
+      -- Rewrite using process_succ
+      have h_eq : (fun ω => setup.svrgProcess (w_fun ω) (g_fun ω) (m + 1) ω) =
+          fun ω => setup.svrgProcess (w_fun ω) (g_fun ω) m ω
+            - setup.toSGDSetup.η m •
+              (setup.toSGDSetup.gradL (setup.svrgProcess (w_fun ω) (g_fun ω) m ω) (setup.toSGDSetup.ξ m ω)
+                - setup.toSGDSetup.gradL (w_fun ω) (setup.toSGDSetup.ξ m ω) + g_fun ω) := by
+        funext ω
+        have h_succ := SVRGSetup.process_succ (wTilde := w_fun ω) (gradLTilde := g_fun ω) (setup := setup) m
+        -- h_succ : setup.svrgProcess (w_fun ω) (g_fun ω) (m + 1) = fun ω' => ...
+        -- Apply congr_fun to get pointwise equality at ω
+        have h_pointwise := congr_fun h_succ ω
+        simp only [h_pointwise]
+      rw [h_eq]
+      exact h_step
