@@ -2471,11 +2471,43 @@ def phase3_prove(
                     "(<<<SEARCH>>>/<<<REPLACE>>>) with the exact Lean code to apply. "
                     "Be specific — no natural language, no explanation without a patch."
                 )
-                guidance, _ = _call_agent2_with_tools(agent2, staging_registry, _noop_ctx)
+                guidance, _a2_route_noop = _call_agent2_with_tools(agent2, staging_registry, _noop_ctx)
                 console.print(
                     f"  [Agent3] attempt {attempt}/{max_retries} — "
                     f"build={last_exit_code} (file UNCHANGED — NOOP forced)"
                 )
+                # ---- Agent2 Router: execute routing decision for NOOP ----
+                _final_route_noop = _apply_agent2_route(
+                    _a2_route_noop, _routing_budget, _err_sig, _route_repeat_tracker
+                )
+                if _final_route_noop in ("agent7", "agent7_then_agent6"):
+                    _routing_budget["preemptive_agent7"] = _routing_budget.get("preemptive_agent7", 0) + 1
+                    _a7_hint_noop = (_a2_route_noop or {}).get("agent7_hint", "")
+                    _a7_prompt_noop = _build_preemptive_agent7_prompt(
+                        _a7_hint_noop, target_file, last_verify_text, agent7_registry
+                    )
+                    _a7_plan_noop, _ = _call_agent7_with_tools(agent7, agent7_registry, _a7_prompt_noop)
+                    if _a7_plan_noop:
+                        _active_agent7_plan = _a7_plan_noop
+                        _agent7_current_step_idx = 0
+                        _agent7_invocations_this_attempt += 1
+                        console.print(
+                            f"  [A2Router\u2192Agent7] Preemptive Agent7 triggered by NOOP route "
+                            f"(confidence={(_a2_route_noop or {}).get('confidence', '?')})"
+                        )
+                    if _final_route_noop == "agent7_then_agent6":
+                        _ft_noop = (_a7_plan_noop or {}).get("fallback_trigger", {}) if _a7_plan_noop else {}
+                        _agent7_approved_agent6 = str(_ft_noop.get("route_to", "")).lower() == "agent6"
+                        console.print(f"  [A2Router\u2192Agent7\u2192Agent6] agent6_approved={_agent7_approved_agent6}")
+                elif _final_route_noop == "self":
+                    _routing_budget["self_revisions"] = _routing_budget.get("self_revisions", 0) + 1
+                    _self_msg_noop = (
+                        "[SELF_REVISION] Your current proof strategy has low confidence. "
+                        "Revise the overall proof approach fundamentally. Do NOT reuse the same tactics.\n\n"
+                        + guidance
+                    )
+                    guidance, _ = _call_agent2_with_tools(agent2, staging_registry, _self_msg_noop)
+                    console.print("  [A2Router\u2192Self] Agent2 self-revision triggered (NOOP)")
                 continue
 
         # DEPENDENCY_COMPILE_ERROR: staging/dep broken — fix dep, never rewrite target
