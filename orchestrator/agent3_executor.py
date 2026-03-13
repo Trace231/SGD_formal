@@ -7,6 +7,7 @@ from pathlib import Path
 from orchestrator.config import PROJECT_ROOT
 from orchestrator.file_io import load_file
 
+@dataclass
 class ExecutionResult:
     """Result envelope for each Agent3 tool execution."""
 

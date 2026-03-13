@@ -487,8 +487,37 @@ def phase3_prove(
             if attempt > 1
             else ""
         )
+
+        # Parse sorry classifications from Agent2's guidance; build mandatory
+        # instruction block for STRUCTURAL sorries so Agent3 escalates immediately.
+        _sorry_classifications = _parse_sorry_classification(guidance)
+        _structural_sorries = [c for c in _sorry_classifications if c["type"] == "STRUCTURAL"]
+        _sorry_structural_block = ""
+        if _structural_sorries:
+            _lines_info = "\n".join(
+                f"  - Line {c['line']}: {c['reason']}\n"
+                f"    diagnosis: \"{c.get('diagnosis', '')}\"\n"
+                f"    dependency_symbols: {c.get('dependency_symbols', [])}"
+                for c in _structural_sorries
+            )
+            _sorry_structural_block = (
+                "## MANDATORY PRE-AUDIT (from Agent2 classification)\n"
+                "The following sorry(s) are classified STRUCTURAL — "
+                "they CANNOT be closed with local tactics:\n"
+                + _lines_info + "\n"
+                "REQUIRED first action for each STRUCTURAL sorry:\n"
+                "  call request_agent7_interface_audit with the diagnosis above.\n"
+                "Do NOT write any tactic or edit_file_patch before completing this step.\n\n"
+            )
+            console.print(
+                f"  [SorryClassification] attempt {attempt} — "
+                f"{len(_structural_sorries)} STRUCTURAL sorry(s): "
+                + ", ".join(f"line {c['line']}" for c in _structural_sorries)
+            )
+
         prover_prompt = (
             _attempt_awareness
+            + _sorry_structural_block
             + _file_absent_prefix
             + "Use tools to close sorry placeholders.\n"
             "Return ONLY valid JSON with exactly three keys: thought, tool, arguments.\n"
