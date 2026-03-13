@@ -320,8 +320,8 @@ class AuditLogger:
                         "size_bytes": len(content.encode("utf-8")),
                         "content": content,
                     }
-                except OSError:
-                    # Snapshot is best-effort; missing entries do not fail the run.
+                except (OSError, UnicodeDecodeError):
+                    # Snapshot is best-effort; non-UTF-8 or missing files do not fail the run.
                     continue
 
         payload: dict[str, Any] = {
