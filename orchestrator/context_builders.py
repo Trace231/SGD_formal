@@ -879,6 +879,44 @@ def _prequery_sorry_goals(
     return header + body + "\n\n" + dep_block
 
 
+def _prequery_error_line_goal(
+    registry,
+    target_file: str,
+    error_line: int | None,
+    goal_cache: dict,
+) -> str:
+    """Query get_lean_goal at the primary error line (not a sorry).
+
+    Used to give Agent2 the exact ``⊢`` type and hypotheses at a failing
+    proof-body line so it can generate a PATCH with correctly-typed terms
+    instead of guessing coercions.
+
+    Returns a formatted string block, or empty string on any failure.
+    """
+    if error_line is None:
+        return ""
+    current_hash = _file_hash(target_file)
+    cache_key = (target_file, error_line, current_hash)
+    if cache_key in goal_cache:
+        cached = goal_cache[cache_key]
+    else:
+        try:
+            cached = registry.call(
+                "get_lean_goal", file_path=target_file, sorry_line=error_line
+            )
+        except Exception:
+            return ""
+        goal_cache[cache_key] = cached
+    if not cached or cached.get("error") or not cached.get("goal"):
+        return ""
+    result = f"## Lean Goal State at Error Line {error_line} (from LSP — authoritative)\n"
+    result += f"{cached['goal']}\n"
+    hyps = (cached.get("hypotheses") or [])[:6]
+    if hyps:
+        result += f"  Hypotheses: {'; '.join(hyps)}\n"
+    return result + "\n"
+
+
 def _parse_sorry_classification(guidance: str) -> list[dict]:
     """Extract per-sorry TACTICAL/STRUCTURAL classifications from Agent2 guidance.
 
@@ -907,9 +945,12 @@ def _parse_sorry_classification(guidance: str) -> list[dict]:
 
     block = m.group(0)
 
-    # Each entry starts with "- Line N: TYPE — reason" (TYPE = STRUCTURAL or TACTICAL).
+    # Each entry starts with "- Line N: TYPE — reason".
+    # TYPE may be STRUCTURAL_GLUE, STRUCTURAL_INTERFACE, STRUCTURAL (legacy), or TACTICAL.
     entry_re = re.compile(
-        r"-\s+Line\s+(\d+)\s*:\s*(STRUCTURAL|TACTICAL)\s*[—\-]+\s*(.+?)(?=\n\s*-\s+Line\s|\Z)",
+        r"-\s+Line\s+(\d+)\s*:\s*"
+        r"(STRUCTURAL_GLUE|STRUCTURAL_INTERFACE|STRUCTURAL|TACTICAL)"
+        r"\s*[—\-]+\s*(.+?)(?=\n\s*-\s+Line\s|\Z)",
         re.DOTALL | re.IGNORECASE,
     )
     dep_re = re.compile(r'dependency_symbols\s*:\s*(\[[^\]]*\])', re.IGNORECASE)
@@ -917,7 +958,18 @@ def _parse_sorry_classification(guidance: str) -> list[dict]:
 
     for entry_m in entry_re.finditer(block):
         line_no = int(entry_m.group(1))
-        sorry_type = entry_m.group(2).upper()
+        raw_type = entry_m.group(2).upper()
+        # Normalise: STRUCTURAL_GLUE / STRUCTURAL_INTERFACE → type="STRUCTURAL" + subtype
+        # STRUCTURAL (legacy) → type="STRUCTURAL", subtype="STRUCTURAL_INTERFACE" (default)
+        # TACTICAL → type="TACTICAL", subtype="TACTICAL"
+        if raw_type.startswith("STRUCTURAL"):
+            sorry_type = "STRUCTURAL"
+            subtype = raw_type  # "STRUCTURAL_GLUE", "STRUCTURAL_INTERFACE", or "STRUCTURAL"
+            if subtype == "STRUCTURAL":
+                subtype = "STRUCTURAL_INTERFACE"  # legacy default
+        else:
+            sorry_type = "TACTICAL"
+            subtype = "TACTICAL"
         body = entry_m.group(3)
         reason = body.splitlines()[0].strip() if body.strip() else ""
 
@@ -940,7 +992,8 @@ def _parse_sorry_classification(guidance: str) -> list[dict]:
 
         results.append({
             "line": line_no,
-            "type": sorry_type,
+            "type": sorry_type,       # "STRUCTURAL" or "TACTICAL" (backward-compat)
+            "subtype": subtype,        # "STRUCTURAL_GLUE", "STRUCTURAL_INTERFACE", or "TACTICAL"
             "reason": reason,
             "dependency_symbols": dep_symbols,
             "diagnosis": diagnosis,

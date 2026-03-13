@@ -171,6 +171,7 @@ from orchestrator.context_builders import (
     _prequery_dependency_signatures,
     _generate_attempt_diagnosis,
     _prequery_sorry_goals,
+    _prequery_error_line_goal,
     _parse_sorry_classification,
     _retrieve_catalog_context,
     _extract_symbol_manifest,
@@ -492,27 +493,54 @@ def phase3_prove(
         # instruction block for STRUCTURAL sorries so Agent3 escalates immediately.
         _sorry_classifications = _parse_sorry_classification(guidance)
         _structural_sorries = [c for c in _sorry_classifications if c["type"] == "STRUCTURAL"]
+        # Split by subtype: STRUCTURAL_GLUE → Agent6, STRUCTURAL_INTERFACE → Agent7.
+        _glue_sorries = [c for c in _structural_sorries if c.get("subtype") == "STRUCTURAL_GLUE"]
+        _iface_sorries = [c for c in _structural_sorries if c.get("subtype") != "STRUCTURAL_GLUE"]
         _sorry_structural_block = ""
-        if _structural_sorries:
-            _lines_info = "\n".join(
+        _struct_blocks: list[str] = []
+        if _iface_sorries:
+            _iface_info = "\n".join(
                 f"  - Line {c['line']}: {c['reason']}\n"
                 f"    diagnosis: \"{c.get('diagnosis', '')}\"\n"
                 f"    dependency_symbols: {c.get('dependency_symbols', [])}"
-                for c in _structural_sorries
+                for c in _iface_sorries
             )
-            _sorry_structural_block = (
-                "## MANDATORY PRE-AUDIT (from Agent2 classification)\n"
-                "The following sorry(s) are classified STRUCTURAL — "
-                "they CANNOT be closed with local tactics:\n"
-                + _lines_info + "\n"
-                "REQUIRED first action for each STRUCTURAL sorry:\n"
-                "  call request_agent7_interface_audit with the diagnosis above.\n"
-                "Do NOT write any tactic or edit_file_patch before completing this step.\n\n"
+            _struct_blocks.append(
+                "## MANDATORY PRE-AUDIT (interface/signature issue — from Agent2)\n"
+                "The following sorry(s) have an API/interface problem:\n"
+                + _iface_info + "\n"
+                "REQUIRED first action: call request_agent7_interface_audit with the "
+                "diagnosis above.\n"
+                "Do NOT write any tactic or edit_file_patch before completing this step.\n"
             )
+        if _glue_sorries:
+            _glue_info = "\n".join(
+                f"  - Line {c['line']}: {c['reason']}\n"
+                f"    diagnosis: \"{c.get('diagnosis', '')}\"\n"
+                f"    dependency_symbols: {c.get('dependency_symbols', [])}"
+                for c in _glue_sorries
+            )
+            _struct_blocks.append(
+                "## MANDATORY GLUE ESCALATION (missing bridge lemma — from Agent2)\n"
+                "The following sorry(s) require a new glue/bridge lemma:\n"
+                + _glue_info + "\n"
+                "REQUIRED first action: call request_agent6_glue with stuck_at_line and "
+                "the diagnosis above.\n"
+                "Do NOT attempt local tactics — this sorry cannot be closed without a "
+                "new lemma. Agent7 will pre-screen to confirm before Agent6 runs.\n"
+            )
+        if _struct_blocks:
+            _sorry_structural_block = "\n".join(_struct_blocks) + "\n\n"
+        if _structural_sorries:
             console.print(
                 f"  [SorryClassification] attempt {attempt} — "
-                f"{len(_structural_sorries)} STRUCTURAL sorry(s): "
-                + ", ".join(f"line {c['line']}" for c in _structural_sorries)
+                + (f"{len(_glue_sorries)} GLUE: "
+                   + ", ".join(f"line {c['line']}" for c in _glue_sorries)
+                   if _glue_sorries else "")
+                + (" | " if _glue_sorries and _iface_sorries else "")
+                + (f"{len(_iface_sorries)} INTERFACE: "
+                   + ", ".join(f"line {c['line']}" for c in _iface_sorries)
+                   if _iface_sorries else "")
             )
 
         prover_prompt = (
@@ -667,6 +695,8 @@ def phase3_prove(
         _agent7_last_verified_sorry: int | None = None
         _stale_err_line: int | None = None
         _stale_err_count: int = 0
+        _def_zone_err_count: int = 0
+        _def_zone_force_threshold = RETRY_LIMITS.get("DEFINITION_ZONE_FORCE_AGENT7_AFTER_N", 3)
         _tools_used_this_attempt: set[str] = set()
         for tool_turn in range(max_tool_turns):
             # Parse Agent3's single action
@@ -1059,13 +1089,115 @@ def phase3_prove(
             # ---------------------------------------------------------------
             if tool_name == "request_agent6_glue":
                 if not _agent7_approved_agent6:
-                    raw_reply = agent3.call(
-                        "## request_agent6_glue rejected — Agent7 gate\n"
-                        "Agent6 is used only when Agent7's interface audit indicates a missing glue lemma. "
-                        "Call request_agent7_interface_audit first."
-                    )
-                    token_char_budget += len(raw_reply)
-                    continue
+                    # Auto pre-screen: call Agent7 to verify the glue gap before
+                    # allowing Agent6. Three outcomes:
+                    #   (a) Agent7 confirms gap → set approved, fall through to Agent6
+                    #   (b) Agent7 finds interface fix → deliver plan, skip Agent6
+                    #   (c) Agent7 limit reached OR plan=None → safe fallback, allow Agent6
+                    if _agent7_invocations_this_attempt < _agent7_max_invocations:
+                        _agent7_invocations_this_attempt += 1
+                        console.print(
+                            f"  [Agent6 pre-screen] Agent7 verifying glue gap "
+                            f"(turn {tool_turn + 1}, "
+                            f"invocation #{_agent7_invocations_this_attempt})"
+                        )
+                        _ps_stuck = (
+                            arguments.get("stuck_at_line")
+                            or arguments.get("sorry_line")
+                            or "unknown"
+                        )
+                        _ps_stuck_int = (
+                            int(_ps_stuck) if str(_ps_stuck).isdigit() else None
+                        )
+                        _ps_snippet = _build_escalation_file_context(
+                            target_file, _ps_stuck_int
+                        )
+                        _ps_prompt = (
+                            "Produce a strict interface-audit protocol JSON for Agent3.\n"
+                            f"Target file: {target_file}\n"
+                            f"Agent3 believes a glue/bridge lemma is missing at line "
+                            f"{_ps_stuck}.\n\n"
+                            f"Error/goal:\n```\n"
+                            f"{str(arguments.get('error_message', ''))[:800]}\n```\n\n"
+                            f"Diagnosis:\n{str(arguments.get('diagnosis', ''))[:600]}\n\n"
+                            f"Current file snippet:\n```lean\n{_ps_snippet[:5000]}\n```\n\n"
+                            "Search the codebase first. "
+                            "If a new glue lemma is truly needed (not already proved), "
+                            "include a step with tool='request_agent6_glue' OR set "
+                            "fallback_trigger.route_to='agent6'.\n"
+                            "If the issue is an API/interface fix (no new lemma needed), "
+                            "provide the fix steps instead.\n"
+                            "Return strict JSON only as specified in your system prompt."
+                        )
+                        _ps_plan, _ps_raw = _call_agent7_with_tools(
+                            agent7, agent7_registry, _ps_prompt
+                        )
+                        if _ps_plan is None:
+                            # Invalid/empty plan → safe fallback: allow Agent6
+                            console.print(
+                                "  [Agent6 pre-screen] Agent7 returned no plan — "
+                                "fallback: allowing Agent6"
+                            )
+                            _agent7_approved_agent6 = True
+                        else:
+                            _ps_ft = _ps_plan.get("fallback_trigger") or {}
+                            _agent7_approved_agent6 = (
+                                str(_ps_ft.get("route_to", "")).strip().lower() == "agent6"
+                                or any(
+                                    str(s.get("tool", "")).strip() == "request_agent6_glue"
+                                    for s in (_ps_plan.get("ordered_steps") or [])
+                                    if isinstance(s, dict)
+                                )
+                            )
+                            if _agent7_approved_agent6:
+                                console.print(
+                                    "  [Agent6 pre-screen] Agent7 confirmed glue gap — "
+                                    "Agent6 approved"
+                                )
+                            else:
+                                # Agent7 found an interface fix — activate plan, skip Agent6
+                                console.print(
+                                    "  [Agent6 pre-screen] Agent7 found interface fix "
+                                    "— delivering plan instead of Agent6"
+                                )
+                                _active_agent7_plan = _ps_plan
+                                _agent7_current_step_idx = 0
+                                _agent7_pending_verify = False
+                                _agent7_last_step_id = None
+                                _agent7_prev_sorry = last_sorry_in_attempt
+                                _agent7_no_progress_count = 0
+                                _ps_ft2 = _ps_plan.get("fallback_trigger") or {}
+                                _agent7_approved_agent6 = (
+                                    str(_ps_ft2.get("route_to", "")).strip().lower() == "agent6"
+                                )
+                                raw_reply = agent3.call(
+                                    "## Agent7 Pre-Screen: interface fix identified "
+                                    "(Agent6 not needed yet)\n\n"
+                                    + _ps_raw + "\n\n"
+                                    "Execute Agent7's protocol: one step at a time, "
+                                    "run_lean_verify after each step."
+                                )
+                                token_char_budget += len(_ps_raw) + len(raw_reply)
+                                continue
+                    else:
+                        # Agent7 invocation limit reached → allow Agent6 as fallback
+                        console.print(
+                            "  [Agent6 pre-screen] Agent7 limit reached — "
+                            "allowing Agent6 as fallback"
+                        )
+                        _agent7_approved_agent6 = True
+
+                    if not _agent7_approved_agent6:
+                        # Pre-screen ran but still not approved (shouldn't normally happen)
+                        raw_reply = agent3.call(
+                            "## request_agent6_glue rejected — Agent7 pre-screen inconclusive\n"
+                            "Agent7 did not confirm a missing glue lemma. "
+                            "Review Agent7's protocol above and apply the suggested fix, "
+                            "or call request_agent2_help for further guidance."
+                        )
+                        token_char_budget += len(raw_reply)
+                        continue
+
                 max_agent6 = RETRY_LIMITS.get("MAX_AGENT6_ESCALATIONS_PER_ATTEMPT", 1)
                 stuck_at_line = arguments.get("stuck_at_line") or arguments.get("sorry_line") or "unknown"
                 error_message = str(arguments.get("error_message", ""))[:600]
@@ -1200,7 +1332,7 @@ def phase3_prove(
                     )
                     raw_reply = agent3.call(esc_msg)
                     token_char_budget += len(esc_msg) + len(raw_reply)
-                continue
+                    continue
                 stuck_at_line = arguments.get("stuck_at_line", "unknown")
                 error_message = str(arguments.get("error_message", ""))[:600]
                 diagnosis = str(arguments.get("diagnosis", ""))[:800]
@@ -1233,13 +1365,58 @@ def phase3_prove(
                     "and provide revised, concrete guidance with exact Lean API "
                     "calls. Agent3 will continue in the SAME attempt.\n"
                     "If a Level-2 missing glue lemma is needed, use write_staging_lemma "
-                    f"to add it to {_staging_rel} NOW — do not just describe it.",
+                    f"to add it to {_staging_rel} NOW — do not just describe it.\n"
+                    "ROUTING RULE: If this error is a structural INTERFACE problem — "
+                    "invalid field notation, wrong function signature, mismatched "
+                    "dot-access path — output exactly `ROUTE_TO: agent7` on its own "
+                    "line BEFORE your analysis. The orchestrator will call Agent7 "
+                    "automatically and deliver the audit protocol to Agent3.",
                 )
-                esc_result_msg = (
-                    f"## Agent2 Revised Guidance (escalation #{_escalation_count})\n"
-                    f"{new_guidance}\n\n"
-                    "Apply this guidance now. Continue with tool calls."
-                )
+                # B: parse Agent2's routing signal — if structural interface problem,
+                # escalate directly to Agent7 instead of returning guidance to Agent3.
+                if re.search(
+                    r"^ROUTE_TO:\s*agent7\s*$", new_guidance,
+                    re.IGNORECASE | re.MULTILINE,
+                ) and _agent7_invocations_this_attempt < _agent7_max_invocations:
+                    _agent7_invocations_this_attempt += 1
+                    console.print(
+                        f"  [Agent3→Agent2→Agent7] Agent2 routed to Agent7 "
+                        f"(escalation #{_escalation_count}, "
+                        f"invocation #{_agent7_invocations_this_attempt})"
+                    )
+                    _agent7_esc_snippet = _build_escalation_file_context(
+                        target_file, _stuck_line_int
+                    )
+                    _agent7_esc_prompt = (
+                        "Produce a strict interface-audit protocol JSON for Agent3.\n"
+                        f"Target file: {target_file}\n"
+                        f"Stuck at line: {stuck_at_line}\n"
+                        f"Escalated via Agent2 routing (structural interface problem).\n\n"
+                        f"Primary error:\n```\n{error_message}\n```\n\n"
+                        f"Diagnosis:\n{diagnosis}\n\n"
+                        f"Agent2 analysis:\n{new_guidance[:2000]}\n\n"
+                        f"Current snippet:\n```lean\n{_agent7_esc_snippet[:6000]}\n```\n\n"
+                        "Return strict JSON only as specified in your system prompt."
+                    )
+                    _plan_obj_esc, _raw_plan_esc = _call_agent7_with_tools(
+                        agent7, agent7_registry,
+                        _agent7_esc_prompt,
+                    )
+                    esc_result_msg = (
+                        f"## Agent7 Interface Audit "
+                        f"(routed by Agent2, escalation #{_escalation_count})\n"
+                        "Agent2 classified this as a structural interface problem "
+                        "and escalated to Agent7.\n\n"
+                        f"{_raw_plan_esc}\n\n"
+                        "Execute Agent7's protocol: one step at a time, "
+                        "run_lean_verify after each."
+                    )
+                else:
+                    esc_result_msg = (
+                        f"## Agent2 Revised Guidance (escalation #{_escalation_count})\n"
+                        f"{new_guidance}\n\n"
+                        "Apply this guidance now. Continue with tool calls."
+                    )
                 exec_results.append(ExecutionResult(
                     status_code="SUCCESS",
                     message=(
@@ -1605,6 +1782,20 @@ def phase3_prove(
                 error_type, _structured_errors_inner = _classify_lean_error_structured(
                     last_verify_text, target_file
                 )
+                # A2: LLM fallback — upgrade PROOF_ERROR to DEFINITION_ZONE_ERROR when
+                # all regex missed but the error sits inside the declaration zone.
+                if error_type == "PROOF_ERROR" and _structured_errors_inner:
+                    _primary_for_llm = _structured_errors_inner[0]
+                    _pline_fb = _primary_for_llm.get("line", 9999)
+                    _dze_fb = _get_decl_zone_end(PROJECT_ROOT / target_file)
+                    if _pline_fb <= _dze_fb:
+                        _llm_fb = _llm_classify_error(
+                            _primary_for_llm,
+                            _build_escalation_file_context(target_file, _pline_fb),
+                            target_file,
+                        )
+                        if _llm_fb.get("locus") == "declaration_zone":
+                            error_type = "DEFINITION_ZONE_ERROR"
                 err_line_no = _extract_first_error_line(last_verify_text)
                 line_no_display = str(err_line_no) if err_line_no is not None else "unknown"
                 if last_exit_code != 0:
@@ -1683,12 +1874,13 @@ def phase3_prove(
                     break  # start next attempt with fresh guidance
 
                 if error_type == "DEFINITION_ZONE_ERROR":
-                    # Do NOT bump _stale_err_count to 3 — let normal stale logic apply
+                    _def_zone_err_count += 1
                     result_msg = (
-                        "## DEFINITION ZONE ERROR\n"
+                        f"## DEFINITION ZONE ERROR [{_def_zone_err_count}/{_def_zone_force_threshold}]\n"
                         "Type mismatch occurs in declaration/definition zone (before proof tactics).\n"
                         "This usually means a called function is being applied with the wrong signature.\n"
-                        "Read the callee definition first, then patch.\n\n"
+                        f"After the FIRST failed local fix you MUST call request_agent7_interface_audit "
+                        f"(forced at {_def_zone_force_threshold} consecutive definition-zone errors).\n\n"
                     ) + result_msg
                     error_type = "LOCAL_PROOF_ERROR"
 
@@ -1831,12 +2023,16 @@ def phase3_prove(
                             _stale_err_count,
                         )
                     _stuck_now = (
-                        _stale_err_count >= _agent7_force_stale_threshold
-                        and _agent7_no_progress_turns >= _agent7_force_no_progress_turns_threshold
+                        (
+                            _stale_err_count >= _agent7_force_stale_threshold
+                            and _agent7_no_progress_turns >= _agent7_force_no_progress_turns_threshold
+                        )
+                        or _def_zone_err_count >= _def_zone_force_threshold
                     )
                     _reason = (
                         f"stale_line_count={_stale_err_count}, "
                         f"no_progress_turns={_agent7_no_progress_turns}, "
+                        f"def_zone_err_count={_def_zone_err_count}, "
                         f"line={line_no_display}"
                     )
                     if _stuck_now and not _agent7_soft_warned:
@@ -1864,6 +2060,7 @@ def phase3_prove(
                         and (tool_turn + 1 - _agent7_force_warn_turn) >= _agent7_force_after_soft_warn
                     ):
                         _agent7_force_gate_active = True
+                        _def_zone_err_count = 0
                         agent7_forced_trigger_count += 1
                         agent7_force_gate_entries.append({
                             "attempt": attempt,
@@ -2139,15 +2336,24 @@ def phase3_prove(
             "For each sorry listed in the goal states above, output a classification block:\n"
             "```\n"
             "## SORRY CLASSIFICATION\n"
-            "- Line N: STRUCTURAL — <one-line reason why tactics alone cannot close this goal>\n"
-            "  dependency_symbols: [\"lemmaA\", \"lemmaB\"]\n"
-            "  diagnosis: \"<what bridge lemma is missing>\"\n"
-            "- Line M: TACTICAL — <specific tactic or have-step to try>\n"
+            "- Line N: STRUCTURAL_GLUE — <reason: a new bridge/glue lemma must be proved>\n"
+            "  dependency_symbols: [\"lemmaA\"]\n"
+            "  diagnosis: \"<what lemma is missing and why it cannot be proved locally>\"\n"
+            "- Line M: STRUCTURAL_INTERFACE — <reason: API/signature/interface mismatch>\n"
+            "  dependency_symbols: [\"wrongName\"]\n"
+            "  diagnosis: \"<what interface fix is needed>\"\n"
+            "- Line K: TACTICAL — <specific tactic or have-step to try>\n"
             "```\n"
-            "STRUCTURAL means: the goal requires applying an existing theorem to a "
-            "random variable / measurable function input, or requires a lemma that "
-            "does not exist in any imported Lib/ file.\n"
-            "TACTICAL means: ring / linarith / simp / exact with existing hypotheses suffices.\n"
+            "STRUCTURAL_GLUE: goal requires a NEW lemma (not present in any imported Lib/ file) "
+            "to be proved — e.g. a bridge between two process definitions, a measurability "
+            "result for a custom function, an expectation bound for a specific algorithm step. "
+            "Use when Agent6 (glue filler) must be invoked to prove a new staging lemma.\n"
+            "STRUCTURAL_INTERFACE: goal fails because of a wrong API call, missing typeclass "
+            "instance, wrong dot-notation, or function signature mismatch that is fixable "
+            "WITHOUT proving a new lemma — just correcting the call site. "
+            "Use when Agent7 (interface auditor) should be invoked.\n"
+            "TACTICAL: ring / linarith / simp / exact / gcongr with existing hypotheses "
+            "suffices — no new lemma or interface fix required.\n"
             + (_pre_agent2_goals or "")
         )
 
@@ -2177,6 +2383,11 @@ def phase3_prove(
             _ref_class_local = _format_ref_and_classification_blocks(
                 _ref_files_local, _llm_class_local
             )
+            # Fetch the actual Lean goal state at the error line so Agent2 can
+            # generate PATCH blocks with correctly-typed terms (no coercion guessing).
+            _error_line_goal = _prequery_error_line_goal(
+                staging_registry, target_file, _err_line_int, _goal_cache
+            )
             guidance = _call_agent2_with_tools(
                 agent2,
                 staging_registry,
@@ -2188,7 +2399,8 @@ def phase3_prove(
                 f"Error at line {line_no_display_final}:\n```\n"
                 f"{_prioritize_error_text(_structured_errors_final, last_verify_text, _err_line_int, target_file)}"
                 f"\n```\n\n"
-                f"\n=== AGENT3'S CURRENT FILE ({target_file}) ===\n"
+                + _error_line_goal
+                + f"\n=== AGENT3'S CURRENT FILE ({target_file}) ===\n"
                 f"```lean\n{_escalation_file_ctx}\n```\n\n"
                 f"=== STAGING FILE ({_staging_rel}) ===\n"
                 f"```lean\n{_staging_content_ctx}\n```\n\n"

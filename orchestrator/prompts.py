@@ -441,6 +441,11 @@ the Planner (Agent2).  You receive:
   switching to a different tactic family (e.g. from simp to ring, convert, calc,
   or manual rewrite) rather than repeatedly tweaking the same tactic's arguments
   (e.g. different simp lemmas).
+- **When a `have h : T := <compound term>` fails with type mismatch or instance
+  synthesis failure 2+ consecutive times**: switch to DECOMPOSITION MODE — break
+  the compound term into 3–5 separate `have` sub-steps, each proving one level of
+  nesting. Verify each sub-step in isolation before combining. This pinpoints which
+  sub-expression carries the wrong type without guessing.
 - **When the theorem statement itself is broken** (unknown symbol in signature):
   Do not rewrite the whole file — escalate by outputting a minimal tool_calls
   that signals you need Planner (Agent2) guidance.
@@ -554,7 +559,11 @@ You have access to the following tools.  Call them via JSON tool_calls.
    - When the issue is likely wrong API usage or signature mismatch (not a tactic or infra gap).
    - Typical indicators:
    - {AGENT7_CRITERIA}
-   - For API drift errors: after 1–2 failed local fixes, consider request_agent7_interface_audit.
+   - For definition-zone errors (DEFINITION ZONE ERROR header in tool result): after the FIRST
+     failed local fix you MUST call request_agent7_interface_audit. Do NOT attempt further local
+     patches — you will only shift the error to a different line without resolving the root cause.
+   - For other API drift errors: after 1 failed local fix you MUST call
+     request_agent7_interface_audit. Do NOT attempt further local patches.
    → Agent7 returns a strict JSON protocol; execute steps one at a time.
 
    **INFRASTRUCTURE GAP** (use request_agent6_glue FIRST):
@@ -677,6 +686,10 @@ You have access to the following tools.  Call them via JSON tool_calls.
      - goal:       "⊢ <type>" — the exact type you must prove
      - hypotheses: ["h : T", ...] — all local hypotheses in scope
      - raw:        full rendered tactic state string
+   - MANDATORY: Whenever you apply rw, unfold, or simp that changes the
+     proof goal, you MUST call get_lean_goal before writing any explicit
+     term (exact, apply, or have h : T := ...). Do NOT write terms based
+     on an assumed unfolded form — always query the actual goal state first.
    - USE CASE: When Agent2's guidance mentions a type but you are unsure
      of the exact form Lean expects, call get_lean_goal FIRST to see the
      actual "⊢ ..." before writing any `have` step.  This eliminates
@@ -928,6 +941,14 @@ Constraints:
   direct_apply is true, the orchestrator applies the patch directly (bypassing Agent3) and the
   inserted content is protected — Agent3 must not remove it. Reasoning/search steps must never
   set direct_apply: true.
+- Definition-zone structural errors (wrong field projection, wrong structure access path,
+  "invalid field notation", "application type mismatch" in the declaration body): the preferred
+  plan shape is (1) one search_codebase or read_file step to locate the correct field path or
+  function signature, then (2) one or more direct_apply=true edit_file_patch steps that replace
+  each incorrect callsite with the verified correct form. Because the old_str and new_str are
+  fully determined after the lookup step, these edits qualify for direct_apply=true. If the same
+  wrong pattern appears at multiple callsites, emit a separate direct_apply=true step for each.
+  Do NOT emit tactic-level steps for definition-zone errors.
 """
 
 # -------------------------------------------------------------------

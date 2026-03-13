@@ -22,6 +22,12 @@ _TYPE_MISMATCH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Structural field/projection errors in declaration zone — route to Agent7.
+_FIELD_NOTATION_RE = re.compile(
+    r"Invalid field notation|does not have a field",
+    re.IGNORECASE,
+)
+
 # Duplicate declarations always corrupt the target — full rewrite required.
 _DUPLICATE_DECL_RE = re.compile(r"has already been declared", re.IGNORECASE)
 
@@ -187,6 +193,13 @@ def _classify_lean_error_structured(
             decl_zone_end = _get_decl_zone_end(tgt_path)
             if line <= decl_zone_end:
                 return "DEFINITION_ZONE_ERROR", errors
+
+        if _FIELD_NOTATION_RE.search(msg):
+            tgt_path = PROJECT_ROOT / target_file
+            decl_zone_end = _get_decl_zone_end(tgt_path)
+            if line <= decl_zone_end:
+                return "DEFINITION_ZONE_ERROR", errors
+            # In proof body — fall through to PROOF_ERROR
 
         if _UNKNOWN_SYMBOL_RE.search(msg):
             # Only SIGNATURE_HALLUCINATION when error is in the declaration zone:
