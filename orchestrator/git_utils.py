@@ -87,73 +87,69 @@ def _git_is_dirty() -> bool:
 
 
 def _capture_git_run_snapshot(run_id: str) -> GitRunSnapshot:
-    """Capture HEAD and optionally stash local dirt for rollback safety."""
-    start_sha = _git_head_sha()
-    pre_run_dirty = _git_is_dirty()
-    if not pre_run_dirty:
-        return GitRunSnapshot(
-            start_sha=start_sha,
-            pre_run_dirty=False,
-            stash_used=False,
-            stash_ref=None,
-        )
+    """Capture HEAD SHA only.
 
-    # Save all local modifications (tracked + untracked) so run rollback can
-    # safely reset and then restore user state.
-    stash_msg = f"orchestrator-pre-run-{run_id}"
-    subprocess.run(
-        ["git", "stash", "push", "-u", "-m", stash_msg],
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    Source files (.lean, .py), Lib staging-area entries, and any other
+    working-directory state are left completely untouched.  Only the start
+    SHA is recorded so that on failure we know which docs to roll back.
+    """
+    start_sha = _git_head_sha()
     return GitRunSnapshot(
         start_sha=start_sha,
-        pre_run_dirty=True,
-        stash_used=True,
-        stash_ref="stash@{0}",
+        pre_run_dirty=_git_is_dirty(),
+        stash_used=False,
+        stash_ref=None,
     )
 
 
 def _restore_snapshot_on_success(snapshot: GitRunSnapshot) -> None:
-    """Restore pre-run user state after successful run."""
-    if not snapshot.stash_used:
-        return
-    subprocess.run(
-        ["git", "stash", "pop", "--index", snapshot.stash_ref or "stash@{0}"],
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    """No-op: source and lib files are intentionally left in their run-end state."""
+    return
 
 
 def _rollback_to_snapshot(snapshot: GitRunSnapshot) -> None:
-    """Rollback workspace to run-start commit and restore pre-run dirt."""
-    subprocess.run(
-        ["git", "reset", "--hard", snapshot.start_sha],
+    """On failure: revert only markdown documentation files to their pre-run state.
+
+    .lean files (including Lib/), Python files, and anything in the git
+    staging area are left completely untouched so that user edits and Lib
+    staging-area work are preserved across failed runs.
+    """
+    # Tracked .md files that changed since the run started.
+    result = subprocess.run(
+        ["git", "diff", snapshot.start_sha, "--name-only"],
         cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
-        check=True,
     )
-    # Remove untracked files generated during this run.
-    subprocess.run(
-        ["git", "clean", "-fd"],
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    if snapshot.stash_used:
+    modified_md = [f for f in result.stdout.splitlines() if f.endswith(".md")]
+
+    if modified_md:
+        console.print(
+            f"[yellow][Git] Rolling back {len(modified_md)} doc file(s): "
+            + ", ".join(modified_md)
+        )
         subprocess.run(
-            ["git", "stash", "pop", "--index", snapshot.stash_ref or "stash@{0}"],
+            ["git", "checkout", snapshot.start_sha, "--"] + modified_md,
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
             check=True,
         )
+
+    # Remove any *new* untracked .md files the run may have created.
+    ls_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    for fname in ls_result.stdout.splitlines():
+        if fname.endswith(".md"):
+            try:
+                (PROJECT_ROOT / fname).unlink()
+                console.print(f"[yellow][Git] Removed new doc file: {fname}")
+            except OSError:
+                pass
 
 
 def _get_modified_lean_files(
