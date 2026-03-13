@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -217,11 +218,70 @@ def _get_default_references(target_file: str) -> list[str]:
 # Agent6 is invoked only when Agent7's protocol explicitly indicates a missing glue lemma.
 AGENT6_AUTO_ROUTE_ENABLED = False
 
+# If True, after the first 3 attempts without any Agent7 call, system triggers Agent7 and
+# Agent6 once before continuing to attempt 4.
+FORCE_AGENT7_AGENT6_AFTER_3_ATTEMPTS = os.getenv("ORCHESTRATOR_FORCE_AGENT7_AGENT6_AFTER_3", "1") != "0"
+
 # Known Mathlib name corrections: wrong identifier -> correct replacement.
 # Applied before escalation to avoid routing trivial fixes to Agent6/Agent7.
 UNKNOWN_IDENTIFIER_RENAME_MAP: dict[str, str] = {
     "pow_le_one": "Left.pow_le_one_of_le",
 }
+
+# ---------------------------------------------------------------------------
+# Agent3 error patterns and escalation hints (config-driven, no hardcoding)
+# Override via ORCHESTRATOR_AGENT_ERROR_PATTERNS / ORCHESTRATOR_AGENT_ESCALATION_HINTS (JSON)
+# ---------------------------------------------------------------------------
+
+_AGENT_ERROR_PATTERNS_DEFAULT: dict[str, str] = {
+    "invalid_field": r"Invalid field",
+    "failed_to_synthesize": r"failed to synthesize instance",
+    "application_type_mismatch": r"Application type mismatch",
+    "function_expected": r"Function expected",
+}
+
+_AGENT_ESCALATION_HINTS_DEFAULT: dict[str, str] = {
+    "api_drift": (
+        "If local fixes fail repeatedly, consider request_agent7_interface_audit "
+        "for API/signature drift."
+    ),
+    "definition_zone": (
+        "Type mismatch occurs in declaration/definition zone (before proof tactics). "
+        "This usually means a called function is being applied with the wrong signature. "
+        "Read the callee definition first, then patch. "
+        "If local fixes fail repeatedly, consider request_agent7_interface_audit."
+    ),
+    "stale_agent7": (
+        "If this persists, consider request_agent7_interface_audit for API/signature drift."
+    ),
+}
+
+
+def _load_json_dict(env_key: str, default: dict[str, str]) -> dict[str, str]:
+    raw = os.getenv(env_key, "")
+    if not raw:
+        return default.copy()
+    try:
+        loaded = json.loads(raw)
+        return dict(loaded) if isinstance(loaded, dict) else default.copy()
+    except Exception:
+        return default.copy()
+
+
+AGENT_ERROR_PATTERNS: dict[str, str] = _load_json_dict(
+    "ORCHESTRATOR_AGENT_ERROR_PATTERNS", _AGENT_ERROR_PATTERNS_DEFAULT
+)
+AGENT_ESCALATION_HINTS: dict[str, str] = _load_json_dict(
+    "ORCHESTRATOR_AGENT_ESCALATION_HINTS", _AGENT_ESCALATION_HINTS_DEFAULT
+)
+
+AGENT7_ROUTING_CRITERIA: list[str] = [
+    "Invalid field notation (wrong dot/projection on structure)",
+    "Application type mismatch / Function expected in declaration/definition zone",
+    "failed to synthesize instance in def zone (before proof body)",
+    "Same error line repeats with no net sorry decrease",
+    "Errors oscillate across a small line set (e.g. 70/74/101/115)",
+]
 
 RETRY_LIMITS: dict[str, int] = {
     "MAX_PHASE2_APPROVAL_ROUNDS": 10,

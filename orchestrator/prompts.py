@@ -7,7 +7,7 @@ all embedded directly into the appropriate system prompts.
 
 from __future__ import annotations
 
-from orchestrator.config import DOCS_DIR
+from orchestrator.config import AGENT7_ROUTING_CRITERIA, DOCS_DIR
 from orchestrator.file_io import load_file
 
 # ---------------------------------------------------------------------------
@@ -548,7 +548,14 @@ You have access to the following tools.  Call them via JSON tool_calls.
    - WHEN TO USE: prefer this over read_file when exploring unfamiliar territory
      or when searching for proof patterns to adapt for a new goal.
 
-0c0. **When to use request_agent6_glue vs request_agent2_help** — GAP IDENTIFICATION (M1)
+0c0. **When to use request_agent7 vs request_agent6_glue vs request_agent2_help** — GAP IDENTIFICATION (M1)
+
+   **API/SIGNATURE DRIFT** (use request_agent7_interface_audit FIRST):
+   - When the issue is likely wrong API usage or signature mismatch (not a tactic or infra gap).
+   - Typical indicators:
+   - {AGENT7_CRITERIA}
+   - For API drift errors: after 1–2 failed local fixes, consider request_agent7_interface_audit.
+   → Agent7 returns a strict JSON protocol; execute steps one at a time.
 
    **INFRASTRUCTURE GAP** (use request_agent6_glue FIRST):
    - Undefined type conversion (e.g. need E but have Ω → E, or vice versa)
@@ -572,11 +579,12 @@ You have access to the following tools.  Call them via JSON tool_calls.
    - Patch mismatch (SEARCH string not found — copy verbatim)
    → Agent2 provides revised strategy or tactical guidance.
 
-   **Rule**: Try local fixes (search_codebase, edit_file_patch) first. After ≥3 failed
-   attempts on the SAME sorry with no progress, switch to request_agent6_glue instead
-   of repeating tactics indefinitely. Only call when confident the gap is structural —
-   specifically, a NEW bridge lemma must be *proved* (not just API lookup, tactic order,
-   or local-variable naming fixes).
+   **Rule**: Try local fixes (search_codebase, edit_file_patch) first. For API drift: 1–2
+   failed attempts → consider request_agent7_interface_audit. For infra/tactical: after
+   ≥3 failed attempts on the SAME sorry with no progress, switch to request_agent6_glue
+   or request_agent2_help. Only call when confident the gap is structural — specifically,
+   a NEW bridge lemma must be *proved* (not just API lookup, tactic order, or
+   local-variable naming fixes).
 
 0c1. **request_agent6_glue(stuck_at_line, error_message, diagnosis, attempts_tried, extra_context?)** — ESCALATE TO GLUE FILLER
    - Use when you diagnose a MISSING GLUE LEMMA (infrastructure gap per 0c0).
@@ -614,16 +622,14 @@ You have access to the following tools.  Call them via JSON tool_calls.
    - LIMIT: at most 3 escalations per attempt. Escalating on every turn is FORBIDDEN.
 
 0c3. **request_agent7_interface_audit(stuck_at_line, error_message, diagnosis, attempts_tried, primary_error?, dependency_symbols?, recent_failures?)** — ESCALATE TO INTERFACE AUDITOR
-   - Use when the issue is likely API/signature drift (not a pure tactic issue):
-     - `Invalid field ...`
-     - declaration/definition-zone `Application type mismatch` / `Function expected`
-     - same error line repeats with no net sorry decrease
-     - errors oscillate across a small line set (e.g. 70/74/101/115)
+   - Use when 0c0 classifies the issue as API/SIGNATURE DRIFT (see criteria above).
    - Agent7 returns a STRICT JSON execution protocol:
      - `root_cause`, `mismatch_table`, `ordered_steps`, `step_acceptance`,
        `forbidden_patterns`, `fallback_trigger`.
    - After receiving Agent7 protocol, execute exactly one step at a time and call
      `run_lean_verify` after each step.
+   - Escalation timing: for API drift errors, consider Agent7 after 1–2 failed local
+     fixes; for tactic/infra errors, prefer ≥3 attempts before escalating.
    - LIMIT: at most 2 escalations to Agent7 per attempt.
    - If orchestrator returns `FORCE_GATE_ACTIVE`, you MUST prioritize
      `request_agent7_interface_audit` immediately (or `request_agent2_help` only
@@ -761,6 +767,12 @@ Simp lemma (exempt — no Used-in tag required):
 theorem process_zero : setup.process 0 = fun _ => setup.w₀ := rfl
 ```
 """
+
+# Inject config-driven Agent7 routing criteria into sorry_closer prompt
+_agent7_criteria = "\n   - ".join(AGENT7_ROUTING_CRITERIA)
+SYSTEM_PROMPTS["sorry_closer"] = SYSTEM_PROMPTS["sorry_closer"].replace(
+    "{AGENT7_CRITERIA}", _agent7_criteria
+)
 
 # -------------------------------------------------------------------
 # When to use request_agent6_glue vs request_agent2_help (M1)
