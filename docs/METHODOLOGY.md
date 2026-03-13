@@ -35,6 +35,21 @@ root causes. Correctly diagnosing the cause determines the fix strategy.
 
 ## 2. Stub-Probe Protocol
 
+### Phase 2 — SVRG (inner loop complete, outer loop infrastructure pending)
+
+**Inner loop:** Fixed-snapshot inner-loop reduction completed with `svrg_convergence_inner_strongly_convex` via Archetype A (snapshot freeze + `effectiveSGDSetup`).
+
+**Outer loop:** Infrastructure (`svrgOuterProcess` recursive definition) complete in `Algorithms/SVRGOuterLoop.lean`. Convergence theorems (`epoch_contraction_lemma`, `svrgOuter_convergence_strongly_convex`) remain pending — staged in `Lib/Glue/Staging/SVRGOuterLoop.lean`.
+
+**Method:** Archetype B — periodic snapshot updates every `m` steps prevent direct SGD reduction. Requires explicit epoch telescoping with dual integrability hypotheses (`h_int_norm_sq` + `h_int_virtual`) per GLUE_TRICKS.md Section 4b.
+
+**Leverage score (outer loop infrastructure):** reused = 6, new = 1, ratio = 85.7%. Full convergence proof pending.
+
+**Next recommended probe:** Complete SVRG outer loop convergence proof (epoch telescoping + geometric series bound), OR proceed to Adam/momentum-based algorithms (Archetype B with novel update structure).
+
+---
+
+
 ### Phase 3 — Clipped SGD (complete)
 
 **Output:** Convex convergence rate for clipped SGD with explicit bias handling:

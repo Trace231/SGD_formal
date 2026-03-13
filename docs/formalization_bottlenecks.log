@@ -1,4 +1,4 @@
-This is XeTeX, Version 3.141592653-2.6-0.999997 (TeX Live 2025) (preloaded format=xelatex 2026.1.24)  11 MAR 2026 18:04
+This is XeTeX, Version 3.141592653-2.6-0.999997 (TeX Live 2025) (preloaded format=xelatex 2026.1.24)  13 MAR 2026 20:18
 entering extended mode
  restricted \write18 enabled.
  file:line:error style messages enabled.
@@ -612,6 +612,9 @@ Package hyperref Info: Link coloring OFF on input line 33.
 \openout3 = `formalization_bottlenecks.out'.
 
 
+
+Package hyperref Warning: Rerun to get /PageLabels entry.
+
 *geometry* driver: auto-detecting
 *geometry* detected driver: xetex
 *geometry* verbose mode - [ preamble ] result:
@@ -807,6 +810,15 @@ Overfull \hbox (36.06659pt too wide) in paragraph at lines 90--95
 
 
 [2]
+
+LaTeX Warning: Reference `thm:convex-foc' on page 3 undefined on input line 126
+.
+
+
+LaTeX Warning: Reference `cor:sc-inner-lb' on page 3 undefined on input line 15
+4.
+
+
 Overfull \hbox (17.58199pt too wide) in paragraph at lines 168--176
 \TU/STSong(0)/m/n/10.95 成 局 部 极 小，|  需 要 证 \TU/lmtt/m/n/10.95 nhds wStar $\OMS/
 cmsy/m/n/10.95 ^^T$ \TU/lmtt/m/n/10.95 Filter.principal univ\TU/STSong(0)/m/n/1
@@ -848,26 +860,112 @@ L/cmm/m/it/10.95 t; !\OT1/cmr/m/n/10.95 )\OML/cmm/m/it/10.95 :
 
 [4]
 
+LaTeX Warning: Reference `thm:epoch-contraction' on page 5 undefined on input l
+ine 333.
+
+
+
 [5]
 
+LaTeX Warning: Reference `thm:epoch-contraction' on page 6 undefined on input l
+ine 343.
+
+
+LaTeX Warning: Reference `thm:convex-foc' on page 6 undefined on input line 365
+.
+
+
+LaTeX Warning: Reference `thm:sc-foc' on page 6 undefined on input line 366.
+
+
+LaTeX Warning: Reference `cor:convex-inner-lb' on page 6 undefined on input lin
+e 367.
+
+
+LaTeX Warning: Reference `cor:sc-inner-lb' on page 6 undefined on input line 36
+8.
+
+
+LaTeX Warning: Reference `thm:grad-norm' on page 6 undefined on input line 369.
+
+
+
+LaTeX Warning: Reference `thm:svrg-var' on page 6 undefined on input line 370.
+
+
+LaTeX Warning: Reference `lem:indep-comp' on page 6 undefined on input line 371
+.
+
+
+LaTeX Warning: Reference `lem:epoch-indep' on page 6 undefined on input line 37
+2.
+
+
+LaTeX Warning: Reference `thm:epoch-contraction' on page 6 undefined on input l
+ine 373.
+
+
+LaTeX Warning: Reference `thm:outer-convergence' on page 6 undefined on input l
+ine 374.
+
+
+LaTeX Warning: Reference `lem:indep-comp' on page 6 undefined on input line 382
+.
+
+
+LaTeX Warning: Reference `lem:epoch-indep' on page 6 undefined on input line 38
+4.
+
+
+LaTeX Warning: Reference `thm:epoch-contraction' on page 6 undefined on input l
+ine 386.
+
+
+LaTeX Warning: Reference `thm:outer-convergence' on page 6 undefined on input l
+ine 388.
+
+
+LaTeX Warning: Reference `lem:indep-comp' on page 6 undefined on input line 391
+.
+
+
+
 [6]
+
+LaTeX Warning: Reference `lem:indep-comp' on page 7 undefined on input line 440
+.
+
+
 
 [7] (./formalization_bottlenecks.aux)
  ***********
 LaTeX2e <2024-11-01> patch level 2
 L3 programming layer <2022/07/14>
  ***********
-Package rerunfilecheck Info: File `formalization_bottlenecks.out' has not chang
-ed.
-(rerunfilecheck)             Checksum: 7F1DA688BC4BD5A0683F730571D29E45;1741.
+
+
+LaTeX Warning: There were undefined references.
+
+
+LaTeX Warning: Label(s) may have changed. Rerun to get cross-references right.
+
+
+Package rerunfilecheck Warning: File `formalization_bottlenecks.out' has change
+d.
+(rerunfilecheck)                Rerun to get outlines right
+(rerunfilecheck)                or use package `bookmark'.
+
+Package rerunfilecheck Info: Checksums for `formalization_bottlenecks.out':
+(rerunfilecheck)             Before: D41D8CD98F00B204E9800998ECF8427E;0
+(rerunfilecheck)             After:  7F1DA688BC4BD5A0683F730571D29E45;1741.
  ) 
 Here is how much of TeX's memory you used:
- 19012 strings out of 473832
- 407381 string characters out of 5729481
+ 18994 strings out of 473832
+ 406145 string characters out of 5729481
  862602 words of memory out of 5000000
- 41787 multiletter control sequences out of 15000+600000
- 567989 words of font info for 105 fonts, out of 8000000 for 9000
+ 41765 multiletter control sequences out of 15000+600000
+ 568005 words of font info for 107 fonts, out of 8000000 for 9000
  1348 hyphenation exceptions out of 8191
- 93i,10n,114p,1022b,1113s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 93i,12n,114p,1022b,1113s stack positions out of 10000i,1000n,20000p,200000b,200000s
 
 Output written on formalization_bottlenecks.pdf (7 pages).

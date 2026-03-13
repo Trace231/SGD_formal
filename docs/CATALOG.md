@@ -608,6 +608,63 @@ would give measurability of `ω ↦ wt(ω) − w*`, not the pure `w ↦ w − w*
 
 ## Algorithm Layer (Layer 2) — `Algorithms/SGD.lean`
 
+## Algorithm Layer (Layer 2) — `Algorithms/SVRGOuterLoop.lean`
+
+This file provides the outer-loop infrastructure for SVRG with random snapshot updates (Archetype B). Unlike the inner loop (which reduces to plain SGD via snapshot freeze), the outer loop requires explicit epoch telescoping because the snapshot `wTilde` updates every `m` steps.
+
+**Current status:** Infrastructure definitions only — `svrgOuterProcess` recursive definition is complete, but convergence theorems remain pending (staged in `Lib/Glue/Staging/SVRGOuterLoop.lean`).
+
+### `SVRGOuterSetup`
+
+| Field | Value |
+|---|---|
+| File | `Algorithms/SVRGOuterLoop.lean` |
+| Kind | `structure` |
+| Layer | 2 |
+| **Critical distinction** | Extends `SVRGSetup` with epoch parameters `m` (inner steps) and `K` (number of epochs); snapshot updates are random variables, not fixed parameters |
+
+**Fields:**
+- `toSVRGSetup : SVRGSetup E S Ω` — base SVRG data (oracle, samples, step sizes)
+- `m : ℕ` — epoch length (inner steps per epoch)
+- `K : ℕ` — number of outer epochs
+- `hgradF_meas : Measurable toSVRGSetup.toSGDSetup.gradF` — measurability of true gradient (MUST 4)
+- `hgradF_lsmooth : IsLSmooth toSVRGSetup.toSGDSetup.gradF L` — L-smoothness for variance reduction
+- `hgradF_strongly_convex : StrongConvexOn Set.univ μ (toSVRGSetup.toSGDSetup.gradF)` — strong convexity for linear rate
+
+### `svrgOuterProcess` infrastructure
+
+| Component | Role | Gap level | Used in |
+|---|---|---|---|
+| `svrgOuterProcess` | Recursive epoch iteration: `w_{k+1} = svrgProcess w_k (gradF w_k) m` | — | `svrgOuter_convergence_strongly_convex` (pending) |
+| `svrgOuterProcess_measurable` | Measurability of each outer-loop iterate | Level 2 (induction + `svrgProcess_measurable`) | Bridge construction (pending) |
+| `svrgOuterProcess_adapted` | Adaptedness to `sgdFiltration` | Level 2 (filtration monotonicity) | Independence proof (pending) |
+| `svrgOuterProcess_indepFun_xi_epoch` | Independence across epoch boundaries | Level 2 (`iIndepFun` + filtration) | Variance bound (pending) |
+
+### Pending convergence theorems (staged)
+
+The following theorems are specified in `Lib/Glue/Staging/SVRGOuterLoop.lean` but not yet proved in the algorithm file:
+
+| Theorem | Conclusion | Archetype |
+|---|---|---|
+| `epoch_contraction_lemma` | `E[‖w_{k+1} − w*‖²] ≤ (1 − ημ)^m · E[‖w_k − w*‖²] + η·σ_eff²/μ` | B — requires dual integrability |
+| `svrgOuter_convergence_strongly_convex` | `E[‖w_K − w*‖²] ≤ (1 − ημ)^(m·K) · ‖w₀ − w*‖² + σ_eff² / (m·μ²)` | B — epoch telescoping |
+
+### Hit Report — Glue Usage Count
+
+| Component | File | Used by |
+|---|---|---|
+| `svrgProcess` | `Algorithms/SVRG.lean` | `svrgOuterProcess` definition |
+| `svrg_convergence_inner_strongly_convex` | `Algorithms/SVRG.lean` | `epoch_contraction_lemma` (pending) |
+| `svrg_variance_reduction` | `Lib/Glue/Probability.lean` | `epoch_contraction_lemma` hypothesis (pending) |
+| `sgdFiltration` | `Main.lean` | `svrgOuterProcess_adapted` (pending) |
+| `svrgProcess_measurable` | `Algorithms/SVRG.lean` | `svrgOuterProcess_measurable` (pending) |
+| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | `h_int_norm_sq`, `h_int_virtual` (pending) |
+
+**Leverage score (Archetype B — infrastructure only):** reused existing components = 6; new SVRG outer-loop items = 1 (`svrgOuterProcess` definition); reuse ratio = `6 / (6 + 1) = 85.7%`. Convergence theorems pending proof.
+
+---
+
+
 ## Algorithm Layer (Layer 2) — `Algorithms/ClippedSGD.lean`
 
 This file formalizes clipped stochastic gradient descent (Archetype B). The update rule applies radial clipping to the stochastic gradient oracle before the step: $w_{t+1} = w_t - \eta \cdot \text{clip}_G(\text{gradL}(w_t, \xi_t))$. Clipping introduces bias relative to the true gradient, which is explicitly bounded via a domain constraint and a bias parameter $\delta$. The convergence rate includes an additional $\delta R$ term reflecting this bias-domain coupling.
@@ -1263,6 +1320,22 @@ new SVRG bridge components documented = 6; reuse ratio = `3 / (3 + 6) = 33.3%` (
 ---
 
 ## Roadmap & Dependency Tree
+
+### Roadmap & Dependency Tree (SVRG Outer Loop)
+
+| Lemma | File | SVRG inner strongly convex | SVRG outer epoch contraction | SVRG outer convergence | Reusable for |
+|-------|------|:--------------------------:|:----------------------------:|:----------------------:|--------------|
+| `svrg_variance_reduction` | `Lib/Glue/Probability.lean` | pending (Step 1 plan) | **Step 5** (variance hypothesis) | inherited | Control-variate algorithms (SARAH, SPIDER, SCSG) |
+| `svrg_convergence_inner_strongly_convex` | `Algorithms/SVRG.lean` | **Complete** | **Step 5** (epoch base) | inherited | Any fixed-snapshot variance-reduction inner loop |
+| `integrable_norm_sq_iterate_comp` | `Lib/Glue/Measurable.lean` | h_int_norm_sq | **h_int_norm_sq, h_int_virtual** | **h_int_norm_sq** | Any algorithm with distance-to-optimum recursion |
+| `norm_sq_sgd_step` | `Lib/Glue/Algebra.lean` | Step 1 | Step 1 (inherited) | inherited | Any algorithm with SGD-like update |
+| `expectation_norm_sq_gradL_bound` | `Lib/Layer0/IndepExpect.lean` | Step 5 | Step 5 (inherited) | inherited | **Universal** — any IID stochastic gradient algorithm |
+| `strong_convex_inner_lower_bound` | `Lib/Layer0/ConvexFOC.lean` | Step 4 | Step 4 (inherited) | inherited | Any strongly convex algorithm |
+
+**Note:** SVRG outer loop convergence theorems are **pending** — infrastructure (`svrgOuterProcess`) is complete, but `epoch_contraction_lemma` and `svrgOuter_convergence_strongly_convex` remain to be proved. The dual integrability pattern (`h_int_norm_sq` + `h_int_virtual`) from Archetype B (Section 4b in GLUE_TRICKS.md) applies directly.
+
+---
+
 
 | Lemma | File | SGD non-convex | SGD convex | SGD strongly convex | WD non-convex | WD convex | WD strongly convex | PGD convex | SVRG inner strongly convex | SVRG outer stub | Subgradient convex | Clipped SGD convex | Reusable for |
 |-------|------|:--------------:|:----------:|:-------------------:|:-------------:|:---------:|:------------------:|:----------:|:--------------------------:|:---------------:|:------------------:|:------------------:|--------------|
