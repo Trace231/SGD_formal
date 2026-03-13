@@ -1874,6 +1874,68 @@ def phase3_prove(
                             f"(attempt {attempt}, turn {tool_turn + 1})"
                         )
 
+                    # Auto-done: verify already shows exit=0 sorry=0 mid-turn —
+                    # lock the result immediately so Agent3 cannot over-edit.
+                    if last_exit_code == 0 and last_sorry_in_attempt == 0:
+                        _auto_hash = _file_hash(target_file)
+                        _auto_changed = (snapshot_file(target_file) != "") and (
+                            (not initial_exists) or (_auto_hash != initial_hash)
+                        )
+                        if _auto_changed:
+                            console.print(
+                                f"  [AutoDone] a{attempt} t{tool_turn + 1} — "
+                                "verify=0/0; running full-library gate"
+                            )
+                            _auto_full = registry.call("run_repo_verify")
+                            if int(_auto_full.get("exit_code", 1)) == 0:
+                                execution_history.extend(exec_results)
+                                console.print(
+                                    f"  [Agent3] attempt {attempt}/{max_retries} — "
+                                    f"build=OK, sorry=0 (auto-done at turn {tool_turn + 1})"
+                                )
+                                for _gp, _goriginal in _glue_snapshot.items():
+                                    _gp_rel = str(_gp.relative_to(PROJECT_ROOT))
+                                    if snapshot_file(_gp_rel) != _goriginal:
+                                        registry.call("overwrite_file", path=_gp_rel, content=_goriginal)
+                                        console.print(f"  [Staging] Restored {_gp.name} (was modified)")
+                                for _lp, _loriginal in _layer0_snapshot.items():
+                                    _lp_rel = str(_lp.relative_to(PROJECT_ROOT))
+                                    if snapshot_file(_lp_rel) != _loriginal:
+                                        registry.call("overwrite_file", path=_lp_rel, content=_loriginal)
+                                        console.print(f"  [Layer0] Restored {_lp.name} (was modified by Agent3)")
+                                return True, attempts, "", {
+                                    "execution_history": [r.__dict__ for r in execution_history],
+                                    "attempt_failures": attempt_failures,
+                                    "agent7_invocations": agent7_invocations,
+                                    "agent7_step_execution_log": agent7_step_execution_log,
+                                    "agent7_plan_revisions": agent7_plan_revisions,
+                                    "agent7_blocked_actions": agent7_blocked_actions,
+                                    "agent7_forced_trigger_count": agent7_forced_trigger_count,
+                                    "agent7_force_gate_entries": agent7_force_gate_entries,
+                                    "agent7_force_gate_rejections": agent7_force_gate_rejections,
+                                    "agent7_force_gate_reason_samples": agent7_force_gate_reason_samples,
+                                    "estimated_token_consumption": max(1, token_char_budget // 4),
+                                    "retry_count": sum(
+                                        1 for r in execution_history
+                                        if r.status_code in {"ERROR", "BLOCKED"}
+                                    ),
+                                }
+                            else:
+                                _auto_full_errors = (
+                                    "\n".join(_auto_full.get("errors", []))
+                                    or "SGDAlgorithms full build failed"
+                                )
+                                last_errors = _auto_full_errors
+                                exec_results.append(ExecutionResult(
+                                    status_code="ERROR",
+                                    message=f"[AutoDone Full-Build Gate] SGDAlgorithms failed:\n{_auto_full_errors[:800]}",
+                                    attempt=attempt,
+                                ))
+                                console.print(
+                                    f"  [AutoDone] Full-library gate FAILED at turn {tool_turn + 1} "
+                                    "— Agent3 must fix cascade"
+                                )
+
                     if progress_detail in ("normal", "debug"):
                         console.print(
                             f"  [A3] a{attempt}/{max_retries} "
