@@ -171,6 +171,7 @@ from orchestrator.context_builders import (
     _prequery_dependency_signatures,
     _generate_attempt_diagnosis,
     _prequery_sorry_goals,
+    _parse_sorry_classification,
     _retrieve_catalog_context,
     _extract_symbol_manifest,
     _collect_lib_declaration_names,
@@ -620,6 +621,10 @@ def phase3_prove(
         _active_agent7_plan: dict | None = None
         _agent7_current_step_idx = 0
         _agent7_pending_verify = False
+        _direct_applied_patches: list[dict] = []
+        # Each entry: {"path": str, "new_str": str, "step_id": str}
+        # Tracks content applied directly by orchestrator (bypassing Agent3).
+        # Used to detect and rollback Agent3 edits that remove protected content.
         _agent7_last_step_id: str | None = None
         _agent7_prev_sorry = last_sorry_count
         _agent7_no_progress_count = 0
@@ -860,6 +865,62 @@ def phase3_prove(
                     continue
 
                 if not _agent7_pending_verify and _has_steps:
+                    # -----------------------------------------------------------
+                    # DirectApply: orchestrator executes mechanical edit_file_patch
+                    # steps directly, bypassing Agent3, when direct_apply=true.
+                    # -----------------------------------------------------------
+                    if (
+                        _cur_step.get("direct_apply")
+                        and _cur_tool == "edit_file_patch"
+                    ):
+                        _req = _cur_step.get("required_args", {})
+                        _da_old = _req.get("old_str", "")
+                        _da_new = _req.get("new_str", "")
+                        _da_path = _req.get("path", target_file)
+                        if _da_old and _da_new:
+                            try:
+                                registry.call(
+                                    "edit_file_patch",
+                                    path=_da_path,
+                                    old_str=_da_old,
+                                    new_str=_da_new,
+                                )
+                                _direct_applied_patches.append(
+                                    {"path": _da_path, "new_str": _da_new, "step_id": _cur_step_id}
+                                )
+                                _agent7_current_step_idx = min(
+                                    _agent7_current_step_idx + 1, len(_steps) - 1
+                                )
+                                console.print(
+                                    f"  [Agent7 DirectApply] step {_cur_step_id} applied by orchestrator"
+                                )
+                                _da_verify = registry.call("run_lean_verify", target_file)
+                                last_exit_code = int(_da_verify.get("exit_code", 1))
+                                last_sorry_in_attempt = int(_da_verify.get("sorry_count", 0))
+                                last_verify_text = str(_da_verify.get("errors", ""))
+                                _next_step_hint = ""
+                                if _agent7_current_step_idx < len(_steps):
+                                    _ns = _steps[_agent7_current_step_idx]
+                                    _next_step_hint = (
+                                        f"\nNext step: {_ns.get('step_id')} — "
+                                        f"tool={_ns.get('tool')}, purpose={_ns.get('purpose')}"
+                                    )
+                                raw_reply = agent3.call(
+                                    f"## Agent7 step {_cur_step_id} applied directly by orchestrator\n"
+                                    f"exit={last_exit_code}, sorry={last_sorry_in_attempt}\n"
+                                    f"Protected content (do NOT remove):\n```lean\n{_da_new}\n```"
+                                    + _next_step_hint
+                                )
+                                token_char_budget += len(raw_reply)
+                                continue
+                            except (ValueError, FileNotFoundError) as _da_exc:
+                                # old_str not found or file missing — fall through to Agent3
+                                console.print(
+                                    f"  [Agent7 DirectApply] step {_cur_step_id} failed "
+                                    f"({_da_exc!r}) — delegating to Agent3"
+                                )
+                                # Fall through to normal gate flow below
+
                     if _cur_tool and tool_name != _cur_tool:
                         agent7_blocked_actions.append({
                             "attempt": attempt,
@@ -1204,11 +1265,61 @@ def phase3_prove(
                     token_char_budget += len(_patch_warning) + len(raw_reply)
                     continue  # let Agent3 self-correct before applying patch
 
+            # Pre-edit snapshot: capture file content before Agent3's patch so
+            # we can rollback if protected content (from DirectApply) is removed.
+            _pre_edit_snapshot: str | None = None
+            if tool_name == "edit_file_patch" and _direct_applied_patches:
+                try:
+                    _pre_edit_snapshot = load_file(target_file)
+                except Exception:  # noqa: BLE001
+                    _pre_edit_snapshot = None
+
             # Execute single tool and format result for Agent3
             result_msg, verify_result, edited = _execute_single_tool_and_format(
                 registry, tool_name, arguments, target_file
             )
             token_char_budget += len(result_msg)
+
+            # Protection check: if Agent3's edit removed orchestrator-applied
+            # content, roll back and warn.
+            if (
+                tool_name == "edit_file_patch"
+                and edited
+                and _pre_edit_snapshot is not None
+                and _direct_applied_patches
+            ):
+                try:
+                    _current_content = load_file(target_file)
+                except Exception:  # noqa: BLE001
+                    _current_content = ""
+                _violations = [
+                    p for p in _direct_applied_patches
+                    if p.get("path") in (target_file, str(Path(target_file).name))
+                    and p["new_str"] not in _current_content
+                ]
+                if _violations:
+                    registry.call(
+                        "overwrite_file", path=target_file, content=_pre_edit_snapshot
+                    )
+                    _viol_desc = "\n".join(
+                        f"  step {v['step_id']}: {v['new_str'][:120]!r}"
+                        for v in _violations
+                    )
+                    console.print(
+                        f"  [Agent7 DirectApply] attempt {attempt} turn {tool_turn + 1} — "
+                        "protected content removed by Agent3 edit; rolling back"
+                    )
+                    raw_reply = agent3.call(
+                        "## PROTECTED CONTENT VIOLATION — edit reverted\n"
+                        "Your edit removed content applied directly by the orchestrator. "
+                        "The edit has been rolled back.\n"
+                        "The following content must remain in the file at all times:\n"
+                        f"{_viol_desc}\n"
+                        "Rewrite your patch to preserve these lines exactly."
+                    )
+                    token_char_budget += len(raw_reply)
+                    edited_this_attempt = False
+                    continue
             if (
                 _active_agent7_plan is not None
                 and not _agent7_pending_verify
@@ -1985,6 +2096,32 @@ def phase3_prove(
             )
             continue
 
+        # Pre-query sorry goals once per attempt-failure, reuse across all Agent2 paths.
+        _pre_agent2_goals = _prequery_sorry_goals(
+            registry,
+            target_file,
+            "",
+            _goal_cache,
+            staging_has_errors=False,
+            errors_text=last_verify_text,
+        )
+        _classification_request = (
+            "\n\n## SORRY CLASSIFICATION REQUIRED\n"
+            "For each sorry listed in the goal states above, output a classification block:\n"
+            "```\n"
+            "## SORRY CLASSIFICATION\n"
+            "- Line N: STRUCTURAL — <one-line reason why tactics alone cannot close this goal>\n"
+            "  dependency_symbols: [\"lemmaA\", \"lemmaB\"]\n"
+            "  diagnosis: \"<what bridge lemma is missing>\"\n"
+            "- Line M: TACTICAL — <specific tactic or have-step to try>\n"
+            "```\n"
+            "STRUCTURAL means: the goal requires applying an existing theorem to a "
+            "random variable / measurable function input, or requires a lemma that "
+            "does not exist in any imported Lib/ file.\n"
+            "TACTICAL means: ring / linarith / simp / exact with existing hypotheses suffices.\n"
+            + (_pre_agent2_goals or "")
+        )
+
         # LOCAL_PROOF_ERROR: try sorry-degrade to keep the file compilable
         if error_type_final == "LOCAL_PROOF_ERROR":
             console.print(
@@ -2051,7 +2188,8 @@ def phase3_prove(
                 f"   then reference it in your guidance for Agent3.\n\n"
                 + _retrieve_catalog_context(
                     _extract_new_identifiers_from_guidance(last_verify_text + "\n" + err_summary)
-                ),
+                )
+                + _classification_request,
             )
             continue
 
@@ -2114,7 +2252,8 @@ def phase3_prove(
                 staging_registry,
                 f"Attempt {attempt} failed.\n"
                 "Agent3 returned invalid JSON. Last error: " + last_errors + "\n"
-                "Adjust your guidance so Agent3 outputs strict single-action JSON.",
+                "Adjust your guidance so Agent3 outputs strict single-action JSON."
+                + _classification_request,
             )
             continue
 
@@ -2233,7 +2372,8 @@ def phase3_prove(
             "Agent3 will apply your patches verbatim as edit_file_patch calls.\n\n"
             + _retrieve_catalog_context(
                 _extract_new_identifiers_from_guidance(last_verify_text)
-            ),
+            )
+            + _classification_request,
         )
 
     # Staging lemma usage audit (6c): report which staging lemmas were referenced.

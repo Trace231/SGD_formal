@@ -889,6 +889,7 @@ Return ONLY:
   "ordered_steps": [
     {
       "step_id": "S1",
+      "direct_apply": false,
       "purpose": "<why this step>",
       "tool": "read_file|search_in_file|search_codebase|edit_file_patch|write_staging_lemma|request_agent6_glue",
       "required_args": {"...": "..."},
@@ -922,6 +923,11 @@ Constraints:
 - Do NOT route to Agent6 for Unknown identifier that looks like a Mathlib lemma (e.g. pow_le_one).
   Use search_codebase or Agent2-style guidance instead.
 - Never output free-form commentary outside JSON.
+- direct_apply: true may ONLY be set for fully-specified mechanical edits (haveI, letI, instance
+  injection, single-line fix) where both old_str and new_str are completely determined. When
+  direct_apply is true, the orchestrator applies the patch directly (bypassing Agent3) and the
+  inserted content is protected — Agent3 must not remove it. Reasoning/search steps must never
+  set direct_apply: true.
 """
 
 # -------------------------------------------------------------------

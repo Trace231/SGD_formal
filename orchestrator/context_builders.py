@@ -879,6 +879,77 @@ def _prequery_sorry_goals(
     return header + body + "\n\n" + dep_block
 
 
+def _parse_sorry_classification(guidance: str) -> list[dict]:
+    """Extract per-sorry TACTICAL/STRUCTURAL classifications from Agent2 guidance.
+
+    Looks for a block of the form (anywhere in the guidance):
+      ## SORRY CLASSIFICATION
+      - Line N: STRUCTURAL — <reason>
+        dependency_symbols: [...]
+        diagnosis: "..."
+      - Line M: TACTICAL — <tactic hint>
+
+    Returns a list of dicts, each with keys:
+      line (int), type ("STRUCTURAL"|"TACTICAL"), reason (str),
+      dependency_symbols (list[str]), diagnosis (str), tactic_hint (str)
+
+    Tolerant: returns [] when the block is absent or malformed.
+    """
+    results: list[dict] = []
+    # Locate the classification section (case-insensitive header match).
+    section_re = re.compile(
+        r"##\s*SORRY\s+CLASSIFICATION\b.*?(?=\n##|\Z)",
+        re.DOTALL | re.IGNORECASE,
+    )
+    m = section_re.search(guidance)
+    if not m:
+        return results
+
+    block = m.group(0)
+
+    # Each entry starts with "- Line N: TYPE — reason" (TYPE = STRUCTURAL or TACTICAL).
+    entry_re = re.compile(
+        r"-\s+Line\s+(\d+)\s*:\s*(STRUCTURAL|TACTICAL)\s*[—\-]+\s*(.+?)(?=\n\s*-\s+Line\s|\Z)",
+        re.DOTALL | re.IGNORECASE,
+    )
+    dep_re = re.compile(r'dependency_symbols\s*:\s*(\[[^\]]*\])', re.IGNORECASE)
+    diag_re = re.compile(r'diagnosis\s*:\s*"([^"]*)"', re.IGNORECASE)
+
+    for entry_m in entry_re.finditer(block):
+        line_no = int(entry_m.group(1))
+        sorry_type = entry_m.group(2).upper()
+        body = entry_m.group(3)
+        reason = body.splitlines()[0].strip() if body.strip() else ""
+
+        dep_symbols: list[str] = []
+        dep_match = dep_re.search(body)
+        if dep_match:
+            try:
+                dep_symbols = json.loads(dep_match.group(1))
+            except (json.JSONDecodeError, ValueError):
+                dep_symbols = [
+                    s.strip().strip('"\'')
+                    for s in dep_match.group(1).strip("[]").split(",")
+                    if s.strip()
+                ]
+
+        diagnosis = ""
+        diag_match = diag_re.search(body)
+        if diag_match:
+            diagnosis = diag_match.group(1).strip()
+
+        results.append({
+            "line": line_no,
+            "type": sorry_type,
+            "reason": reason,
+            "dependency_symbols": dep_symbols,
+            "diagnosis": diagnosis,
+            "tactic_hint": reason if sorry_type == "TACTICAL" else "",
+        })
+
+    return results
+
+
 def _retrieve_catalog_context(
     query_terms: list[str],
     catalog_path: Path | None = None,
