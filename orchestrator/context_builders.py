@@ -788,6 +788,7 @@ def _prequery_sorry_goals(
     goal_cache: dict,
     staging_has_errors: bool,
     errors_text: str = "",
+    target_line: int | None = None,
 ) -> str:
     """Query Lean LSP for proof goals at all sorry locations in the target file.
 
@@ -844,8 +845,17 @@ def _prequery_sorry_goals(
     if not sorry_lines:
         return dep_block
 
+    # When target_line is set (per-sorry mode): query the active sorry in full detail;
+    # list other pending sorry lines as lightweight notices without LSP overhead.
+    if target_line is not None:
+        primary_lines = [target_line] if target_line in sorry_lines else sorry_lines[:1]
+        other_lines = [ln for ln in sorry_lines if ln != target_line]
+    else:
+        primary_lines = sorry_lines[:6]
+        other_lines = []
+
     results: list[str] = []
-    for line in sorry_lines[:6]:  # cap at 6 lines to limit total LSP time
+    for line in primary_lines:  # full goal injection for active/primary sorry
         cache_key = (target_file, line, current_hash or "")
         if cache_key in goal_cache:
             cached = goal_cache[cache_key]
@@ -864,7 +874,8 @@ def _prequery_sorry_goals(
 
         goal_text = cached["goal"]
         hyps = cached.get("hypotheses", [])
-        entry = f"Line {line}: {goal_text}"
+        label = f"Line {line} [ACTIVE TARGET]" if target_line is not None else f"Line {line}"
+        entry = f"{label}: {goal_text}"
         if hyps:
             hyp_str = "; ".join(hyps[:6])
             entry += f"\n  Hypotheses: {hyp_str}"
@@ -876,6 +887,16 @@ def _prequery_sorry_goals(
     header = "## Pre-queried Lean Goal States (from LSP — authoritative)\n"
     header += "Use these exact types when formulating `have` steps.\n"
     body = "\n".join(results)
+
+    # Append lightweight notice of other pending sorries (no LSP call).
+    if other_lines:
+        other_notice = (
+            "\n## Other pending sorry lines (do NOT modify these now): "
+            + ", ".join(str(ln) for ln in other_lines[:10])
+            + "\n"
+        )
+        body += other_notice
+
     return header + body + "\n\n" + dep_block
 
 
