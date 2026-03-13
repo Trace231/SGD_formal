@@ -60,6 +60,10 @@ class GitRunSnapshot:
     pre_run_dirty: bool
     stash_used: bool
     stash_ref: str | None
+    # In-memory content snapshot of .md files as they existed on disk at run
+    # start (including any uncommitted local edits).  Used by _rollback_to_snapshot
+    # to restore exactly the pre-run disk state rather than the last git commit.
+    md_snapshots: dict[str, str] | None = None
 
 
 def _git_head_sha() -> str:
@@ -87,18 +91,36 @@ def _git_is_dirty() -> bool:
 
 
 def _capture_git_run_snapshot(run_id: str) -> GitRunSnapshot:
-    """Capture HEAD SHA only.
+    """Capture HEAD SHA and snapshot current on-disk content of all .md files.
 
-    Source files (.lean, .py), Lib staging-area entries, and any other
-    working-directory state are left completely untouched.  Only the start
-    SHA is recorded so that on failure we know which docs to roll back.
+    Source files (.lean, .py) and Lib staging-area entries are left completely
+    untouched.  The in-memory md_snapshots dict lets _rollback_to_snapshot
+    restore the exact pre-run disk state (including any uncommitted local edits)
+    rather than falling back to the last git commit.
     """
     start_sha = _git_head_sha()
+
+    # Walk docs/ and any other tracked .md files for a pre-run disk snapshot.
+    md_snapshots: dict[str, str] = {}
+    result = subprocess.run(
+        ["git", "ls-files", "--", "*.md"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    for rel in result.stdout.splitlines():
+        p = PROJECT_ROOT / rel
+        try:
+            md_snapshots[rel] = p.read_text(encoding="utf-8")
+        except OSError:
+            pass
+
     return GitRunSnapshot(
         start_sha=start_sha,
         pre_run_dirty=_git_is_dirty(),
         stash_used=False,
         stash_ref=None,
+        md_snapshots=md_snapshots,
     )
 
 
@@ -108,35 +130,34 @@ def _restore_snapshot_on_success(snapshot: GitRunSnapshot) -> None:
 
 
 def _rollback_to_snapshot(snapshot: GitRunSnapshot) -> None:
-    """On failure: revert only markdown documentation files to their pre-run state.
+    """On failure: restore .md docs to their exact pre-run on-disk state.
 
-    .lean files (including Lib/), Python files, and anything in the git
-    staging area are left completely untouched so that user edits and Lib
-    staging-area work are preserved across failed runs.
+    Uses the in-memory md_snapshots captured at run start, so uncommitted
+    local edits that existed before the run are also preserved correctly.
+    .lean files (including Lib/), Python files, and the git staging area are
+    left completely untouched.
     """
-    # Tracked .md files that changed since the run started.
-    result = subprocess.run(
-        ["git", "diff", snapshot.start_sha, "--name-only"],
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-    )
-    modified_md = [f for f in result.stdout.splitlines() if f.endswith(".md")]
+    snapshots = snapshot.md_snapshots or {}
 
-    if modified_md:
+    # Restore every .md file that is now different from its pre-run content.
+    restored: list[str] = []
+    for rel, original_content in snapshots.items():
+        p = PROJECT_ROOT / rel
+        try:
+            current = p.read_text(encoding="utf-8")
+        except OSError:
+            current = None
+        if current != original_content:
+            p.write_text(original_content, encoding="utf-8")
+            restored.append(rel)
+
+    if restored:
         console.print(
-            f"[yellow][Git] Rolling back {len(modified_md)} doc file(s): "
-            + ", ".join(modified_md)
-        )
-        subprocess.run(
-            ["git", "checkout", snapshot.start_sha, "--"] + modified_md,
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
+            f"[yellow][Git] Rolled back {len(restored)} doc file(s): "
+            + ", ".join(restored)
         )
 
-    # Remove any *new* untracked .md files the run may have created.
+    # Remove any *new* untracked .md files the run created (not in snapshot).
     ls_result = subprocess.run(
         ["git", "ls-files", "--others", "--exclude-standard"],
         cwd=PROJECT_ROOT,
@@ -144,7 +165,7 @@ def _rollback_to_snapshot(snapshot: GitRunSnapshot) -> None:
         text=True,
     )
     for fname in ls_result.stdout.splitlines():
-        if fname.endswith(".md"):
+        if fname.endswith(".md") and fname not in snapshots:
             try:
                 (PROJECT_ROOT / fname).unlink()
                 console.print(f"[yellow][Git] Removed new doc file: {fname}")
