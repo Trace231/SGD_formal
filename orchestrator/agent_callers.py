@@ -23,7 +23,7 @@ def _call_agent2_with_tools(
     registry: "ToolRegistry",
     user_msg: str,
     max_tool_rounds: int = 8,
-) -> str:
+) -> tuple[str, dict | None]:
     """Call Agent2 with read-only tool support and a lookup hard gate.
 
     Agent2 may reply with a lookup request:
@@ -117,7 +117,22 @@ def _call_agent2_with_tools(
             + "\n\nContinue planning or issue more lookups if still needed."
         )
 
-    return reply
+    # Parse Agent2's routing decision from the ROUTE_DECISION: block or embedded JSON.
+    route_decision: dict | None = None
+    _route_marker = "ROUTE_DECISION:"
+    _search_text = reply
+    _marker_pos = reply.find(_route_marker)
+    if _marker_pos != -1:
+        _search_text = reply[_marker_pos + len(_route_marker):]
+    for candidate in _json_candidates(_search_text.strip()):
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict) and "route_to" in obj:
+                route_decision = obj
+                break
+        except json.JSONDecodeError:
+            continue
+    return reply, route_decision
 
 
 def _call_agent7_with_tools(

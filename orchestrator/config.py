@@ -310,6 +310,24 @@ TIMEOUTS: dict[str, int] = {
     "LEAN_BUILD_TIMEOUT": 300,
 }
 
+# ---------------------------------------------------------------------------
+# Agent2 routing parameters
+# ---------------------------------------------------------------------------
+
+ROUTING_PARAMS: dict[str, int | float] = {
+    # Minimum confidence Agent2 must report to allow cross-agent routing (agent7/agent6).
+    # Below this threshold, orchestrator forces route_to="agent3".
+    "MIN_CONFIDENCE_FOR_CROSS_AGENT_ROUTE": 0.6,
+    # Maximum number of "self" (Agent2 self-revision) routes per attempt.
+    "MAX_SELF_REVISIONS_PER_ATTEMPT": 1,
+    # Maximum times the same (error_signature, route_to) pair may repeat before
+    # the orchestrator escalates to the next level (anti-oscillation guard).
+    "MAX_SAME_ROUTE_REPEAT": 2,
+    # Maximum number of preemptive (orchestrator-driven, not Agent3-requested)
+    # Agent7 invocations per attempt.
+    "AGENT7_PREEMPTIVE_MAX_PER_ATTEMPT": 1,
+}
+
 # Backward-compatible aliases (to be removed after full migration).
 MAX_APPROVAL_ROUNDS = RETRY_LIMITS["MAX_PHASE2_APPROVAL_ROUNDS"]
 MAX_PHASE3_RETRIES = RETRY_LIMITS["MAX_PHASE3_RETRIES"]

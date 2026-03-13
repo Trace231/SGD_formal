@@ -58,6 +58,7 @@ from orchestrator.config import (
     PROJECT_ROOT,
     REFERENCE_FILES_WITH_DESCRIPTIONS,
     RETRY_LIMITS,
+    ROUTING_PARAMS,
     UNKNOWN_IDENTIFIER_RENAME_MAP,
     _get_default_references,
 )
@@ -218,6 +219,72 @@ def _is_line_still_sorry(file_path: str, line: int) -> bool:
         return False
     except OSError:
         return False
+
+
+def _apply_agent2_route(
+    route: dict | None,
+    budget: dict,
+    last_error_sig: str,
+    route_repeat_tracker: dict,
+) -> str:
+    """Arbitrate Agent2's routing proposal; return the final route_to string.
+
+    Applies the following guardrails in order:
+    1. Invalid / missing route → "agent3"
+    2. Confidence below threshold → "agent3"
+    3. Anti-oscillation: same (error_sig, route_to) pair seen too many times → escalate
+    4. "self" budget exceeded → "agent3"
+    5. Preemptive Agent7 budget exceeded → "agent3"
+    """
+    if route is None:
+        return "agent3"
+    route_to = str(route.get("route_to", "agent3")).strip()
+    confidence = float(route.get("confidence", 0.0))
+    valid = {"agent3", "agent7", "agent7_then_agent6", "self"}
+    if route_to not in valid:
+        return "agent3"
+    # Low-confidence guard: only route cross-agent when confident enough.
+    min_conf = float(ROUTING_PARAMS.get("MIN_CONFIDENCE_FOR_CROSS_AGENT_ROUTE", 0.6))
+    if route_to != "agent3" and confidence < min_conf:
+        return "agent3"
+    # Anti-oscillation: track how many times (error_sig, route_to) has been chosen.
+    max_repeat = int(ROUTING_PARAMS.get("MAX_SAME_ROUTE_REPEAT", 2))
+    sig_key = f"{last_error_sig[:40]}:{route_to}"
+    route_repeat_tracker[sig_key] = route_repeat_tracker.get(sig_key, 0) + 1
+    if route_repeat_tracker[sig_key] > max_repeat:
+        # Escalate to next level to break oscillation.
+        _escalation = {"agent3": "agent7", "agent7": "self", "self": "agent3"}
+        return _escalation.get(route_to, "agent3")
+    # "self" budget.
+    max_self = int(ROUTING_PARAMS.get("MAX_SELF_REVISIONS_PER_ATTEMPT", 1))
+    if route_to == "self" and budget.get("self_revisions", 0) >= max_self:
+        return "agent3"
+    # Preemptive Agent7 budget.
+    max_a7 = int(ROUTING_PARAMS.get("AGENT7_PREEMPTIVE_MAX_PER_ATTEMPT", 1))
+    if route_to in ("agent7", "agent7_then_agent6") and budget.get("preemptive_agent7", 0) >= max_a7:
+        return "agent3"
+    return route_to
+
+
+def _build_preemptive_agent7_prompt(
+    hint: str,
+    target_file: str,
+    last_verify_text: str,
+    _agent7_registry: "ToolRegistry | None" = None,
+) -> str:
+    """Build the Agent7 prompt for a preemptive (Agent2-routed) invocation."""
+    snippet = _build_escalation_file_context(target_file, _extract_first_error_line(last_verify_text))
+    dep_sigs = _prequery_dependency_signatures(last_verify_text, target_file)
+    return (
+        "Produce a strict interface-audit protocol JSON for Agent3.\n"
+        f"Target file: {target_file}\n"
+        "[Preemptive invocation — triggered by Agent2 routing decision]\n\n"
+        f"Agent2 diagnosis:\n{hint[:1200]}\n\n"
+        f"Latest build errors:\n```\n{last_verify_text[:2000]}\n```\n\n"
+        f"Current file snippet:\n```lean\n{snippet[:8000]}\n```\n\n"
+        f"Dependency signatures:\n```lean\n{dep_sigs[:4000]}\n```\n\n"
+        "Return strict JSON only as specified in your system prompt."
+    )
 
 
 def phase3_prove(
@@ -411,7 +478,7 @@ def phase3_prove(
         f"\n\n{_imported_sigs}"
         if _imported_sigs else ""
     )
-    guidance = _call_agent2_with_tools(
+    guidance, _ = _call_agent2_with_tools(
         agent2,
         readonly_registry,
         "The verification target file is "
@@ -696,6 +763,8 @@ def phase3_prove(
         _attempt_esc_a7: int = 0
         # Reset per-attempt error dedup.
         _last_printed_err_sig = None
+        # Current error signature (MD5 of primary error); updated each verify round.
+        _err_sig: str = ""
 
         # -------------------------------------------------------------------
         # Per-sorry loop: each iteration focuses Agent3 on one sorry line.
@@ -767,6 +836,9 @@ def phase3_prove(
             _agent7_no_progress_threshold = RETRY_LIMITS.get("AGENT7_STEP_NO_PROGRESS_THRESHOLD", 2)
             # Agent3 autonomy: Agent6 no longer requires Agent7 pre-approval.
             _agent7_approved_agent6 = True
+            # Agent2 router budget — reset each attempt.
+            _routing_budget: dict[str, int] = {"self_revisions": 0, "preemptive_agent7": 0}
+            _route_repeat_tracker: dict[str, int] = {}
             _active_agent7_plan: dict | None = None
             _agent7_current_step_idx = 0
             _agent7_pending_verify = False
@@ -1324,7 +1396,7 @@ def phase3_prove(
                         _stuck_line_int = int(stuck_at_line) if str(stuck_at_line).isdigit() else None
                         _current_snippet = _build_escalation_file_context(target_file, _stuck_line_int)
                         _staging_snippet = _staging_read_overlay()
-                        new_guidance = _call_agent2_with_tools(
+                        new_guidance, _ = _call_agent2_with_tools(
                             agent2,
                             staging_registry,
                             f"[AGENT6 FALLBACK — Agent6 could not prove glue]\n"
@@ -1372,7 +1444,7 @@ def phase3_prove(
                     _stuck_line_int = int(stuck_at_line) if str(stuck_at_line).isdigit() else None
                     current_file_snippet = _build_escalation_file_context(target_file, _stuck_line_int)
                     _staging_snippet = _staging_read_overlay()
-                    new_guidance = _call_agent2_with_tools(
+                    new_guidance, _a2_route_mid = _call_agent2_with_tools(
                         agent2,
                         staging_registry,
                         f"[AGENT3 ESCALATION — MID-ATTEMPT HELP REQUEST]\n"
@@ -1396,21 +1468,31 @@ def phase3_prove(
                         "line BEFORE your analysis. The orchestrator will call Agent7 "
                         "automatically and deliver the audit protocol to Agent3.",
                     )
-                    # B: parse Agent2's routing signal — if structural interface problem,
-                    # escalate directly to Agent7 instead of returning guidance to Agent3.
-                    if re.search(
+                    # Apply Agent2 router: "self" is forbidden mid-attempt.
+                    _mid_route_budget = dict(_routing_budget)  # snapshot (no self mid-attempt)
+                    _mid_route_budget["self_revisions"] = 9999  # disable self mid-attempt
+                    _final_route_mid = _apply_agent2_route(
+                        _a2_route_mid, _mid_route_budget, _err_sig, _route_repeat_tracker
+                    )
+                    # B: parse Agent2's routing signal — new JSON protocol + legacy ROUTE_TO fallback
+                    _a2_wants_agent7 = _final_route_mid in ("agent7", "agent7_then_agent6")
+                    _legacy_agent7 = bool(re.search(
                         r"^ROUTE_TO:\s*agent7\s*$", new_guidance,
                         re.IGNORECASE | re.MULTILINE,
-                    ) and _agent7_invocations_this_attempt < _agent7_max_invocations:
+                    ))
+                    if (_a2_wants_agent7 or _legacy_agent7) and _agent7_invocations_this_attempt < _agent7_max_invocations:
                         _agent7_invocations_this_attempt += 1
+                        _route_label = "JSON" if _a2_wants_agent7 else "legacy"
                         console.print(
                             f"  [Agent3→Agent2→Agent7] Agent2 routed to Agent7 "
                             f"(escalation #{_escalation_count}, "
-                            f"invocation #{_agent7_invocations_this_attempt})"
+                            f"invocation #{_agent7_invocations_this_attempt}, "
+                            f"protocol={_route_label})"
                         )
                         _agent7_esc_snippet = _build_escalation_file_context(
                             target_file, _stuck_line_int
                         )
+                        _a7_hint_mid = (_a2_route_mid or {}).get("agent7_hint", "") if _a2_route_mid else ""
                         _agent7_esc_prompt = (
                             "Produce a strict interface-audit protocol JSON for Agent3.\n"
                             f"Target file: {target_file}\n"
@@ -1418,7 +1500,8 @@ def phase3_prove(
                             f"Escalated via Agent2 routing (structural interface problem).\n\n"
                             f"Primary error:\n```\n{error_message}\n```\n\n"
                             f"Diagnosis:\n{diagnosis}\n\n"
-                            f"Agent2 analysis:\n{new_guidance[:2000]}\n\n"
+                            + (f"Agent2 routing hint:\n{_a7_hint_mid}\n\n" if _a7_hint_mid else "")
+                            + f"Agent2 analysis:\n{new_guidance[:2000]}\n\n"
                             f"Current snippet:\n```lean\n{_agent7_esc_snippet[:6000]}\n```\n\n"
                             "Return strict JSON only as specified in your system prompt."
                         )
@@ -1426,9 +1509,16 @@ def phase3_prove(
                             agent7, agent7_registry,
                             _agent7_esc_prompt,
                         )
+                        if _plan_obj_esc:
+                            _active_agent7_plan = _plan_obj_esc
+                            _agent7_current_step_idx = 0
+                        if _final_route_mid == "agent7_then_agent6":
+                            _ft_mid = (_plan_obj_esc or {}).get("fallback_trigger", {}) if _plan_obj_esc else {}
+                            _agent7_approved_agent6 = str(_ft_mid.get("route_to", "")).lower() == "agent6"
+                            console.print(f"  [A2Router→Agent7→Agent6] agent6_approved={_agent7_approved_agent6}")
                         esc_result_msg = (
                             f"## Agent7 Interface Audit "
-                            f"(routed by Agent2, escalation #{_escalation_count})\n"
+                            f"(routed by Agent2 [{_route_label}], escalation #{_escalation_count})\n"
                             "Agent2 classified this as a structural interface problem "
                             "and escalated to Agent7.\n\n"
                             f"{_raw_plan_esc}\n\n"
@@ -1893,7 +1983,7 @@ def phase3_prove(
                             initial_exists = False
                             initial_hash = None
                             file_changed = False
-                        guidance = _call_agent2_with_tools(
+                        guidance, _ = _call_agent2_with_tools(
                             agent2,
                             staging_registry,
                             f"[STATEMENT ERROR — SIGNATURE HALLUCINATION]\n"
@@ -2040,7 +2130,7 @@ def phase3_prove(
                                 else:
                                     _current_snippet = _build_escalation_file_context(target_file, _line_int)
                                     _staging_snippet = _staging_read_overlay()
-                                    new_guidance = _call_agent2_with_tools(
+                                    new_guidance, _ = _call_agent2_with_tools(
                                         agent2,
                                         staging_registry,
                                         f"[AGENT6 AUTO-ROUTE FALLBACK — Agent6 could not prove glue]\n"
@@ -2158,7 +2248,7 @@ def phase3_prove(
                             registry,
                             target_file,
                         )
-                        guidance = _call_agent2_with_tools(
+                        guidance, _ = _call_agent2_with_tools(
                             agent2,
                             staging_registry,
                             _attempt_diag
@@ -2269,7 +2359,7 @@ def phase3_prove(
                 f"{len(_skipped_sorry_lines)} unresolved: "
                 + ", ".join(f"line {ln}" for ln in _skipped_sorry_lines)
             )
-            guidance = _call_agent2_with_tools(agent2, staging_registry, _round_replan_prompt)
+            guidance, _ = _call_agent2_with_tools(agent2, staging_registry, _round_replan_prompt)
 
         # ---------------------------------------------------------------
         # Attempt summary panel (normal: one compact line; debug: Panel)
@@ -2342,7 +2432,7 @@ def phase3_prove(
 
         # File-not-created check
         if not _target_exists_overlay():
-            guidance = _call_agent2_with_tools(
+            guidance, _ = _call_agent2_with_tools(
                 agent2,
                 staging_registry,
                 f"Attempt {attempt} failed: Target file still does not exist.\n"
@@ -2381,7 +2471,7 @@ def phase3_prove(
                     "(<<<SEARCH>>>/<<<REPLACE>>>) with the exact Lean code to apply. "
                     "Be specific — no natural language, no explanation without a patch."
                 )
-                guidance = _call_agent2_with_tools(agent2, staging_registry, _noop_ctx)
+                guidance, _ = _call_agent2_with_tools(agent2, staging_registry, _noop_ctx)
                 console.print(
                     f"  [Agent3] attempt {attempt}/{max_retries} — "
                     f"build={last_exit_code} (file UNCHANGED — NOOP forced)"
@@ -2423,7 +2513,7 @@ def phase3_prove(
             _ref_class_dep = _format_ref_and_classification_blocks(
                 _ref_files_dep, None
             )
-            guidance = _call_agent2_with_tools(
+            guidance, _ = _call_agent2_with_tools(
                 agent2,
                 staging_registry,
                 _attempt_diag
@@ -2515,7 +2605,7 @@ def phase3_prove(
             _error_line_goal = _prequery_error_line_goal(
                 staging_registry, target_file, _err_line_int, _goal_cache
             )
-            guidance = _call_agent2_with_tools(
+            guidance, _a2_route_local = _call_agent2_with_tools(
                 agent2,
                 staging_registry,
                 _attempt_diag
@@ -2559,6 +2649,38 @@ def phase3_prove(
                 )
                 + _classification_request,
             )
+            # ---- Agent2 Router: execute routing decision for LOCAL_PROOF_ERROR ----
+            _final_route_local = _apply_agent2_route(
+                _a2_route_local, _routing_budget, _err_sig, _route_repeat_tracker
+            )
+            if _final_route_local in ("agent7", "agent7_then_agent6"):
+                _routing_budget["preemptive_agent7"] = _routing_budget.get("preemptive_agent7", 0) + 1
+                _a7_hint_local = (_a2_route_local or {}).get("agent7_hint", "")
+                _a7_prompt_local = _build_preemptive_agent7_prompt(
+                    _a7_hint_local, target_file, last_verify_text, agent7_registry
+                )
+                _a7_plan_local, _ = _call_agent7_with_tools(agent7, agent7_registry, _a7_prompt_local)
+                if _a7_plan_local:
+                    _active_agent7_plan = _a7_plan_local
+                    _agent7_current_step_idx = 0
+                    _agent7_invocations_this_attempt += 1
+                    console.print(
+                        f"  [A2Router→Agent7] Preemptive Agent7 triggered by LOCAL_PROOF_ERROR route "
+                        f"(confidence={(_a2_route_local or {}).get('confidence', '?')})"
+                    )
+                if _final_route_local == "agent7_then_agent6":
+                    _ft_local = (_a7_plan_local or {}).get("fallback_trigger", {}) if _a7_plan_local else {}
+                    _agent7_approved_agent6 = str(_ft_local.get("route_to", "")).lower() == "agent6"
+                    console.print(f"  [A2Router→Agent7→Agent6] agent6_approved={_agent7_approved_agent6}")
+            elif _final_route_local == "self":
+                _routing_budget["self_revisions"] = _routing_budget.get("self_revisions", 0) + 1
+                _self_msg_local = (
+                    "[SELF_REVISION] Your current proof strategy has low confidence. "
+                    "Revise the overall proof approach fundamentally. Do NOT reuse the same tactics.\n\n"
+                    + guidance
+                )
+                guidance, _ = _call_agent2_with_tools(agent2, staging_registry, _self_msg_local)
+                console.print("  [A2Router→Self] Agent2 self-revision triggered (LOCAL_PROOF_ERROR)")
             continue
 
         # ---- Assumption-type shortcut (routing table: Todo 2) ----
@@ -2615,7 +2737,7 @@ def phase3_prove(
             )
 
         if _inner_break_reason == "json_error":
-            guidance = _call_agent2_with_tools(
+            guidance, _ = _call_agent2_with_tools(
                 agent2,
                 staging_registry,
                 f"Attempt {attempt} failed.\n"
@@ -2713,7 +2835,7 @@ def phase3_prove(
                 "Agent3 does NOT change proof tactics for these — just add the params.\n\n"
             )
         _history_prefix = _format_failed_approaches(_failed_approaches[-5:])
-        guidance = _call_agent2_with_tools(
+        guidance, _a2_route_gen = _call_agent2_with_tools(
             agent2,
             staging_registry,
             _attempt_diag + _surgeon_prefix + _assumption_context_prefix + _history_prefix + mismatch_prefix
@@ -2743,6 +2865,38 @@ def phase3_prove(
             )
             + _classification_request,
         )
+        # ---- Agent2 Router: execute routing decision for general failure ----
+        _final_route_gen = _apply_agent2_route(
+            _a2_route_gen, _routing_budget, _err_sig, _route_repeat_tracker
+        )
+        if _final_route_gen in ("agent7", "agent7_then_agent6"):
+            _routing_budget["preemptive_agent7"] = _routing_budget.get("preemptive_agent7", 0) + 1
+            _a7_hint_gen = (_a2_route_gen or {}).get("agent7_hint", "")
+            _a7_prompt_gen = _build_preemptive_agent7_prompt(
+                _a7_hint_gen, target_file, last_verify_text, agent7_registry
+            )
+            _a7_plan_gen, _ = _call_agent7_with_tools(agent7, agent7_registry, _a7_prompt_gen)
+            if _a7_plan_gen:
+                _active_agent7_plan = _a7_plan_gen
+                _agent7_current_step_idx = 0
+                _agent7_invocations_this_attempt += 1
+                console.print(
+                    f"  [A2Router→Agent7] Preemptive Agent7 triggered by general-failure route "
+                    f"(confidence={(_a2_route_gen or {}).get('confidence', '?')})"
+                )
+            if _final_route_gen == "agent7_then_agent6":
+                _ft_gen = (_a7_plan_gen or {}).get("fallback_trigger", {}) if _a7_plan_gen else {}
+                _agent7_approved_agent6 = str(_ft_gen.get("route_to", "")).lower() == "agent6"
+                console.print(f"  [A2Router→Agent7→Agent6] agent6_approved={_agent7_approved_agent6}")
+        elif _final_route_gen == "self":
+            _routing_budget["self_revisions"] = _routing_budget.get("self_revisions", 0) + 1
+            _self_msg_gen = (
+                "[SELF_REVISION] Your current proof strategy has low confidence. "
+                "Revise the overall proof approach fundamentally. Do NOT reuse the same tactics.\n\n"
+                + guidance
+            )
+            guidance, _ = _call_agent2_with_tools(agent2, staging_registry, _self_msg_gen)
+            console.print("  [A2Router→Self] Agent2 self-revision triggered (general failure)")
 
     # Staging lemma usage audit (6c): report which staging lemmas were referenced.
     if snapshot_file(_staging_rel) and snapshot_file(target_file):

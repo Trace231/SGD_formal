@@ -411,6 +411,72 @@ references lemmas, APIs, or patterns you have not yet verified, it is STRONGLY
 RECOMMENDED to perform a lookup first. Unverified identifiers can cause Agent3
 failures. Use your judgment — the reference files and context provided may
 already give you enough confidence.
+
+## Routing Decision Protocol (MANDATORY — append to EVERY guidance response)
+
+After your analysis and PATCH blocks, you MUST end with a `ROUTE_DECISION:` block
+containing a single-line JSON object. The orchestrator parses this to decide whether
+to preemptively invoke Agent7 or Agent6 before the next Agent3 attempt starts.
+
+### Output format (append verbatim at the very end of your reply)
+
+```
+ROUTE_DECISION:
+{"route_to":"<agent3|agent7|agent7_then_agent6|self>","confidence":<0.0-1.0>,"root_cause":"<one sentence>","error_class":"<INTERFACE|INFRA_GAP|TACTICAL|STRUCTURAL>","agent7_hint":"<only when route_to=agent7*: exact error text + diagnosis for Agent7>","fallback":{"if_no_progress_turns":3,"route_to":"agent7"}}
+```
+
+### Route selection rules (STRICT — choose exactly one)
+
+**route_to = "agent3"** (default — let Agent3 fix locally):
+- Error is a wrong tactic, missing import, wrong lemma name, or minor type coercion
+- You have a concrete PATCH block that directly addresses it
+- Confidence ≥ 0.8 that the patch will resolve the error in one attempt
+
+**route_to = "agent7"** (interface audit — wrong API call or signature):
+- "Application type mismatch" / "Function expected" occurs in the declaration zone (before `:= by`)
+- "Invalid field notation" or wrong dot-projection on a structure
+- Same error line has repeated ≥ 3 times across attempts with no sorry decrease
+- Error is caused by wrong argument order, wrong explicit/implicit distinction, or wrong namespace
+
+**route_to = "agent7_then_agent6"** (interface audit → new glue lemma):
+- A needed bridge lemma genuinely does not exist anywhere in the codebase
+  (REQUIRED: confirm with `search_codebase` before using this route)
+- Type mismatch between deterministic type (`E`) and random/dependent type (`Ω → E`)
+  that cannot be resolved by fixing the call site alone
+- Goal requires a mathematically standard lemma not present in any Lib/ file
+
+**route_to = "self"** (Agent2 revises own proof strategy):
+- The current proof approach is fundamentally wrong (wrong lemma, wrong mathematical step)
+- Confidence in any concrete fix is < 0.5
+- CONSTRAINT: use at most ONCE per attempt. If you already issued "self" this attempt,
+  use "agent3" instead (the orchestrator enforces this).
+
+### Confidence calibration
+
+- 0.9+: you have seen the exact fix in a reference file and the patch is mechanical
+- 0.7–0.9: clear strategy, minor uncertainty about exact Lean syntax
+- 0.5–0.7: structural suspicion — Agent7 audit should confirm
+- < 0.5: escalate to "self" or "agent7"
+
+### Real examples (from SVRGOuterLoop proof failures)
+
+INTERFACE example → agent7:
+  Error: `svrg_convergence_inner_strongly_convex f L μ σeff η wStar ...`
+  `L : NNReal` is passed as a positional argument where the function expects `wTilde : E`
+  Root cause: implicit argument `{L : NNReal}` is being supplied explicitly, shifting all
+  positional arguments by one. Fix: remove explicit `L` from the call.
+  → route_to = "agent7", confidence = 0.85
+
+INFRA_GAP example → agent7_then_agent6:
+  Error: goal requires `setup.svrgProcess (w_k ω) (gradF (w_k ω)) t ω` but
+  `svrgProcess` signature only accepts deterministic `wTilde : E`, not `w_k : Ω → E`.
+  A bridge lemma `svrgProcess_measurable_random_snapshot` is needed and does not exist.
+  → route_to = "agent7_then_agent6", confidence = 0.75
+
+TACTICAL example → agent3:
+  Error: `rewrite` failed — pattern not found at line 137.
+  Fix: replace `rewrite [h_inner_eq]` with `simp only [h_inner_eq]`.
+  → route_to = "agent3", confidence = 0.90
 """
 
 # -------------------------------------------------------------------
