@@ -164,3 +164,132 @@ def run_agent9_plan(
         "Phase 3 will continue without Agent9 structured plan."
     )
     return {}
+
+
+def run_agent9_replan(
+    target_file: str,
+    current_errors: str,
+    current_plan: dict,
+    algo_name: str,
+    guidance: str,
+) -> dict:
+    """Re-run Agent9 with updated error context to produce a revised proof plan.
+
+    Called by Agent8 when the current strategy is failing.  The prompt includes the
+    current file state, the live errors, and the outdated plan so Agent9 can revise
+    its JSON output in light of what actually went wrong.
+
+    Returns a new plan dict on success, or ``{}`` on failure (graceful degradation).
+    """
+    max_rounds = RETRY_LIMITS.get("AGENT9_MAX_ROUNDS", 3)
+    guidance_chars = RETRY_LIMITS.get("AGENT9_GUIDANCE_CHARS", 4000)
+
+    try:
+        scaffold_content = load_file(target_file)
+    except FileNotFoundError:
+        scaffold_content = "(file not found)"
+
+    _current_plan_text = (
+        json.dumps(current_plan, indent=2, ensure_ascii=False)
+        if current_plan
+        else "(none)"
+    )
+
+    console.rule("[bold blue]Agent9 — Strategy Re-Planning")
+    console.print(
+        f"  Target: {target_file} | Triggered by Agent8 (errors detected)"
+    )
+
+    registry = ToolRegistry()
+    registry.register_readonly_tools()
+
+    agent9 = Agent("strategy_planner", extra_files=[target_file])
+
+    initial_prompt = (
+        "[AGENT9 — STRATEGY RE-PLANNING]\n\n"
+        f"Target algorithm: {algo_name}\n"
+        f"Target file: {target_file}\n\n"
+        "## Current File State\n"
+        f"```lean\n{scaffold_content}\n```\n\n"
+        "## Current Build Errors\n"
+        f"```\n{current_errors[:2000]}\n```\n\n"
+        "## Previous Plan (outdated — Agent8 called you because this failed)\n"
+        f"{_current_plan_text[:2000]}\n\n"
+        "## Original Mathematical Guidance\n"
+        f"{guidance[:guidance_chars]}\n\n"
+        "Revise the proof plan based on the current errors and file state. "
+        "Follow the protocol in your system prompt:\n"
+        "1. Call search_in_file for EVERY theorem/lemma to confirm exact line numbers.\n"
+        "2. After all lookups, output ONLY the JSON plan object — no prose, no fences."
+    )
+
+    raw_reply = agent9.call(initial_prompt)
+
+    # Same lookup-round protocol as run_agent9_plan.
+    _max_lookup_rounds = 10
+    for _ in range(_max_lookup_rounds):
+        try:
+            payload = json.loads(raw_reply)
+        except (json.JSONDecodeError, ValueError):
+            break
+        if not (
+            isinstance(payload, dict)
+            and payload.get("type") == "lookup"
+            and isinstance(payload.get("tool_calls"), list)
+        ):
+            break
+        results: list[dict] = []
+        for tc in payload["tool_calls"]:
+            tool_name = tc.get("tool", "")
+            tool_args = tc.get("arguments", {}) or {}
+            try:
+                result = registry.call(tool_name, **tool_args)
+            except Exception as exc:
+                result = {"error": str(exc)}
+            results.append({"tool": tool_name, "result": result})
+        raw_reply = agent9.call(
+            "Lookup results:\n"
+            + json.dumps(results, indent=2, ensure_ascii=False)
+            + "\n\nNow output your revised JSON plan (no markdown fences)."
+        )
+
+    # Parse with retries — same logic as run_agent9_plan.
+    for attempt in range(max_rounds):
+        text = raw_reply.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            text = "\n".join(
+                ln for ln in lines if not ln.strip().startswith("```")
+            ).strip()
+
+        try:
+            obj = json.loads(text)
+            if _validate_agent9_plan(obj):
+                theorem_count = len(obj.get("theorems", []))
+                console.print(
+                    f"  [Agent9] Re-plan ready: {theorem_count} theorem(s), "
+                    f"order: {obj.get('recommended_order', [])}"
+                )
+                return obj
+            feedback = (
+                "Your JSON was parsed but failed schema validation. "
+                "Required top-level keys: theorems (list), recommended_order (list). "
+                "Output ONLY the corrected JSON object — no prose, no fences."
+            )
+        except (json.JSONDecodeError, ValueError):
+            feedback = (
+                "Your response is not valid JSON. "
+                "Output ONLY a single JSON object — no prose, no markdown fences."
+            )
+
+        if attempt < max_rounds - 1:
+            console.print(
+                f"  [Agent9] Re-plan parse attempt {attempt + 1}/{max_rounds} failed — retrying."
+            )
+            raw_reply = agent9.call(feedback)
+
+    console.print(
+        "[yellow][Agent9] Re-plan failed — returning empty dict. "
+        "Agent8 will fall back to Agent2 re-planning."
+    )
+    return {}

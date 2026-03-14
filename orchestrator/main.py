@@ -580,10 +580,30 @@ def phase3_prove(
             staging_rel=_staging_rel,
             algo_name=_algo_name_for_staging,
         )
+        # Collect build errors so Agent10 can use them for Full-Correction mode.
         if not _scaffold_ok:
+            _a2_verify = registry.call("run_lean_verify", target_file)
+            _a2_build_errors: str = str(_a2_verify.get("errors", ""))
+        else:
+            _a2_build_errors = ""
+
+        # Phase 3a-verify — Agent10 (Scaffold Verifier): systematic API-trace
+        # and typeclass completeness check after Agent2's scaffold attempt.
+        #   • scaffold_succeeded=True  → Semantic-Verify mode (Phase D + E)
+        #   • scaffold_succeeded=False → Full-Correction mode (Phase A-E)
+        from orchestrator.phase3a_agent10 import run_agent10_verify as _run_agent10_verify
+        _a10_ok = _run_agent10_verify(
+            target_file,
+            guidance,
+            _algo_name,
+            scaffold_succeeded=_scaffold_ok,
+            build_errors=_a2_build_errors,
+        )
+
+        if not _a10_ok:
             console.print(
-                "[red bold][Phase 3a] Scaffold failed — Agent2 could not produce "
-                "a compiling scaffold. Aborting Phase 3."
+                "[red bold][Phase 3a] Scaffold failed — Agent2 and Agent10 "
+                "could not produce a compiling scaffold. Aborting Phase 3."
             )
             return False, 0, "Phase 3a scaffold failed", {
                 "attempts": 0,
@@ -599,7 +619,8 @@ def phase3_prove(
                 "agent7_force_gate_rejections": [],
                 "agent7_force_gate_reason_samples": [],
             }
-        # Refresh checkpoint with fresh scaffold content
+
+        # Refresh checkpoint with verified scaffold content.
         _initial_sorry_for_ckpt = int(
             registry.call("run_lean_verify", target_file).get("sorry_count", 999)
         )
@@ -618,6 +639,23 @@ def phase3_prove(
             console.print(
                 "[yellow][Agent9] Strategy plan unavailable — "
                 "Agent8 will operate without structured plan."
+            )
+        else:
+            # Agent9 plan ready — skip Agent3 multi-retry loop and hand control
+            # directly to Agent8.  Set max_retries=0 so range(1,1) is empty.
+            max_retries = 0
+            _skip_verify = registry.call("run_lean_verify", target_file)
+            last_errors = str(_skip_verify.get("errors", ""))
+            last_sorry_count = int(
+                _skip_verify.get("sorry_count", _initial_sorry_for_ckpt)
+            )
+            # Agent9 is now the primary strategy source — promote its plan to
+            # current_plan so Agent8's loop starts with Agent9's JSON rather
+            # than Agent2's initial text guidance.
+            guidance = json.dumps(_agent9_plan, indent=2, ensure_ascii=False)
+            console.print(
+                f"[cyan bold][Agent9] Plan ready — bypassing Agent3 loop, "
+                f"handing control directly to Agent8 (sorry={last_sorry_count})"
             )
     else:
         # Target file already exists (re-run or partial proof) — skip scaffold
@@ -2664,6 +2702,28 @@ def phase3_prove(
                         f"  [PerSorrySkip] a{attempt} line={_active_sorry_line} "
                         f"reason={_skip_reason} turns_used={_turns_this_sorry}"
                     )
+            # Exit=1 invariant guard: if the file is broken at the end of this
+            # sorry iteration, restore the best checkpoint immediately so the
+            # next turn never starts from a non-compiling state.
+            if last_exit_code == 1 and best_checkpoint["content"] is not None:
+                registry.call(
+                    "overwrite_file", path=target_file,
+                    content=best_checkpoint["content"],
+                )
+                if best_checkpoint.get("staging_content") is not None:
+                    registry.call(
+                        "overwrite_file", path=_staging_rel,
+                        content=best_checkpoint["staging_content"],
+                    )
+                last_sorry_in_attempt = int(best_checkpoint["sorry_count"])
+                last_sorry_count = last_sorry_in_attempt
+                last_exit_code = 0
+                last_errors = ""
+                console.print(
+                    f"  [InvariantRestore] exit=1 at sorry boundary — "
+                    f"restored checkpoint (sorry={best_checkpoint['sorry_count']})"
+                )
+
             if _break_attempt:
                 _inner_break_reason = _inner_break_reason or "break_attempt"
                 break  # exit the per-sorry loop early
@@ -3338,7 +3398,14 @@ def phase3_prove(
     # ------------------------------------------------------------------
     from orchestrator.phase3_agent8 import run_agent8_loop
 
-    console.print("[magenta bold]Max retries exhausted — entering Agent8 Decision Hub.")
+    console.print(
+        "[magenta bold]"
+        + (
+            "Agent9 plan ready — entering Agent8 Decision Hub as primary Phase 3 driver."
+            if _agent9_plan
+            else "Max retries exhausted — entering Agent8 Decision Hub."
+        )
+    )
     _agent8_success, _agent8_plan, _agent8_errors = run_agent8_loop(
         agent2,
         target_file,

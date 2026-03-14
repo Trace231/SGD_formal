@@ -84,6 +84,7 @@ def _build_agent8_tick_context(
     decision_history: list[dict],
     staging_rel: str,
     agent9_plan: dict | None = None,
+    plan_updated_tick: int = 0,
 ) -> str:
     """Build a minimal, non-truncated diagnostic prompt for Agent8.
 
@@ -143,25 +144,43 @@ def _build_agent8_tick_context(
     _hist_window = RETRY_LIMITS.get("AGENT8_HISTORY_WINDOW", 8)
     if decision_history:
         history_lines = []
+        _last_success_tick: int | None = None
+        for entry in decision_history:
+            if entry.get("outcome") == "success":
+                _last_success_tick = entry["tick"]
         for entry in decision_history[-_hist_window:]:
             _eb = entry.get("errors_before", "")
             _ea = entry.get("errors_after", "")
             _delta = entry.get("sorry_delta", None)
             _sc = entry.get("sorry_count", "?")
             _sc_before = (int(_sc) - int(_delta)) if (_delta is not None and _sc != "?") else "?"
-            _no_change_tag = ""
-            if _eb and _ea and _eb[:120] == _ea[:120] and _delta == 0:
-                _no_change_tag = "  ← NO CHANGE"
+            _outcome = entry.get("outcome", "?")
+            # Outcome tag
+            if _outcome == "success":
+                _outcome_tag = "[SUCCESS]"
+            elif _outcome == "replan_done":
+                _outcome_tag = "[REPLAN]"
+            elif _eb and _ea and _eb[:120] == _ea[:120] and _delta == 0:
+                _outcome_tag = "[NO-CHANGE]"
+            elif _delta is not None and _delta < 0:
+                _outcome_tag = "[PROGRESS]"
+            else:
+                _outcome_tag = "[FAIL]"
             history_lines.append(
-                f"  tick {entry['tick']}: action={entry['action']}, "
+                f"  tick {entry['tick']} {_outcome_tag}: action={entry['action']}, "
                 f"target={entry.get('target_theorem', '?')}, "
-                f"result={entry.get('outcome', '?')}, "
                 f"sorry={_sc_before}→{_sc} (delta {_delta if _delta is not None else '?'})"
             )
             if _eb:
                 history_lines.append(f"    before: \"{_eb[:120]}\"")
-            if _ea:
-                history_lines.append(f"    after : \"{_ea[:120]}\"{_no_change_tag}")
+            if _ea and _ea != _eb:
+                history_lines.append(f"    after : \"{_ea[:120]}\"")
+        if _last_success_tick is not None:
+            history_lines.insert(
+                0,
+                f"  NOTE: Last [SUCCESS] was at tick {_last_success_tick} — "
+                "do NOT undo work that built on it."
+            )
         history_block = "\n".join(history_lines)
     else:
         history_block = "  (no previous decisions)"
@@ -178,6 +197,16 @@ def _build_agent8_tick_context(
     _plan_chars = RETRY_LIMITS.get("AGENT8_PLAN_CHARS", 3000)
     _a9_chars = RETRY_LIMITS.get("AGENT9_PLAN_CHARS", 3000)
 
+    # Banner shown for one tick immediately after Agent9 re-planning.
+    _new_plan_banner = ""
+    if plan_updated_tick > 0:
+        _new_plan_banner = (
+            f"## [NEW PLAN FROM AGENT9 — updated at tick {plan_updated_tick}]\n"
+            "The proof strategy was just revised by Agent9. "
+            "Re-evaluate ALL open sorrys against the new plan before choosing an action. "
+            "Do NOT repeat the action that triggered the replan.\n\n"
+        )
+
     # Agent9 structured plan block (omitted when no plan is available).
     _a9_block = ""
     if agent9_plan:
@@ -192,12 +221,13 @@ def _build_agent8_tick_context(
         )
 
     return (
+        f"{_new_plan_banner}"
         "## Current Algorithm File (smart-truncated around error lines)\n"
         f"File: {target_file}\n"
         f"```lean\n{algo_display}\n```\n\n"
         f"## Build Errors\n```\n{errors_text[:_err_chars]}\n```\n\n"
         f"## Staging File ({staging_rel})\n```lean\n{staging_content[:_staging_chars]}\n```\n\n"
-        f"## Agent2 Proof Plan (current)\n{agent2_plan[:_plan_chars]}\n\n"
+        f"## Proof Plan (current)\n{agent2_plan[:_plan_chars]}\n\n"
         f"## Library Files Available\n{lib_desc}\n\n"
         f"{_a9_block}"
         f"## Decision History (recent)\n{history_block}\n\n"
@@ -238,6 +268,34 @@ def _parse_agent8_decision(raw_reply: str) -> dict | None:
     except json.JSONDecodeError:
         pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# Agent9 theorem-strategy context builder
+# ---------------------------------------------------------------------------
+
+def _build_agent9_theorem_context(
+    agent9_plan: dict | None,
+    target_theorem: str,
+) -> str:
+    """Return a formatted strategy block for *target_theorem* from the Agent9 plan.
+
+    Used to enrich Agent3's dispatch prompt so it has theorem-specific guidance
+    (proof strategy, key lemmas, dependencies) from Agent9's structured plan.
+    Returns empty string when the plan is absent or the theorem is not found.
+    """
+    if not agent9_plan or not target_theorem:
+        return ""
+    for thm in agent9_plan.get("theorems", []):
+        if thm.get("name") == target_theorem:
+            return (
+                f"\n\n## Agent9 Strategy for `{target_theorem}`\n"
+                f"- proof_strategy: {thm.get('proof_strategy', 'N/A')}\n"
+                f"- key_lib_lemmas: {thm.get('key_lib_lemmas', [])}\n"
+                f"- depends_on: {thm.get('depends_on', [])}\n"
+                f"- difficulty: {thm.get('difficulty', 'unknown')}\n"
+            )
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -699,6 +757,10 @@ def run_agent8_loop(
 
     # (legacy per-tick counters kept for the _consecutive_same_error hard-trigger below)
 
+    # Tracks the tick at which the Agent9 plan was most recently updated, so
+    # _build_agent8_tick_context can prepend a "NEW PLAN" banner on the following tick.
+    _plan_updated_tick: int = 0
+
     for tick in range(1, max_steps + 1):
         console.print(f"\n[magenta]--- Agent8 Tick {tick}/{max_steps} ---")
 
@@ -706,6 +768,7 @@ def run_agent8_loop(
         ctx = _build_agent8_tick_context(
             target_file, current_errors, current_plan, decision_history, staging_rel,
             agent9_plan=agent9_plan,
+            plan_updated_tick=_plan_updated_tick,
         )
 
         # 2. Call Agent8 with optional investigation rounds
@@ -823,11 +886,14 @@ def run_agent8_loop(
         try:
             if action == "agent3_tactical":
                 console.print("  [Agent8→Agent3] Dispatching tactical fix...")
+                _a9_thm_ctx = _build_agent9_theorem_context(
+                    agent9_plan, decision.get("target_theorem", "")
+                )
                 result = _agent8_run_agent3(
                     target_file,
                     staging_rel,
                     current_plan,
-                    targeted_prompt,
+                    targeted_prompt + _a9_thm_ctx,
                     decision.get("allowed_edit_lines"),
                 )
                 outcome = {
@@ -885,23 +951,42 @@ def run_agent8_loop(
                 current_errors = result.get("errors", current_errors)
 
             elif action == "agent2_replan":
-                console.print("  [Agent8→Agent2] Dispatching strategy revision...")
-                current_plan = _agent8_run_agent2_replan(
-                    agent2, target_file, current_errors, current_plan
+                console.print("  [Agent8→Agent9] Dispatching strategy re-planning via Agent9...")
+                from orchestrator.phase3a_agent9 import run_agent9_replan as _run_a9_replan
+                _new_plan = _run_a9_replan(
+                    target_file,
+                    current_errors,
+                    agent9_plan or {},
+                    algo_name,
+                    current_plan,
                 )
-                # After replan, run Agent3 to apply the new strategy
-                result = _agent8_run_agent3(
-                    target_file, staging_rel, current_plan,
-                    "Apply the revised proof strategy from Agent2. "
-                    "Focus on the errors identified in the replan.",
-                    None,
-                )
+                if _new_plan:
+                    agent9_plan = _new_plan
+                    current_plan = json.dumps(_new_plan, indent=2, ensure_ascii=False)
+                    _plan_updated_tick = tick
+                    console.print(
+                        "  [Agent8→Agent9] Re-plan succeeded. "
+                        "Agent8 retains control for next tick."
+                    )
+                else:
+                    console.print(
+                        "  [Agent8→Agent9] Re-plan failed — falling back to Agent2."
+                    )
+                    current_plan = _agent8_run_agent2_replan(
+                        agent2, target_file, current_errors, current_plan
+                    )
+                # Run a fresh verify to capture current state.
+                # No Agent3 dispatch — Agent8 decides the next action on the next tick.
+                from orchestrator.tools import run_lean_verify as _rlv
+                _replan_verify = _rlv(target_file)
                 outcome = {
-                    "outcome": "success" if result["exit_code"] == 0 and result["sorry_count"] == 0 else "failed",
-                    "exit_code": result["exit_code"],
-                    "sorry_count": result["sorry_count"],
+                    "outcome": "replan_done",
+                    "exit_code": int(_replan_verify.get("exit_code", 1)),
+                    "sorry_count": int(
+                        _replan_verify.get("sorry_count", _current_sorry_count)
+                    ),
                 }
-                current_errors = result.get("errors", current_errors)
+                current_errors = str(_replan_verify.get("errors", current_errors))
 
             elif action == "human_missing_assumption":
                 console.print(

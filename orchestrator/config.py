@@ -62,6 +62,7 @@ AGENT_CONFIGS: dict[str, dict] = {
     "glue_filler":   {"provider": "qwen",     "model": "qwen3.5-plus", "max_tokens": 32768, "use_manifest": True},
     "interface_auditor": {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768},
     "decision_hub":      {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768},
+    "scaffold_verifier": {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768, "use_manifest": False},
 }
 
 # ---------------------------------------------------------------------------
@@ -313,7 +314,7 @@ RETRY_LIMITS: dict[str, int] = {
     # a distilled plan summary (math plan + best checkpoint + failed approaches blacklist).
     "AGENT2_CONTEXT_EVICT_EVERY_N": 4,
     # Agent8 Decision Hub: maximum decision ticks before escalating to Agent5.
-    "AGENT8_MAX_STEPS": 8,
+    "AGENT8_MAX_STEPS": 15,
     # Agent8: maximum Agent3 tool turns per dispatch (simplified loop).
     "AGENT8_AGENT3_MAX_TURNS": 15,
     # Agent8 investigation phase: max read-only lookup rounds before final decision.
@@ -347,6 +348,10 @@ RETRY_LIMITS: dict[str, int] = {
     "AGENT9_PLAN_CHARS": 3000,
     # Agent9: how many chars of Agent2's guidance to feed into Agent9's prompt.
     "AGENT9_GUIDANCE_CHARS": 4000,
+    # Agent10 (scaffold_verifier): max parse retries for the JSON verdict response.
+    "AGENT10_MAX_PARSE_RETRIES": 3,
+    # Agent10: how many chars of the approved plan to include in the verification prompt.
+    "AGENT10_GUIDANCE_CHARS": 4000,
     # Agent8 anti-loop: consecutive zero-delta ticks with same action before escalating.
     "AGENT8_NO_PROGRESS_ESCALATE_AFTER": 2,
     # Agent8 anti-loop: length of error-signature string used for loop detection.
