@@ -102,6 +102,34 @@ class ToolRegistry:
         else:
             self.register("write_staging_lemma", write_staging_lemma)
 
+    def register_scaffold_tools(self, target_algo: str = "") -> None:
+        """Full write access for Agent2 Phase 3a scaffold writing.
+
+        Includes write_new_file, edit_file_patch, run_lean_verify, write_staging_lemma,
+        plus all read-only tools.  Agent2 uses this to create the complete Lean file
+        (all theorem statements + sorry placeholders) and verify it compiles.
+        """
+        import functools
+
+        from orchestrator.tools import (
+            edit_file_patch,
+            run_lean_verify,
+            write_new_file,
+            write_staging_lemma,
+        )
+
+        self.register_readonly_tools()
+        self.register("write_new_file", write_new_file)
+        self.register("edit_file_patch", edit_file_patch)
+        self.register("run_lean_verify", run_lean_verify)
+        if target_algo:
+            self.register(
+                "write_staging_lemma",
+                functools.partial(write_staging_lemma, target_algo=target_algo),
+            )
+        else:
+            self.register("write_staging_lemma", write_staging_lemma)
+
     def call(self, name: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke a registered tool by name."""
         if name not in self._tools:

@@ -60,6 +60,7 @@ AGENT_CONFIGS: dict[str, dict] = {
     "diagnostician": {"provider": "qwen",     "model": "qwen3.5-plus",  "max_tokens": 16384},
     "glue_filler":   {"provider": "qwen",     "model": "qwen3.5-plus", "max_tokens": 32768, "use_manifest": True},
     "interface_auditor": {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768},
+    "decision_hub":      {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768},
 }
 
 # ---------------------------------------------------------------------------
@@ -285,7 +286,7 @@ AGENT7_ROUTING_CRITERIA: list[str] = [
 
 RETRY_LIMITS: dict[str, int] = {
     "MAX_PHASE2_APPROVAL_ROUNDS": 10,
-    "MAX_PHASE3_RETRIES": 5,
+    "MAX_PHASE3_RETRIES": 2,
     "MAX_AGENT6_TOOL_TURNS": 70,
     "MAX_AGENT6_RETRIES": 3,
     # Agent3 autonomy: Agent6 is a first-class tool, allow up to 3 calls per sorry
@@ -304,6 +305,16 @@ RETRY_LIMITS: dict[str, int] = {
     "DEFINITION_ZONE_FORCE_AGENT7_AFTER_N": 2,
     # Per-sorry turn budget (used by per-sorry loop)
     "PER_SORRY_TURNS": 20,
+    # Context eviction: clear Agent3 conversation history every N attempts to prevent
+    # context pollution from accumulated failed attempts.
+    "AGENT3_CONTEXT_EVICT_EVERY_N": 3,
+    # Context eviction: clear Agent2 conversation history every N attempts and reinject
+    # a distilled plan summary (math plan + best checkpoint + failed approaches blacklist).
+    "AGENT2_CONTEXT_EVICT_EVERY_N": 4,
+    # Agent8 Decision Hub: maximum decision ticks before escalating to Agent5.
+    "AGENT8_MAX_STEPS": 8,
+    # Agent8: maximum Agent3 tool turns per dispatch (simplified loop).
+    "AGENT8_AGENT3_MAX_TURNS": 15,
 }
 
 TIMEOUTS: dict[str, int] = {
@@ -327,6 +338,21 @@ ROUTING_PARAMS: dict[str, int | float] = {
     # Agent7 invocations per attempt.
     "AGENT7_PREEMPTIVE_MAX_PER_ATTEMPT": 1,
 }
+
+# ---------------------------------------------------------------------------
+# Agent8 Decision Hub parameters
+# ---------------------------------------------------------------------------
+
+# Number of lines above/below each error line to include in the truncated
+# file context sent to Agent8.  Agent8 can request more via read-only tools.
+AGENT8_FILE_WINDOW_RADIUS: int = int(os.getenv("AGENT8_FILE_WINDOW_RADIUS", "60"))
+
+# When True, Agent8 writes detailed per-tick debug logs to the audit directory.
+AGENT8_DEBUG: bool = os.getenv("AGENT8_DEBUG", "0") != "0"
+
+# Hard trigger: if the same error_signature appears >= this many consecutive
+# ticks with different actions, force human_missing_assumption.
+AGENT8_HUMAN_GATE_CONSECUTIVE_THRESHOLD: int = 3
 
 # Backward-compatible aliases (to be removed after full migration).
 MAX_APPROVAL_ROUNDS = RETRY_LIMITS["MAX_PHASE2_APPROVAL_ROUNDS"]

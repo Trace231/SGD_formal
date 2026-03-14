@@ -123,6 +123,7 @@ from orchestrator.git_utils import (
     _remove_algorithm_from_lakefile,
 )
 from orchestrator.agent_callers import (
+    _call_agent2_scaffold,
     _call_agent2_with_tools,
     _call_agent7_with_tools,
     _run_agent6_glue_loop,
@@ -318,6 +319,7 @@ def phase3_prove(
     registry = ToolRegistry()
     registry.register_default_tools()
     _algo_name_for_staging = Path(target_file).stem  # e.g. "SVRGOuterLoop"
+    _algo_name = _algo_name_for_staging  # alias used in Phase 3a scaffold block
     registry.register(
         "write_staging_lemma",
         functools.partial(write_staging_lemma, target_algo=_algo_name_for_staging),
@@ -387,7 +389,7 @@ def phase3_prove(
     # --- Glue Staging setup (Fix B1) ---
     # Architecture: algorithm vs staging separation
     # - Algorithm file: target_file (e.g. Algorithms/<Algo>.lean) — main definitions, theorems.
-    #   Created by Agent3 write_new_file or pre-existing. Always lives in Algorithms/.
+    #   Created by Agent2 Phase 3a scaffold or pre-existing. Always lives in Algorithms/.
     # - Staging file: Lib/Glue/Staging/<Algo>.lean — glue/bridge lemmas only, added by
     #   Agent3/Agent6 via write_staging_lemma. Algorithm imports staging; never the reverse.
     # - run_lean_verify(target_file) builds the algorithm module (lake build Algorithms.<Algo>),
@@ -431,6 +433,11 @@ def phase3_prove(
         )
         console.print(f"  [Staging] Created {_staging_rel}")
 
+    # Remove write_new_file from Agent3's registry: Phase 3a scaffold guarantees the
+    # target file exists before Agent3 starts. Agent3 should only use edit_file_patch.
+    # Pop after staging creation so the orchestrator can create Lib/Glue/Staging/*.lean.
+    registry._tools.pop("write_new_file", None)
+
     # Inject staging import into algorithm file if not already present.
     if snapshot_file(target_file):
         _tgt_content = load_file(target_file)
@@ -463,15 +470,6 @@ def phase3_prove(
     }
 
     initial_exists: bool = _target_exists_overlay()
-    _file_absent_suffix = (
-        "\n\nCRITICAL: The target file does NOT exist yet. Your guidance MUST instruct "
-        f'Agent3 to call write_new_file(path="{target_file}", content=<full Lean scaffold>) '
-        "as the FIRST tool call. Output the complete file content in a code block for "
-        "Agent3 to pass to write_new_file. Do NOT suggest edit_file_patch — the file "
-        "must be created first."
-        if not initial_exists
-        else ""
-    )
     # Pre-compute imported API signatures once; reused for every Agent2 + Agent3 call.
     _imported_sigs = _extract_imported_algo_sigs(target_file)
     _imported_sigs_block = (
@@ -490,7 +488,6 @@ def phase3_prove(
         "guidance MUST instruct Agent3 to complete BOTH in a single attempt, "
         "or verification will fail."
         + _archetype_b_warning
-        + _file_absent_suffix
         + _imported_sigs_block,
     )
     console.print(Panel(
@@ -516,6 +513,9 @@ def phase3_prove(
     agent7_force_gate_rejections: list[dict] = []
     agent7_force_gate_reason_samples: list[str] = []
     token_char_budget = 0
+    # Carry-over Agent7 plan from round-replan routing: set at end of attempt N,
+    # consumed at the start of attempt N+1's per-sorry loop initialisation.
+    _pending_agent7_plan: dict | None = None
 
     # Circuit breaker: track consecutive repeat error signatures.
     # Key: normalized (file, line, message) hash of the primary error.
@@ -560,22 +560,103 @@ def phase3_prove(
         "staging_content": _staging_read_overlay(default="") or None,
     }
 
+    # ------------------------------------------------------------------
+    # Phase 3a — Scaffold: Agent2 writes ALL theorem statements + sorry
+    # placeholders, and verifies exit_code=0 before Agent3 begins.
+    # Only runs when the target file does not yet exist.
+    # ------------------------------------------------------------------
+    if not _target_exists_overlay():
+        _scaffold_registry = ToolRegistry()
+        _scaffold_registry.register_scaffold_tools(target_algo=_algo_name)
+        _algo_name_for_staging = _algo_name
+        _scaffold_ok = _call_agent2_scaffold(
+            agent2,
+            _scaffold_registry,
+            target_file,
+            guidance,  # Agent2's approved plan from Phase 2
+            staging_rel=_staging_rel,
+            algo_name=_algo_name_for_staging,
+        )
+        if not _scaffold_ok:
+            console.print(
+                "[red bold][Phase 3a] Scaffold failed — Agent2 could not produce "
+                "a compiling scaffold. Aborting Phase 3."
+            )
+            return False, 0, "Phase 3a scaffold failed", {
+                "attempts": 0,
+                "execution_history": [],
+                "attempt_failures": [],
+                "agent3_turns": [],
+                "agent7_invocations": [],
+                "agent7_step_execution_log": [],
+                "agent7_plan_revisions": [],
+                "agent7_blocked_actions": [],
+                "agent7_forced_trigger_count": 0,
+                "agent7_force_gate_entries": [],
+                "agent7_force_gate_rejections": [],
+                "agent7_force_gate_reason_samples": [],
+            }
+        # Refresh checkpoint with fresh scaffold content
+        _initial_sorry_for_ckpt = int(
+            registry.call("run_lean_verify", target_file).get("sorry_count", 999)
+        )
+        best_checkpoint["sorry_count"] = _initial_sorry_for_ckpt
+        best_checkpoint["content"] = load_file(target_file)
+        best_checkpoint["staging_content"] = _staging_read_overlay(default="") or None
+        initial_hash = _file_hash(target_file)
+        initial_exists = True
+
     for attempt in range(1, max_retries + 1):
         attempts = attempt
         attempt_start_hash: str | None = _file_hash(target_file)
+
+        # ------------------------------------------------------------------
+        # Context eviction: periodically clear Agent3 / Agent2 conversation
+        # history to prevent cumulative context pollution from failed attempts.
+        # Clearing self.messages causes the next agent.call() to re-prepend
+        # _file_context automatically (see Agent.call first-turn logic).
+        # ------------------------------------------------------------------
+        if attempt > 1:
+            _a3_evict_n = RETRY_LIMITS.get("AGENT3_CONTEXT_EVICT_EVERY_N", 3)
+            if (attempt - 1) % _a3_evict_n == 0:
+                agent3.messages.clear()
+                console.print(
+                    f"  [ContextEvict] a{attempt} — Agent3 context cleared "
+                    f"(every {_a3_evict_n} attempts)"
+                )
+
+            _a2_evict_n = RETRY_LIMITS.get("AGENT2_CONTEXT_EVICT_EVERY_N", 4)
+            if (attempt - 1) % _a2_evict_n == 0 and agent2.messages:
+                agent2.messages.clear()
+                # Re-inject distilled context: math plan + best checkpoint + failed approaches
+                # blacklist. This replaces the full accumulated conversation with a clean
+                # summary so Agent2 retains mathematical knowledge without failure noise.
+                _distilled_failures = "\n".join(
+                    f"  a{f['attempt']} L{f.get('line', '?')}: {str(f.get('message', ''))[:80]}"
+                    for f in attempt_failures[-8:]
+                ) or "  (none recorded)"
+                _distilled_ctx = (
+                    f"[CONTEXT REFRESH — Attempt {attempt}]\n"
+                    "Your conversation history has been cleared to remove context pollution "
+                    "from failed attempts. Below is a distilled summary.\n\n"
+                    f"## Current proof plan (preserve math structure, update tactics only)\n"
+                    f"{guidance[:2000]}\n\n"
+                    f"## Best checkpoint (sorry={best_checkpoint['sorry_count']})\n"
+                    f"```lean\n{(best_checkpoint['content'] or '')[:3000]}\n```\n\n"
+                    f"## Failed approaches — do NOT repeat these\n{_distilled_failures}\n\n"
+                    "Provide updated proof strategy for the next attempt."
+                )
+                guidance, _ = _call_agent2_with_tools(agent2, staging_registry, _distilled_ctx)
+                console.print(
+                    f"  [ContextEvict] a{attempt} — Agent2 context refreshed "
+                    f"(every {_a2_evict_n} attempts, distilled)"
+                )
+
         # Keep previous verify context available before prequery (attempt>1 path).
         # These are re-initialized later for per-attempt tracking, but must exist
         # before first use in _prequery_sorry_goals.
         last_exit_code = 1
         last_verify_text = ""
-        _file_absent_prefix = (
-            "CRITICAL: Target file does NOT exist. You MUST call write_new_file(path="
-            f'"{target_file}", content=<complete Lean code>) as your FIRST tool call. '
-            "The guidance below contains the full file content — pass it to write_new_file. "
-            "Only after the file exists do you call run_lean_verify.\n\n"
-            if not _target_exists_overlay()
-            else ""
-        )
         # Fix 3: when checkpoint has already improved, forbid overwriting the target file.
         _no_overwrite_rule = (
             f"- FORBIDDEN: write_new_file({target_file}) — the file already exists "
@@ -657,7 +738,6 @@ def phase3_prove(
         _base_prover_prompt = (
             _attempt_awareness
             + _sorry_structural_block
-            + _file_absent_prefix
             + "Use tools to close sorry placeholders.\n"
             "Return ONLY valid JSON with exactly three keys: thought, tool, arguments.\n"
             "Output ONE action per response. After each action you will receive its "
@@ -665,8 +745,10 @@ def phase3_prove(
             'Example: {"thought": "...", "tool": "read_file", "arguments": {"path": "..."}}\n'
             "To signal no further actions are needed: "
             '{"thought": "...", "tool": "done", "arguments": {}}\n'
+            "write_new_file is NOT available — the scaffold file already exists. "
+            "Use ONLY edit_file_patch to modify the target file.\n"
             "Allowed tools: read_file, read_file_readonly, search_in_file, search_in_file_readonly, "
-            "search_codebase, edit_file_patch, write_new_file, write_staging_lemma, get_lean_goal, "
+            "search_codebase, edit_file_patch, write_staging_lemma, get_lean_goal, "
             "check_lean_have, run_lean_verify, request_agent6_glue, request_agent2_help, "
             "request_agent7_interface_audit.\n"
             "SITUATIONAL BEHAVIOR:\n"
@@ -839,7 +921,10 @@ def phase3_prove(
             # Agent2 router budget — reset each attempt.
             _routing_budget: dict[str, int] = {"self_revisions": 0, "preemptive_agent7": 0}
             _route_repeat_tracker: dict[str, int] = {}
-            _active_agent7_plan: dict | None = None
+            # Carry over any Agent7 plan pre-computed during the previous attempt's
+            # round-replan routing (stored in _pending_agent7_plan); clear the carrier.
+            _active_agent7_plan: dict | None = _pending_agent7_plan
+            _pending_agent7_plan = None
             _agent7_current_step_idx = 0
             _agent7_pending_verify = False
             _direct_applied_patches: list[dict] = []
@@ -883,6 +968,9 @@ def phase3_prove(
 
             # Per-sorry turn counter (used in PerSorrySkip summary).
             _turns_this_sorry: int = 0
+            # JSON retry counter — retry up to 2 times before breaking attempt
+            _json_retry_count: int = 0
+            _MAX_JSON_RETRIES: int = 2
 
             # -------------------------------------------------------------------
             # Single-step interactive tool loop (per sorry)
@@ -900,6 +988,17 @@ def phase3_prove(
                         "Return valid JSON with keys: thought, tool, arguments."
                     )
                     diag_log.append(f"attempt={attempt} turn={tool_turn} {err_msg}")
+                    if _json_retry_count < _MAX_JSON_RETRIES:
+                        _json_retry_count += 1
+                        raw_reply = agent3.call(
+                            f"{err_msg}\n\n"
+                            "Your response must be a single JSON object — no markdown fences, "
+                            "no extra text. Example format:\n"
+                            '{"thought": "...", "tool": "edit_file_patch", "arguments": {...}}'
+                        )
+                        _turns_this_sorry += 1
+                        _total_turns_this_attempt += 1
+                        continue
                     exec_results.append(ExecutionResult(
                         status_code="ERROR", message=err_msg, attempt=attempt,
                     ))
@@ -908,9 +1007,21 @@ def phase3_prove(
                     _break_attempt = True
                     break
 
+                _json_retry_count = 0  # reset on successful parse
+
                 if not isinstance(payload, dict):
                     err_msg = "Agent3 JSON must be an object with keys: thought, tool, arguments."
                     diag_log.append(f"attempt={attempt} turn={tool_turn} {err_msg}")
+                    if _json_retry_count < _MAX_JSON_RETRIES:
+                        _json_retry_count += 1
+                        raw_reply = agent3.call(
+                            f"{err_msg}\n\n"
+                            "Return ONLY a JSON object: "
+                            '{"thought": "...", "tool": "...", "arguments": {...}}'
+                        )
+                        _turns_this_sorry += 1
+                        _total_turns_this_attempt += 1
+                        continue
                     exec_results.append(ExecutionResult(
                         status_code="ERROR", message=err_msg, attempt=attempt,
                     ))
@@ -2040,29 +2151,56 @@ def phase3_prove(
                                 "instead of full wipe"
                             )
                         else:
+                            # No checkpoint — delete the broken file and re-scaffold.
                             if _tgt.exists():
                                 _tgt.unlink()
                             initial_exists = False
                             initial_hash = None
                             file_changed = False
-                        guidance, _ = _call_agent2_with_tools(
-                            agent2,
-                            staging_registry,
-                            f"[STATEMENT ERROR — SIGNATURE HALLUCINATION]\n"
-                            f"Lean error excerpt:\n```\n"
-                            f"{_prioritize_error_text(_structured_errors_inner, last_verify_text, _inner_err_line, target_file, max_chars=800)}"
-                            f"\n```\n\n"
-                            "The theorem STATEMENT itself is broken: it references a symbol "
-                            "that does not exist in Lean or Lib/.\n"
-                            "The old file has been DELETED. You MUST now rewrite it from scratch.\n\n"
-                            "CONSTRAINT (non-negotiable — Principle A):\n"
-                            "Use ONLY mathematical primitives in the new theorem signature.\n"
-                            "Do NOT invent any new abstract type, set constructor, or class name —\n"
-                            "including any name resembling the one that just failed.\n"
-                            "Express every property as a direct inequality, ∀/∃ quantifier,\n"
-                            "or inner-product expression (e.g. ∀ y, f y ≥ f x + ⟪g, y-x⟫_ℝ).\n\n"
-                            "Output a complete corrected file. Agent3 will use write_new_file.",
-                        )
+                            # Re-run Phase 3a scaffold so Agent3 has a clean compilable base.
+                            _halluc_scaffold_registry = ToolRegistry()
+                            _halluc_scaffold_registry.register_scaffold_tools(
+                                target_algo=_algo_name_for_staging
+                            )
+                            _halluc_err_ctx = (
+                                f"[STATEMENT ERROR — SIGNATURE HALLUCINATION]\n"
+                                f"Lean error excerpt:\n```\n"
+                                f"{_prioritize_error_text(_structured_errors_inner, last_verify_text, _inner_err_line, target_file, max_chars=800)}"
+                                f"\n```\n\n"
+                                "The theorem STATEMENT itself is broken: it references a symbol "
+                                "that does not exist in Lean or Lib/.\n"
+                                "CONSTRAINT (non-negotiable — Principle A):\n"
+                                "Use ONLY mathematical primitives in the new theorem signature.\n"
+                                "Do NOT invent any new abstract type, set constructor, or class name —\n"
+                                "including any name resembling the one that just failed.\n"
+                                "Express every property as a direct inequality, ∀/∃ quantifier,\n"
+                                "or inner-product expression (e.g. ∀ y, f y ≥ f x + ⟪g, y-x⟫_ℝ).\n\n"
+                                "Rewrite the scaffold from scratch with all statements fixed.\n"
+                            )
+                            guidance, _ = _call_agent2_with_tools(
+                                agent2,
+                                staging_registry,
+                                _halluc_err_ctx + "Provide updated strategy for the re-scaffold.",
+                            )
+                            _scaffold_ok_h = _call_agent2_scaffold(
+                                agent2,
+                                _halluc_scaffold_registry,
+                                target_file,
+                                guidance,
+                                staging_rel=_staging_rel,
+                                algo_name=_algo_name_for_staging,
+                            )
+                            if _scaffold_ok_h:
+                                initial_exists = True
+                                initial_hash = _file_hash(target_file)
+                                best_checkpoint["content"] = load_file(target_file)
+                                best_checkpoint["sorry_count"] = int(
+                                    registry.call("run_lean_verify", target_file).get("sorry_count", 999)
+                                )
+                            else:
+                                console.print(
+                                    "[red][SIGNATURE_HALLUCINATION] Re-scaffold also failed — continuing."
+                                )
                         _inner_break_reason = "hallucination"
                         _break_attempt = True
                         break  # start next attempt with fresh guidance
@@ -2403,25 +2541,75 @@ def phase3_prove(
             and attempt < max_retries
             and _inner_break_reason not in ("dep_compile_error", "hallucination", "json_error")
         ):
+            # Build a full error history summary (last 8 failures) so Agent2 sees the
+            # complete picture of what has been tried, not just the last verify output.
+            _replan_failure_summary = "\n".join(
+                f"  a{f['attempt']} L{f.get('line', '?')}: {str(f.get('message', ''))[:100]}"
+                for f in attempt_failures[-8:]
+            ) or "  (none recorded)"
             _round_replan_prompt = (
                 f"[ROUND REPLAN — Per-Sorry Pass {attempt} Complete]\n"
                 f"Closed: {[ln for ln, s in _sorry_status.items() if s == 'closed']}\n"
                 f"Skipped (unresolved): {_skipped_sorry_lines}\n\n"
-                f"Last errors:\n```\n{last_verify_text[:1200]}\n```\n\n"
+                f"## Full error history (last 8 failures)\n{_replan_failure_summary}\n\n"
+                f"## Latest verify errors\n```\n{last_verify_text[:1200]}\n```\n\n"
                 f"=== CURRENT FILE ({target_file}) ===\n"
                 f"```lean\n"
                 + (load_file(target_file)[:8000] if _target_exists_overlay() else "(no file)")
                 + "\n```\n\n"
                 "Provide updated proof strategy for the unresolved sorry lines. "
                 "Apply your Sorry-Fill Proof Path Protocol. "
-                "If a Level-2 missing glue lemma is needed, write it to staging NOW."
+                "If a Level-2 missing glue lemma is needed, write it to staging NOW.\n\n"
+                "## ROUTING DECISION REQUIRED\n"
+                "End your response with a ROUTE_DECISION JSON block indicating which agent "
+                "should handle the next attempt:\n"
+                "  ROUTE_DECISION: {\"route_to\": \"agent3\"|\"agent7\"|\"agent7_then_agent6\"|\"self\", "
+                "\"confidence\": 0.0-1.0, \"reason\": \"...\", \"agent7_hint\": \"...\"}\n"
+                "Choose agent7 when the error is an API/signature/typeclass mismatch. "
+                "Choose agent7_then_agent6 when a new glue lemma is also needed. "
+                "Choose self when the proof strategy needs fundamental revision. "
+                "Choose agent3 for tactical tactic fixes.\n"
             )
             console.print(
                 f"  [RoundReplan] attempt {attempt} — "
                 f"{len(_skipped_sorry_lines)} unresolved: "
                 + ", ".join(f"line {ln}" for ln in _skipped_sorry_lines)
             )
-            guidance, _ = _call_agent2_with_tools(agent2, staging_registry, _round_replan_prompt)
+            guidance, _a2_route_replan = _call_agent2_with_tools(
+                agent2, staging_registry, _round_replan_prompt
+            )
+
+            # Execute Agent2's routing decision for the NEXT attempt.
+            _final_route_replan = _apply_agent2_route(
+                _a2_route_replan, _routing_budget, _err_sig, _route_repeat_tracker
+            )
+            if _final_route_replan in ("agent7", "agent7_then_agent6"):
+                _routing_budget["preemptive_agent7"] = _routing_budget.get("preemptive_agent7", 0) + 1
+                _a7_hint_replan = (_a2_route_replan or {}).get("agent7_hint", "")
+                _a7_prompt_replan = _build_preemptive_agent7_prompt(
+                    _a7_hint_replan, target_file, last_verify_text, agent7_registry
+                )
+                agent7.messages.clear()
+                _a7_plan_replan, _ = _call_agent7_with_tools(agent7, agent7_registry, _a7_prompt_replan)
+                if _a7_plan_replan:
+                    _pending_agent7_plan = _a7_plan_replan
+                    console.print(
+                        f"  [A2Router→Agent7] Replan preemptive Agent7 triggered "
+                        f"(confidence={(_a2_route_replan or {}).get('confidence', '?')})"
+                    )
+                if _final_route_replan == "agent7_then_agent6":
+                    _ft_replan = (_a7_plan_replan or {}).get("fallback_trigger", {}) if _a7_plan_replan else {}
+                    if str(_ft_replan.get("route_to", "")).lower() == "agent6":
+                        console.print("  [A2Router→Agent7→Agent6] agent6_approved for next attempt")
+            elif _final_route_replan == "self":
+                _routing_budget["self_revisions"] = _routing_budget.get("self_revisions", 0) + 1
+                _self_msg_replan = (
+                    "[SELF_REVISION] Your current proof strategy has low confidence. "
+                    "Revise the overall proof approach fundamentally. Do NOT reuse the same tactics.\n\n"
+                    + guidance
+                )
+                guidance, _ = _call_agent2_with_tools(agent2, staging_registry, _self_msg_replan)
+                console.print("  [A2Router→Self] Agent2 self-revision triggered (replan)")
 
         # ---------------------------------------------------------------
         # Attempt summary panel (normal: one compact line; debug: Panel)
@@ -2492,24 +2680,6 @@ def phase3_prove(
         current_hash_end = _file_hash(target_file)
         attempt_file_changed = _target_exists_overlay() and (current_hash_end != attempt_start_hash)
 
-        # File-not-created check
-        if not _target_exists_overlay():
-            guidance, _ = _call_agent2_with_tools(
-                agent2,
-                staging_registry,
-                f"Attempt {attempt} failed: Target file still does not exist.\n"
-                f"Agent3 did NOT call write_new_file. You MUST output the FULL Lean file content "
-                f'and explicitly instruct Agent3 to call write_new_file(path="{target_file}", '
-                "content=<complete file>) as the FIRST tool call.\n"
-                f"Guidance format: Provide a code block with the complete {target_file} "
-                "scaffold (imports, setup, theorem stubs with sorry). Agent3 will pass it to write_new_file.",
-            )
-            console.print(
-                f"  [Agent3] attempt {attempt}/{max_retries} — "
-                "build=FAIL (file not created)"
-            )
-            continue
-
         # No-op trap: file unchanged regardless of build status.
         # NOTE: DEPENDENCY_COMPILE_ERROR is excluded — when staging is broken
         # Agent3 correctly leaves the target file untouched; falling through to
@@ -2548,6 +2718,7 @@ def phase3_prove(
                     _a7_prompt_noop = _build_preemptive_agent7_prompt(
                         _a7_hint_noop, target_file, last_verify_text, agent7_registry
                     )
+                    agent7.messages.clear()
                     _a7_plan_noop, _ = _call_agent7_with_tools(agent7, agent7_registry, _a7_prompt_noop)
                     if _a7_plan_noop:
                         _active_agent7_plan = _a7_plan_noop
@@ -2753,6 +2924,7 @@ def phase3_prove(
                 _a7_prompt_local = _build_preemptive_agent7_prompt(
                     _a7_hint_local, target_file, last_verify_text, agent7_registry
                 )
+                agent7.messages.clear()
                 _a7_plan_local, _ = _call_agent7_with_tools(agent7, agent7_registry, _a7_prompt_local)
                 if _a7_plan_local:
                     _active_agent7_plan = _a7_plan_local
@@ -2969,6 +3141,7 @@ def phase3_prove(
             _a7_prompt_gen = _build_preemptive_agent7_prompt(
                 _a7_hint_gen, target_file, last_verify_text, agent7_registry
             )
+            agent7.messages.clear()
             _a7_plan_gen, _ = _call_agent7_with_tools(agent7, agent7_registry, _a7_prompt_gen)
             if _a7_plan_gen:
                 _active_agent7_plan = _a7_plan_gen
@@ -3009,7 +3182,76 @@ def phase3_prove(
             registry.call("overwrite_file", path=_lp_rel, content=_loriginal)
             console.print(f"  [Layer0] Restored {_lp.name} (was modified by Agent3)")
 
-    console.print("[red bold]Max retries exhausted — escalating to Agent5.")
+    # ------------------------------------------------------------------
+    # Agent8 Decision Hub: last-resort error-recovery before Agent5.
+    # Each tick clears Agent8 context, builds minimal diagnostic info,
+    # and dispatches a single targeted action.  On success → Phase 3 done.
+    # On exhaustion → reset all agents and fall through to Agent5.
+    # ------------------------------------------------------------------
+    from orchestrator.phase3_agent8 import run_agent8_loop
+
+    console.print("[magenta bold]Max retries exhausted — entering Agent8 Decision Hub.")
+    _agent8_success, _agent8_plan, _agent8_errors = run_agent8_loop(
+        agent2,
+        target_file,
+        _staging_rel,
+        guidance,
+        last_errors,
+        best_checkpoint=best_checkpoint,
+    )
+    if _agent8_success:
+        # Restore Glue/Layer0 if Agent8 agents modified them
+        for _gp2, _goriginal2 in _glue_snapshot.items():
+            _gp2_rel = str(_gp2.relative_to(PROJECT_ROOT))
+            if snapshot_file(_gp2_rel) != _goriginal2:
+                registry.call("overwrite_file", path=_gp2_rel, content=_goriginal2)
+        for _lp2, _loriginal2 in _layer0_snapshot.items():
+            _lp2_rel = str(_lp2.relative_to(PROJECT_ROOT))
+            if snapshot_file(_lp2_rel) != _loriginal2:
+                registry.call("overwrite_file", path=_lp2_rel, content=_loriginal2)
+        # Verify with run_repo_verify for full-project clean build
+        _repo_result = registry.call("run_repo_verify")
+        if int(_repo_result.get("exit_code", 1)) == 0:
+            console.print("[green bold][Agent8] Decision Hub succeeded — Phase 3 complete.")
+            return True, attempts, "", {
+                "execution_history": [r.__dict__ for r in execution_history],
+                "attempt_failures": attempt_failures,
+                "agent7_invocations": agent7_invocations,
+                "agent7_step_execution_log": agent7_step_execution_log,
+                "agent7_plan_revisions": agent7_plan_revisions,
+                "agent7_blocked_actions": agent7_blocked_actions,
+                "agent7_forced_trigger_count": agent7_forced_trigger_count,
+                "agent7_force_gate_entries": agent7_force_gate_entries,
+                "agent7_force_gate_rejections": agent7_force_gate_rejections,
+                "agent7_force_gate_reason_samples": agent7_force_gate_reason_samples,
+                "estimated_token_consumption": max(1, token_char_budget // 4),
+                "retry_count": sum(
+                    1
+                    for r in execution_history
+                    if r.status_code in {"ERROR", "BLOCKED"}
+                ),
+            }
+        console.print(
+            "[yellow][Agent8] File-level verify passed but repo-verify failed. "
+            "Falling through to Agent5."
+        )
+    else:
+        # Update plan and errors from Agent8's attempts
+        if _agent8_plan:
+            guidance = _agent8_plan
+        if _agent8_errors:
+            last_errors = _agent8_errors
+
+    # Reset all agent memories before Agent5 to prevent context pollution
+    agent2.messages.clear()
+    agent3.messages.clear()
+    agent7.messages.clear()
+    agent6.messages.clear()
+    console.print(
+        "  [Agent8→Agent5] All agent memories cleared before Agent5 escalation."
+    )
+
+    console.print("[red bold]Agent8 exhausted — escalating to Agent5.")
     if diag_log:
         console.print(Panel(
             "\n".join(diag_log[-12:]),

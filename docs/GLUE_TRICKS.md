@@ -80,8 +80,6 @@ Example: "integral" + "inner" → `integral_inner` in `Mathlib.MeasureTheory.Int
 
 ## Section 3 — Standard Proof Patterns
 
-## Section 3 — Standard Proof Patterns
-
 No new patterns — GLUE_TRICKS.md unchanged.
 
 **Validation gate answer:** The SVRGOuterLoop.lean file contains only the `svrgOuterProcess` recursive definition and imports — no convergence theorems or bridge lemmas are proved. Therefore no new proof patterns emerged. All required patterns (Archetype B dual integrability from Section 4b, epoch telescoping from Section 4c snapshot freeze) are already documented.

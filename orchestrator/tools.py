@@ -1168,12 +1168,13 @@ def apply_doc_patch(path: str | Path, anchor: str, new_content: str) -> dict[str
             f"Anchor not found in {resolved.relative_to(PROJECT_ROOT)}: {anchor}"
         )
     if len(matches) > 1:
+        import warnings
         positions = [m.start() for m in matches]
-        raise ValueError(
-            f"Anchor matches {len(matches)} locations in "
-            f"{resolved.relative_to(PROJECT_ROOT)} "
-            f"(positions {positions}); anchor must be unique. "
-            "Refine the regex to target a single match."
+        warnings.warn(
+            f"[apply_doc_patch] Anchor matches {len(matches)} locations in "
+            f"{resolved.relative_to(PROJECT_ROOT)} (positions {positions}); "
+            "using first match. Refine anchor regex to suppress this warning.",
+            stacklevel=2,
         )
 
     insert_at = matches[0].end()
