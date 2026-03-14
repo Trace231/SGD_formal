@@ -56,6 +56,7 @@ AGENT_CONFIGS: dict[str, dict] = {
     "planner":       {"provider": "qwen",     "model": "qwen3.5-plus",  "max_tokens": 32768},
     #"sorry_closer":  {"provider": "deepseek", "model": "deepseek-reasoner", "temperature": 0.0,   "max_tokens": 8192, "use_manifest": True},
     "sorry_closer":  {"provider": "qwen",     "model": "qwen3.5-plus", "max_tokens": 32768, "use_manifest": True},
+    "strategy_planner": {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 16384},
     "persister":     {"provider": "qwen",     "model": "qwen3.5-plus", "max_tokens": 32768},
     "diagnostician": {"provider": "qwen",     "model": "qwen3.5-plus",  "max_tokens": 16384},
     "glue_filler":   {"provider": "qwen",     "model": "qwen3.5-plus", "max_tokens": 32768, "use_manifest": True},
@@ -315,6 +316,42 @@ RETRY_LIMITS: dict[str, int] = {
     "AGENT8_MAX_STEPS": 8,
     # Agent8: maximum Agent3 tool turns per dispatch (simplified loop).
     "AGENT8_AGENT3_MAX_TURNS": 15,
+    # Agent8 investigation phase: max read-only lookup rounds before final decision.
+    "AGENT8_INVESTIGATION_TURNS": 3,
+    # Agent8 context truncation constants (characters).
+    "AGENT8_ERROR_CHARS": 3000,
+    "AGENT8_PLAN_CHARS": 3000,
+    "AGENT8_STAGING_CHARS": 2000,
+    "AGENT8_HISTORY_WINDOW": 8,
+    "AGENT8_A7_PROMPT_CHARS": 1500,
+    "AGENT8_A2_PLAN_CHARS": 4000,
+    "AGENT8_A2_ERROR_CHARS": 2000,
+    "AGENT8_A2_FILE_CHARS": 6000,
+    # Agent5 (diagnostician) context limits.
+    "AGENT5_ERRORS_CHARS": 3000,
+    "AGENT5_PLAN_CHARS": 2000,
+    # Agent2 distilled summary max chars.
+    "AGENT2_DISTILLED_GUIDANCE_CHARS": 5000,
+    # Conservative routing: how many consecutive turns the same interface-like error
+    # signature (file:line:msg-prefix) may repeat inside LOCAL_PROOF_ERROR handling
+    # before the system forces escalation to DEFINITION_ZONE_ERROR / Agent7.
+    # Set to 2 so Agent3 gets one genuine self-fix attempt, then we escalate.
+    "CONSERVATIVE_INTERFACE_ERROR_REPEAT_THRESHOLD": 2,
+    # Conservative routing: when blocked_sorry_count > 0 AND the primary error
+    # belongs to the interface-like family, immediately treat as DEFINITION_ZONE_ERROR
+    # instead of letting Agent3 try to patch locally.  1 = enabled, 0 = disabled.
+    "CONSERVATIVE_BLOCKED_SORRY_INTERFACE_ESCALATE": 1,
+    # Agent9 (strategy_planner): max LLM retries on JSON parse failure.
+    "AGENT9_MAX_ROUNDS": 3,
+    # Agent9: truncation limit (chars) when injecting structured plan into Agent8 context.
+    "AGENT9_PLAN_CHARS": 3000,
+    # Agent9: how many chars of Agent2's guidance to feed into Agent9's prompt.
+    "AGENT9_GUIDANCE_CHARS": 4000,
+    # Agent8 anti-loop: consecutive zero-delta ticks with same action before escalating.
+    "AGENT8_NO_PROGRESS_ESCALATE_AFTER": 2,
+    # Agent8 anti-loop: length of error-signature string used for loop detection.
+    # Replaces the previous 40-char truncation that caused false collisions.
+    "AGENT8_ERROR_SIG_FULL_LEN": 120,
 }
 
 TIMEOUTS: dict[str, int] = {
@@ -349,6 +386,10 @@ AGENT8_FILE_WINDOW_RADIUS: int = int(os.getenv("AGENT8_FILE_WINDOW_RADIUS", "60"
 
 # When True, Agent8 writes detailed per-tick debug logs to the audit directory.
 AGENT8_DEBUG: bool = os.getenv("AGENT8_DEBUG", "0") != "0"
+
+# Verbosity level for Agent8 debug logs.
+# 1 = decision + outcome only, 2 = +ctx summary (first 500 chars), 3 = +raw_reply truncated.
+AGENT8_DEBUG_LEVEL: int = int(os.getenv("AGENT8_DEBUG_LEVEL", "1"))
 
 # Hard trigger: if the same error_signature appears >= this many consecutive
 # ticks with different actions, force human_missing_assumption.

@@ -80,6 +80,10 @@ _ADMIT_SOURCE_RE = re.compile(r"\badmit\b")
 # build output prose.  This avoids counting sorry occurrences in error messages,
 # documentation echoes, or user-visible strings.
 _SORRY_OUTPUT_RE = re.compile(r"declaration uses 'sorry'")
+# Captures file path, line, and column from each "declaration uses 'sorry'" warning.
+_SORRY_WARN_LOCATION_RE = re.compile(
+    r"([\w./\\-]+\.lean):(\d+):\d+:\s*warning:.*?declaration uses 'sorry'"
+)
 # Matches Lean block comments (possibly multi-line).
 _BLOCK_COMMENT_RE = re.compile(r"/-.*?-/", re.DOTALL)
 
@@ -98,6 +102,24 @@ def _count_sorry_in_source(text: str) -> int:
 
 def _count_sorry_in_output(text: str) -> int:
     return len(_SORRY_OUTPUT_RE.findall(text))
+
+
+def _extract_sorry_warning_locations(text: str) -> list[dict]:
+    """Return one entry per 'declaration uses sorry' compiler warning.
+
+    Each entry is ``{"file": str, "line": int}`` parsed from the warning line
+    emitted by the Lean compiler, e.g.::
+
+        Algorithms/Foo.lean:42:0: warning: declaration 'bar' uses 'sorry'
+
+    Only declarations that were successfully elaborated carry this warning.
+    Declarations with other compile errors will NOT appear here (they are
+    "blocked sorrys").
+    """
+    results: list[dict] = []
+    for m in _SORRY_WARN_LOCATION_RE.finditer(text):
+        results.append({"file": m.group(1), "line": int(m.group(2))})
+    return results
 
 
 def get_build_errors(target: str | None = None) -> str:

@@ -847,11 +847,13 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     raw_output = ""
     build_returncode = 1
     build_errors_for_parsing = ""
+    compiler_sorry_count = 0  # number of 'declaration uses sorry' warnings from compiler
     with _workspace_overlay_from_staging():
         build = lake_build(target=_path_to_lean_module(rel))
         build_returncode = int(build.returncode)
         raw_output = build.errors
         build_errors_for_parsing = build.errors
+        compiler_sorry_count = build.sorry_count
 
         # Fallback: freshly-created modules can temporarily miss lake target
         # registration; elaborate the file directly instead of failing hard.
@@ -868,6 +870,9 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
             build_returncode = int(proc.returncode)
             raw_output = (proc.stdout or "") + (proc.stderr or "")
             build_errors_for_parsing = raw_output if build_returncode != 0 else ""
+            # Re-count compiler sorry warnings from the direct-elaboration output.
+            from orchestrator.verify import _count_sorry_in_output as _cso
+            compiler_sorry_count = _cso(raw_output)
 
         sorry_count = count_sorrys(rel)
 
@@ -893,11 +898,14 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
             or all_lines
         )
 
+    blocked_sorry_count = max(0, sorry_count - compiler_sorry_count)
     return {
         "target": rel,
         "success": build_returncode == 0 and sorry_count == 0,
         "exit_code": build_returncode,
         "sorry_count": sorry_count,
+        "sorry_declarations": compiler_sorry_count,
+        "blocked_sorry_count": blocked_sorry_count,
         "error_count": len(error_lines),
         "errors": error_lines,
         "warnings": warning_lines,

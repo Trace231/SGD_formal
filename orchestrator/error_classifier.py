@@ -174,6 +174,21 @@ def _classify_lean_error_structured(
     if dep_errors and errors[0]["file"] and not _is_target_file(errors[0]["file"]):
         return "DEPENDENCY_COMPILE_ERROR", errors
 
+    # Build per-declaration zone map once for this target file.
+    tgt_path = PROJECT_ROOT / target_file
+    try:
+        _tgt_lines = tgt_path.read_text(encoding="utf-8").splitlines()
+        _decl_zones = _build_decl_zone_map(_tgt_lines)
+    except OSError:
+        _tgt_lines = []
+        _decl_zones = []
+
+    # Conservative fallback flag: when zone detection yielded no zones (file
+    # unreadable, or only has declarations without closeable := by) we cannot
+    # distinguish declaration zone from proof body.  In that case we prefer to
+    # escalate interface-like errors rather than silently route to LOCAL_PROOF_ERROR.
+    _zone_detection_uncertain = len(_decl_zones) == 0
+
     # All errors are in target — classify by message content and location.
     for e in target_errors:
         msg = e["message"]
@@ -189,36 +204,139 @@ def _classify_lean_error_structured(
         # Type mismatch in declaration/definition zone usually means callee
         # signature misuse, not a local tactic issue.
         if _TYPE_MISMATCH_RE.search(msg):
-            tgt_path = PROJECT_ROOT / target_file
-            decl_zone_end = _get_decl_zone_end(tgt_path)
-            if line <= decl_zone_end:
+            if _is_in_declaration_zone(line, _decl_zones):
+                return "DEFINITION_ZONE_ERROR", errors
+            # Conservative fallback: when zone detection is uncertain, prefer
+            # DEFINITION_ZONE_ERROR over PROOF_ERROR for type-mismatch errors.
+            if _zone_detection_uncertain:
                 return "DEFINITION_ZONE_ERROR", errors
 
         if _FIELD_NOTATION_RE.search(msg):
-            tgt_path = PROJECT_ROOT / target_file
-            decl_zone_end = _get_decl_zone_end(tgt_path)
-            if line <= decl_zone_end:
+            if _is_in_declaration_zone(line, _decl_zones):
                 return "DEFINITION_ZONE_ERROR", errors
-            # In proof body — fall through to PROOF_ERROR
+            # Conservative fallback: field notation errors are almost always API
+            # mismatches; prefer DEFINITION_ZONE_ERROR when zone detection is uncertain.
+            if _zone_detection_uncertain:
+                return "DEFINITION_ZONE_ERROR", errors
+            # In proof body and zone detection is reliable — fall through to PROOF_ERROR
 
         if _UNKNOWN_SYMBOL_RE.search(msg):
-            # Only SIGNATURE_HALLUCINATION when error is in the declaration zone:
-            # use target file content to determine where declarations end.
-            tgt_path = PROJECT_ROOT / target_file
-            decl_zone_end = _get_decl_zone_end(tgt_path)
-            if line <= decl_zone_end:
+            # Only SIGNATURE_HALLUCINATION when error is in the declaration zone.
+            if _is_in_declaration_zone(line, _decl_zones):
+                return "SIGNATURE_HALLUCINATION", errors
+            # Conservative fallback: unknown symbol outside any mapped zone is most
+            # likely an API/interface mismatch (e.g. calling a non-existent function
+            # in an equation-style def body that wasn't captured in the zone map).
+            # Prefer SIGNATURE_HALLUCINATION (forces Agent7/rewrite) over LOCAL_PROOF_ERROR.
+            if _zone_detection_uncertain:
                 return "SIGNATURE_HALLUCINATION", errors
             return "LOCAL_PROOF_ERROR", errors
 
+    # Conservative end-of-loop: if none of the per-error checks triggered a return
+    # but all errors are interface-like (type mismatch family), prefer DEFINITION_ZONE_ERROR
+    # over PROOF_ERROR so Agent7/Agent2 is consulted.
+    _all_interface_like = all(
+        _TYPE_MISMATCH_RE.search(e["message"])
+        or _FIELD_NOTATION_RE.search(e["message"])
+        or _UNKNOWN_SYMBOL_RE.search(e["message"])
+        for e in target_errors
+    ) if target_errors else False
+    if _all_interface_like:
+        return "DEFINITION_ZONE_ERROR", errors
+
     return "PROOF_ERROR", errors
+
+
+_DECL_START_RE = re.compile(
+    r"^(?:noncomputable\s+)?(?:theorem|lemma|def|abbrev)\s"
+)
+_PROOF_BODY_RE = re.compile(r":=\s*by\b|:=\s*$")
+
+# Top-level Lean 4 structural keywords that end any open declaration block.
+# When one of these appears at column 0 (not indented), any pending equation-style
+# def tracking should be closed.
+_TOP_LEVEL_RESET_RE = re.compile(
+    r"^(?:structure|class|instance|inductive|mutual|section|namespace|end|open|set_option|#)\s*",
+    re.IGNORECASE,
+)
+
+
+def _build_decl_zone_map(lines: list[str]) -> list[tuple[int, int]]:
+    """Return a list of (sig_start, sig_end) pairs — one per declaration.
+
+    sig_start is the 1-indexed line of the ``theorem``/``lemma``/``def`` keyword.
+    sig_end   is the 1-indexed line of the closing marker for that declaration.
+
+    **Closing rules** (in priority order):
+    1. ``:= by`` / ``:=`` alone on its line — standard proof-body opener.
+    2. A *new* top-level declaration keyword at the same or outer indentation level —
+       this handles **equation-style** ``def``/``abbrev`` declarations that use
+       ``| pattern => body`` syntax instead of ``:= by``.  The previous open zone is
+       closed at the line immediately before the new declaration.
+    3. A structural keyword (``structure``, ``namespace``, ``end``, …) at column 0
+       — always terminates any open tracking.
+    4. End-of-file — closes any still-open declaration.
+
+    This means the body of an equation-style def (its ``| branch =>`` lines) is
+    part of its zone, so type-API errors inside branches are correctly identified
+    as declaration-zone (interface) errors and routed to Agent7/Agent2.
+    """
+    zones: list[tuple[int, int]] = []
+    decl_start: int | None = None
+    for i, line in enumerate(lines, start=1):
+        stripped = line.strip()
+
+        # Rule 3: structural keyword at column 0 resets tracking.
+        if not line or (line[0] != " " and line[0] != "\t" and _TOP_LEVEL_RESET_RE.match(stripped)):
+            if decl_start is not None:
+                # Close the previous open declaration conservatively.
+                zones.append((decl_start, i - 1))
+                decl_start = None
+
+        # Rule 2: a NEW top-level declaration while one is already open → close old one.
+        if _DECL_START_RE.match(stripped):
+            if decl_start is not None:
+                # The previous declaration was equation-style (never saw := by).
+                # Close it at the line before this new declaration starts.
+                zones.append((decl_start, i - 1))
+            decl_start = i
+            continue  # don't fall into rule 1 for the opening line itself
+
+        # Rule 1: proof-body opener for the current := by / := style declaration.
+        if decl_start is not None and _PROOF_BODY_RE.search(line):
+            zones.append((decl_start, i))
+            decl_start = None
+
+    # Rule 4: end-of-file closes any still-open declaration.
+    if decl_start is not None:
+        zones.append((decl_start, len(lines)))
+
+    return zones
+
+
+def _is_in_declaration_zone(error_line: int, decl_zone_map: list[tuple[int, int]]) -> bool:
+    """Return True iff *error_line* falls within any declaration's signature zone.
+
+    A line is "in the declaration zone" of a declaration D when it lies between
+    D's keyword line and the ``:= by`` / ``:=`` line (inclusive on both ends).
+    Lines in proof bodies (after ``:= by``) are NOT in any declaration zone.
+    """
+    for sig_start, sig_end in decl_zone_map:
+        if sig_start <= error_line <= sig_end:
+            return True
+    return False
 
 
 def _get_decl_zone_end(tgt_path: Path) -> int:
     """Return the last line number of the declaration zone in a Lean file.
 
-    The declaration zone is everything up to (and including) the line where
-    the first proof body begins — i.e. the first ':= by' or ':= ' that starts
-    a proof.  Falls back to _PROOF_BODY_LINE_THRESHOLD if file is unreadable.
+    Kept for backward compatibility with callers that only need a single
+    threshold (e.g. legacy fallback paths).  New code should use
+    ``_build_decl_zone_map`` + ``_is_in_declaration_zone`` for per-error
+    accuracy in multi-theorem files.
+
+    Returns the sig_end of the LAST declaration whose signature we can parse,
+    or ``_PROOF_BODY_LINE_THRESHOLD`` if the file is unreadable / has no decls.
     """
     if not tgt_path.exists():
         return _PROOF_BODY_LINE_THRESHOLD
@@ -227,14 +345,11 @@ def _get_decl_zone_end(tgt_path: Path) -> int:
     except OSError:
         return _PROOF_BODY_LINE_THRESHOLD
 
-    # Find the first theorem/lemma/def declaration, then track until the proof body.
-    in_decl = False
-    for i, line in enumerate(lines, start=1):
-        stripped = line.strip()
-        if re.match(r"^(?:noncomputable\s+)?(?:theorem|lemma|def|abbrev)\s", stripped):
-            in_decl = True
-        if in_decl and re.search(r":=\s*by\b|:=\s*$", line):
-            return i
+    zones = _build_decl_zone_map(lines)
+    if zones:
+        # Return the sig_end of the last parsed declaration so that the threshold
+        # covers the full file's declaration zones rather than stopping at the first.
+        return zones[-1][1]
     return _PROOF_BODY_LINE_THRESHOLD
 
 
@@ -300,6 +415,18 @@ def _format_agent3_tool_feedback(
             "```",
             warn_text[:1500],
             "```",
+        ])
+    blocked_sorry_count = int(verify_result.get("blocked_sorry_count", 0))
+    if blocked_sorry_count > 0:
+        n_clean = int(verify_result.get("sorry_declarations", 0))
+        parts.extend([
+            "",
+            f"### Blocked sorrys: {blocked_sorry_count} of {sorry_count} source sorrys are "
+            f"inside declarations that have compile errors above.",
+            f"Only {n_clean} declaration(s) have clean sorrys (no other errors).",
+            "**Fix the compilation errors listed above BEFORE attempting to fill any sorry.**",
+            "Filling a sorry inside a broken declaration will have no effect until the "
+            "declaration compiles successfully.",
         ])
     parts.extend([
         "",

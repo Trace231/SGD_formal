@@ -18,6 +18,7 @@ import re
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
@@ -34,10 +35,12 @@ from orchestrator.config import (
     AGENT8_HUMAN_GATE_CONSECUTIVE_THRESHOLD,
     AUDIT_DIR,
     PROJECT_ROOT,
+    REFERENCE_FILES_WITH_DESCRIPTIONS,
     RETRY_LIMITS,
 )
 from orchestrator.context_builders import (
     _build_escalation_file_context,
+    _extract_imported_algo_sigs,
     _prequery_dependency_signatures,
 )
 from orchestrator.error_classifier import _extract_first_error_line, _json_candidates
@@ -49,24 +52,8 @@ console = Console()
 # Lib file descriptions — compact summary for Agent8 context
 # ---------------------------------------------------------------------------
 
-LIB_FILE_DESCRIPTIONS: list[tuple[str, str]] = [
-    ("Lib/Glue/Probability.lean",
-     "Probability/integral tools: probReal_univ, integral_const, IsProbabilityMeasure, HasBoundedVariance"),
-    ("Lib/Glue/Algebra.lean",
-     "Norm-squared expansion, gradient step inner-product algebra"),
-    ("Lib/Glue/Measurable.lean",
-     "Measurability and integrable composite helpers"),
-    ("Lib/Glue/Calculus.lean",
-     "Hilbert space FTC, segment integration"),
-    ("Lib/Layer0/ConvexFOC.lean",
-     "Convex/strongly-convex first-order conditions"),
-    ("Lib/Layer0/GradientFTC.lean",
-     "L-smooth gradient quadratic bound"),
-    ("Lib/Layer0/IndepExpect.lean",
-     "Expectation/independence: expectation_inner_gradL_eq, expectation_norm_sq_gradL_bound"),
-    ("Lib/Layer1/StochasticDescent.lean",
-     "StochasticDescentHyps structure and convergence theorems"),
-]
+# Alias to the config-driven list — avoids hardcoding file descriptions here.
+LIB_FILE_DESCRIPTIONS = REFERENCE_FILES_WITH_DESCRIPTIONS
 
 
 def _extract_error_signature(errors_text: str) -> str:
@@ -96,6 +83,7 @@ def _build_agent8_tick_context(
     agent2_plan: str,
     decision_history: list[dict],
     staging_rel: str,
+    agent9_plan: dict | None = None,
 ) -> str:
     """Build a minimal, non-truncated diagnostic prompt for Agent8.
 
@@ -152,16 +140,28 @@ def _build_agent8_tick_context(
     lib_desc = "\n".join(f"  - {path}: {desc}" for path, desc in LIB_FILE_DESCRIPTIONS)
 
     # --- Decision history ---
+    _hist_window = RETRY_LIMITS.get("AGENT8_HISTORY_WINDOW", 8)
     if decision_history:
         history_lines = []
-        for entry in decision_history[-8:]:
+        for entry in decision_history[-_hist_window:]:
+            _eb = entry.get("errors_before", "")
+            _ea = entry.get("errors_after", "")
+            _delta = entry.get("sorry_delta", None)
+            _sc = entry.get("sorry_count", "?")
+            _sc_before = (int(_sc) - int(_delta)) if (_delta is not None and _sc != "?") else "?"
+            _no_change_tag = ""
+            if _eb and _ea and _eb[:120] == _ea[:120] and _delta == 0:
+                _no_change_tag = "  ← NO CHANGE"
             history_lines.append(
                 f"  tick {entry['tick']}: action={entry['action']}, "
                 f"target={entry.get('target_theorem', '?')}, "
-                f"error_sig=\"{entry.get('error_signature', '?')}\", "
                 f"result={entry.get('outcome', '?')}, "
-                f"exit={entry.get('exit_code', '?')}, sorry={entry.get('sorry_count', '?')}"
+                f"sorry={_sc_before}→{_sc} (delta {_delta if _delta is not None else '?'})"
             )
+            if _eb:
+                history_lines.append(f"    before: \"{_eb[:120]}\"")
+            if _ea:
+                history_lines.append(f"    after : \"{_ea[:120]}\"{_no_change_tag}")
         history_block = "\n".join(history_lines)
     else:
         history_block = "  (no previous decisions)"
@@ -170,16 +170,39 @@ def _build_agent8_tick_context(
     # searching across project Lean files — works for any algorithm.
     dep_sigs = _prequery_dependency_signatures(errors_text, target_file, max_symbols=5)
 
+    # Extract signatures of declarations imported by the target algorithm file.
+    algo_sigs = _extract_imported_algo_sigs(target_file)
+
+    _err_chars = RETRY_LIMITS.get("AGENT8_ERROR_CHARS", 3000)
+    _staging_chars = RETRY_LIMITS.get("AGENT8_STAGING_CHARS", 2000)
+    _plan_chars = RETRY_LIMITS.get("AGENT8_PLAN_CHARS", 3000)
+    _a9_chars = RETRY_LIMITS.get("AGENT9_PLAN_CHARS", 3000)
+
+    # Agent9 structured plan block (omitted when no plan is available).
+    _a9_block = ""
+    if agent9_plan:
+        import json as _json
+        try:
+            _a9_text = _json.dumps(agent9_plan, indent=2, ensure_ascii=False)
+        except Exception:
+            _a9_text = str(agent9_plan)
+        _a9_block = (
+            f"## Agent9 Structured Plan\n"
+            f"```json\n{_a9_text[:_a9_chars]}\n```\n\n"
+        )
+
     return (
         "## Current Algorithm File (smart-truncated around error lines)\n"
         f"File: {target_file}\n"
         f"```lean\n{algo_display}\n```\n\n"
-        f"## Build Errors\n```\n{errors_text[:3000]}\n```\n\n"
-        f"## Staging File ({staging_rel})\n```lean\n{staging_content[:2000]}\n```\n\n"
-        f"## Agent2 Proof Plan (current)\n{agent2_plan[:3000]}\n\n"
+        f"## Build Errors\n```\n{errors_text[:_err_chars]}\n```\n\n"
+        f"## Staging File ({staging_rel})\n```lean\n{staging_content[:_staging_chars]}\n```\n\n"
+        f"## Agent2 Proof Plan (current)\n{agent2_plan[:_plan_chars]}\n\n"
         f"## Library Files Available\n{lib_desc}\n\n"
+        f"{_a9_block}"
         f"## Decision History (recent)\n{history_block}\n\n"
         f"{dep_sigs}"
+        f"{algo_sigs}\n\n"
         "Analyze the errors and produce a single JSON decision following the "
         "priority rules in your system prompt."
     )
@@ -257,13 +280,21 @@ def _agent8_run_agent3(
             "of the target file. Do not modify code outside this range."
         )
 
+    try:
+        _staging_snippet = load_file(staging_rel)[
+            : RETRY_LIMITS.get("AGENT8_STAGING_CHARS", 2000)
+        ]
+    except FileNotFoundError:
+        _staging_snippet = "(no staging file)"
+
     initial_msg = (
         f"[AGENT8 DISPATCH — Tactical Fix]\n\n"
         f"{targeted_prompt}\n\n"
         f"The full proof plan is available at: {plan_file}\n"
         f"(Read it with read_file if you need the complete mathematical strategy.)\n"
         f"Target file: {target_file}\n"
-        f"Staging file: {staging_rel}"
+        f"Staging file: {staging_rel}\n\n"
+        f"## Current Staging File\n```lean\n{_staging_snippet}\n```\n"
         f"{scope_instruction}\n\n"
         "Fix the specified error. When done, signal tool=done. "
         "Output ONE JSON action per response: {{thought, tool, arguments}}."
@@ -379,7 +410,7 @@ def _agent8_run_agent7(
         "Produce a strict interface-audit protocol JSON for Agent3.\n"
         f"Target file: {target_file}\n"
         "[Agent8 Decision Hub dispatch — signature diagnosis]\n\n"
-        f"Agent8 diagnosis:\n{agent7_targeted_prompt[:1500]}\n\n"
+        f"Agent8 diagnosis:\n{agent7_targeted_prompt[:RETRY_LIMITS.get('AGENT8_A7_PROMPT_CHARS', 1500)]}\n\n"
         f"Latest build errors:\n```\n{errors_text[:2000]}\n```\n\n"
         f"Current file snippet:\n```lean\n{snippet[:8000]}\n```\n\n"
         f"Dependency signatures:\n```lean\n{dep_sigs[:4000]}\n```\n\n"
@@ -488,9 +519,9 @@ def _agent8_run_agent2_replan(
         "[AGENT8 — STRATEGY REVISION REQUEST]\n\n"
         "The current proof strategy has failed after all retry attempts. "
         "Please revise the proof plan based on the errors below.\n\n"
-        f"## Current Plan\n{current_plan[:4000]}\n\n"
-        f"## Current Errors\n```\n{errors_text[:2000]}\n```\n\n"
-        f"## Current File Content\n```lean\n{current_file[:6000]}\n```\n\n"
+        f"## Current Plan\n{current_plan[:RETRY_LIMITS.get('AGENT8_A2_PLAN_CHARS', 4000)]}\n\n"
+        f"## Current Errors\n```\n{errors_text[:RETRY_LIMITS.get('AGENT8_A2_ERROR_CHARS', 2000)]}\n```\n\n"
+        f"## Current File Content\n```lean\n{current_file[:RETRY_LIMITS.get('AGENT8_A2_FILE_CHARS', 6000)]}\n```\n\n"
         "Revise the proof strategy. You may:\n"
         "- Decompose sub-goals differently\n"
         "- Add new intermediate lemmas\n"
@@ -511,7 +542,9 @@ def _agent8_run_agent2_replan(
 # Debug logger
 # ---------------------------------------------------------------------------
 
-def _debug_log(algo_name: str, tick: int, decision: dict, outcome: dict) -> None:
+def _debug_log(
+    algo_name: str, tick: int, decision: dict, outcome: dict, **extra: Any
+) -> None:
     """Write per-tick debug info to the audit directory."""
     if not AGENT8_DEBUG:
         return
@@ -523,9 +556,100 @@ def _debug_log(algo_name: str, tick: int, decision: dict, outcome: dict) -> None
         "timestamp": time.time(),
         "decision": decision,
         "outcome": outcome,
+        **extra,
     }
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Behavior-driven anti-loop check
+# ---------------------------------------------------------------------------
+
+def _check_anti_loop(
+    decision: dict,
+    decision_history: list[dict],
+) -> tuple[str, str]:
+    """Decide whether the proposed action should be overridden to break a loop.
+
+    Returns ``(action, override_reason)``.  When no override is needed,
+    ``override_reason`` is empty and ``action`` equals ``decision["action"]``.
+
+    Logic (evaluated in priority order):
+    1. **Zero-progress repeat** — the same action was used in the last N
+       history entries, all of which had ``sorry_delta == 0`` AND
+       ``errors_after[:120] == errors_before[:120]``.  Escalate to
+       ``agent2_replan`` (or ``human_missing_assumption`` if the proposed
+       action is already ``agent2_replan``).
+    2. **Error frozen across all recent actions** — the last 3 history entries
+       (regardless of action) all share the same ``errors_after[:120]``.
+       Escalate to ``human_missing_assumption``.
+    3. **Classic heuristic fallback** — ``(action, error_sig[:LEN])`` pair
+       repeated too many times (uses ``AGENT8_ERROR_SIG_FULL_LEN`` instead of
+       the old 40-char truncation).
+    """
+    _no_progress_n = RETRY_LIMITS.get("AGENT8_NO_PROGRESS_ESCALATE_AFTER", 2)
+    _sig_len = RETRY_LIMITS.get("AGENT8_ERROR_SIG_FULL_LEN", 120)
+    proposed_action = decision.get("action", "agent3_tactical")
+    error_sig = decision.get("error_signature", "")
+    _escapable = proposed_action not in ("agent2_replan", "human_missing_assumption")
+
+    if not decision_history:
+        return proposed_action, ""
+
+    # --- Condition 1: zero-progress repeat for the same action ---
+    _same_action_entries = [
+        e for e in decision_history if e.get("action") == proposed_action
+    ]
+    if len(_same_action_entries) >= _no_progress_n:
+        _last_n = _same_action_entries[-_no_progress_n:]
+        _all_no_progress = all(
+            e.get("sorry_delta", None) == 0
+            and e.get("errors_before", "")[:120] == e.get("errors_after", "")[:120]
+            for e in _last_n
+        )
+        if _all_no_progress:
+            _reason = (
+                f"action '{proposed_action}' made zero progress in last "
+                f"{_no_progress_n} attempts (errors unchanged, sorry_delta=0)"
+            )
+            if proposed_action == "agent2_replan":
+                return "human_missing_assumption", _reason
+            return "agent2_replan", _reason
+
+    # --- Condition 2: error frozen across all recent actions ---
+    if len(decision_history) >= 3:
+        _last3 = decision_history[-3:]
+        _ea_signatures = [e.get("errors_after", "")[:120] for e in _last3]
+        # Also require sorry_delta == 0 for all entries: when exit_code==0 but sorrys
+        # remain, errors is an empty list ("[]"), making all ea_signatures identical
+        # even while progress is made (sorrys decreasing). Without this guard we'd
+        # fire human_missing_assumption on a normally-progressing sequence.
+        _all_sorry_frozen = all(e.get("sorry_delta", None) == 0 for e in _last3)
+        if _ea_signatures[0] and len(set(_ea_signatures)) == 1 and _all_sorry_frozen:
+            _reason = (
+                f"errors and sorry both unchanged across last 3 ticks: "
+                f"\"{_ea_signatures[0][:60]}\""
+            )
+            return "human_missing_assumption", _reason
+
+    # --- Condition 3: classic (action, error_sig) pair heuristic (extended sig) ---
+    if _escapable and decision_history:
+        _sig_key = error_sig[:_sig_len]
+        _pair_repeats = sum(
+            1
+            for e in decision_history
+            if e.get("action") == proposed_action
+            and e.get("error_signature", "")[:_sig_len] == _sig_key
+        )
+        if _pair_repeats >= 2:
+            _reason = (
+                f"(action='{proposed_action}', error_sig='{_sig_key[:60]}') "
+                f"repeated {_pair_repeats + 1}× in history"
+            )
+            return "agent2_replan", _reason
+
+    return proposed_action, ""
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +664,7 @@ def run_agent8_loop(
     last_errors: str,
     *,
     best_checkpoint: dict | None = None,
+    agent9_plan: dict | None = None,
 ) -> tuple[bool, str, str]:
     """Run the Agent8 decision hub loop.
 
@@ -556,27 +681,68 @@ def run_agent8_loop(
     _consecutive_same_error: int = 0
     _last_error_sig: str = ""
 
+    # Running sorry count — updated after every dispatch so we can compute
+    # per-tick deltas and record them in decision_history.
+    # Seed from best_checkpoint if available (most recent known sorry count before
+    # Agent8 started), so the first-tick delta is meaningful rather than -(999 - N).
+    _current_sorry_count: int = (
+        int(best_checkpoint.get("sorry_count", 999))
+        if best_checkpoint
+        else 999
+    )
+
     console.rule("[bold magenta]Agent8 Decision Hub — Error Recovery")
     console.print(
         f"  Target: {target_file} | Max steps: {max_steps} | "
         f"Debug: {AGENT8_DEBUG}"
     )
 
-    # Anti-loop: track consecutive (action, error_sig) pair failures
-    _last_action_error_pair: tuple[str, str] = ("", "")
-    _consecutive_same_action_error: int = 0
+    # (legacy per-tick counters kept for the _consecutive_same_error hard-trigger below)
 
     for tick in range(1, max_steps + 1):
         console.print(f"\n[magenta]--- Agent8 Tick {tick}/{max_steps} ---")
 
         # 1. Build context
         ctx = _build_agent8_tick_context(
-            target_file, current_errors, current_plan, decision_history, staging_rel
+            target_file, current_errors, current_plan, decision_history, staging_rel,
+            agent9_plan=agent9_plan,
         )
 
-        # 2. Call Agent8 (fresh context every tick)
+        # 2. Call Agent8 with optional investigation rounds
         agent8 = Agent("decision_hub")
+        _inv_registry = ToolRegistry()
+        _inv_registry.register_investigation_tools()
+        _max_inv = RETRY_LIMITS.get("AGENT8_INVESTIGATION_TURNS", 3)
+        _investigation_rounds_this_tick = 0
         raw_reply = agent8.call(ctx)
+
+        for _inv_round in range(_max_inv):
+            try:
+                _inv_payload = json.loads(raw_reply)
+            except (json.JSONDecodeError, ValueError):
+                break
+            if not (
+                isinstance(_inv_payload, dict)
+                and _inv_payload.get("type") == "lookup"
+                and isinstance(_inv_payload.get("tool_calls"), list)
+                and len(_inv_payload["tool_calls"]) > 0
+            ):
+                break
+            _inv_results: list[dict] = []
+            for _tc in _inv_payload["tool_calls"]:
+                _tn = _tc.get("tool", "")
+                _ta = _tc.get("arguments", {}) or {}
+                try:
+                    _tr = _inv_registry.call(_tn, **_ta)
+                except Exception as _exc:
+                    _tr = {"error": str(_exc)}
+                _inv_results.append({"tool": _tn, "result": _tr})
+            _investigation_rounds_this_tick += 1
+            raw_reply = agent8.call(
+                "Investigation results:\n"
+                + json.dumps(_inv_results, indent=2, ensure_ascii=False)
+                + "\n\nNow output your final JSON decision."
+            )
 
         # 3. Parse decision (with retry)
         decision = _parse_agent8_decision(raw_reply)
@@ -619,35 +785,21 @@ def run_agent8_loop(
         console.print(
             f"  [Agent8] Decision: {action} "
             f"(P={decision.get('priority_level', '?')}) "
-            f"| error_sig=\"{error_sig[:40]}\""
+            f"| error_sig=\"{error_sig[:60]}\""
         )
         console.print(f"  [Agent8] Reason: {decision.get('reason', '?')}")
 
-        # 4a. Anti-loop: same (action, error_sig) pair repeated ≥ 2 times → force agent2_replan
-        _escapable = action not in ("agent2_replan", "human_missing_assumption")
-        _current_pair = (action, error_sig[:40])
-        if _current_pair == _last_action_error_pair and _escapable:
-            _consecutive_same_action_error += 1
-        else:
-            _consecutive_same_action_error = 1
-            _last_action_error_pair = _current_pair
-
-        if _consecutive_same_action_error >= 2 and _escapable:
-            console.print(
-                f"  [Agent8] ANTI-LOOP: same action+error pair repeated "
-                f"{_consecutive_same_action_error}× → forcing agent2_replan"
-            )
-            action = "agent2_replan"
+        # 4. Anti-loop check (behavior-driven, replaces old heuristic pair counters).
+        action, _antiloop_reason = _check_anti_loop(decision, decision_history)
+        if _antiloop_reason:
+            console.print(f"  [AntiLoop] {action} ← {_antiloop_reason}")
             decision["action"] = action
             targeted_prompt = (
-                f"[FORCED by anti-loop: '{_current_pair[0]}' failed "
-                f"{_consecutive_same_action_error}× for error '{error_sig[:60]}'] "
-                + targeted_prompt
+                f"[FORCED by anti-loop: {_antiloop_reason}] " + targeted_prompt
             )
-            _consecutive_same_action_error = 0  # reset after forcing
-            _last_action_error_pair = ("", "")
 
-        # 4b. Hard trigger: same error_signature too many consecutive times → human gate
+        # Hard trigger: same error_signature too many consecutive ticks → human gate.
+        # Kept as a final safety net on top of _check_anti_loop.
         if error_sig and error_sig == _last_error_sig:
             _consecutive_same_error += 1
         else:
@@ -663,7 +815,9 @@ def run_agent8_loop(
                 action = "human_missing_assumption"
                 decision["action"] = action
 
-        # 5. Dispatch
+        # 5. Dispatch — capture state BEFORE action for delta computation.
+        _errors_before: str = current_errors[:300]
+        _sorry_before: int = _current_sorry_count
         outcome: dict = {"outcome": "unknown"}
 
         try:
@@ -765,14 +919,29 @@ def run_agent8_loop(
                     "action": action,
                     "target_theorem": decision.get("target_theorem"),
                     "error_signature": error_sig,
+                    "errors_before": _errors_before,
+                    "errors_after": _errors_before,  # no dispatch happened
+                    "sorry_delta": 0,
                     **outcome,
                 })
-                _debug_log(algo_name, tick, decision, outcome)
+                _debug_log(
+                    algo_name, tick, decision, outcome,
+                    ctx_char_len=len(ctx),
+                    first_error_line=_extract_first_error_line(current_errors),
+                    error_sig=error_sig,
+                    investigation_rounds=_investigation_rounds_this_tick,
+                    dispatch_prompt_len=len(targeted_prompt),
+                )
                 return False, current_plan, current_errors
 
         except Exception as exc:
             console.print(f"  [Agent8] Dispatch error: {exc}")
             outcome = {"outcome": "dispatch_error", "error": str(exc)}
+
+        # Update running sorry count from outcome (keep previous on dispatch_error).
+        _current_sorry_count = int(outcome.get("sorry_count", _current_sorry_count))
+        _errors_after: str = current_errors[:300]
+        _sorry_delta: int = _current_sorry_count - _sorry_before
 
         # 6. Record decision
         decision_history.append({
@@ -780,9 +949,19 @@ def run_agent8_loop(
             "action": action,
             "target_theorem": decision.get("target_theorem"),
             "error_signature": error_sig,
+            "errors_before": _errors_before,
+            "errors_after": _errors_after,
+            "sorry_delta": _sorry_delta,
             **outcome,
         })
-        _debug_log(algo_name, tick, decision, outcome)
+        _debug_log(
+            algo_name, tick, decision, outcome,
+            ctx_char_len=len(ctx),
+            first_error_line=_extract_first_error_line(current_errors),
+            error_sig=error_sig,
+            investigation_rounds=_investigation_rounds_this_tick,
+            dispatch_prompt_len=len(targeted_prompt),
+        )
 
         # 7. Check success
         if outcome.get("outcome") == "success":

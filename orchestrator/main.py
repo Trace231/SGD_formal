@@ -96,12 +96,15 @@ from orchestrator.error_classifier import (
     _UNKNOWN_SYMBOL_RE,
     _TYPECLASS_FAIL_RE,
     _TYPE_MISMATCH_RE,
+    _FIELD_NOTATION_RE,
     _DUPLICATE_DECL_RE,
     _PROOF_BODY_LINE_THRESHOLD,
     _parse_lean_errors,
     _json_candidates,
     _classify_lean_error_structured,
     _get_decl_zone_end,
+    _build_decl_zone_map,
+    _is_in_declaration_zone,
     _is_target_file_error,
     _extract_first_error_line,
     _infer_failure_class,
@@ -606,6 +609,21 @@ def phase3_prove(
         initial_hash = _file_hash(target_file)
         initial_exists = True
 
+        # Agent9 — Strategy Planner: convert compiled scaffold into a structured
+        # JSON proof plan.  This plan is passed to Agent8's Decision Hub as
+        # additional context.  Failure is non-fatal: Phase 3 continues with {}.
+        from orchestrator.phase3a_agent9 import run_agent9_plan as _run_agent9_plan
+        _agent9_plan: dict = _run_agent9_plan(target_file, guidance, _algo_name)
+        if not _agent9_plan:
+            console.print(
+                "[yellow][Agent9] Strategy plan unavailable — "
+                "Agent8 will operate without structured plan."
+            )
+    else:
+        # Target file already exists (re-run or partial proof) — skip scaffold
+        # and Agent9 since we don't have a freshly compiled scaffold to plan from.
+        _agent9_plan = {}
+
     for attempt in range(1, max_retries + 1):
         attempts = attempt
         attempt_start_hash: str | None = _file_hash(target_file)
@@ -620,6 +638,7 @@ def phase3_prove(
             _a3_evict_n = RETRY_LIMITS.get("AGENT3_CONTEXT_EVICT_EVERY_N", 3)
             if (attempt - 1) % _a3_evict_n == 0:
                 agent3.messages.clear()
+                _goal_cache.clear()  # avoid stale file-hash cache entries after eviction
                 console.print(
                     f"  [ContextEvict] a{attempt} — Agent3 context cleared "
                     f"(every {_a3_evict_n} attempts)"
@@ -640,7 +659,7 @@ def phase3_prove(
                     "Your conversation history has been cleared to remove context pollution "
                     "from failed attempts. Below is a distilled summary.\n\n"
                     f"## Current proof plan (preserve math structure, update tactics only)\n"
-                    f"{guidance[:2000]}\n\n"
+                    f"{guidance[:RETRY_LIMITS.get('AGENT2_DISTILLED_GUIDANCE_CHARS', 5000)]}\n\n"
                     f"## Best checkpoint (sorry={best_checkpoint['sorry_count']})\n"
                     f"```lean\n{(best_checkpoint['content'] or '')[:3000]}\n```\n\n"
                     f"## Failed approaches — do NOT repeat these\n{_distilled_failures}\n\n"
@@ -943,6 +962,16 @@ def phase3_prove(
             _stale_err_count: int = 0
             _def_zone_err_count: int = 0
             _def_zone_force_threshold = RETRY_LIMITS.get("DEFINITION_ZONE_FORCE_AGENT7_AFTER_N", 2)
+            # Conservative routing counters.
+            # Tracks consecutive turns where the same interface-like error signature repeated.
+            _conservative_iface_sig: str = ""
+            _conservative_iface_repeat_count: int = 0
+            _conservative_iface_repeat_threshold = RETRY_LIMITS.get(
+                "CONSERVATIVE_INTERFACE_ERROR_REPEAT_THRESHOLD", 2
+            )
+            _conservative_blocked_escalate = bool(
+                RETRY_LIMITS.get("CONSERVATIVE_BLOCKED_SORRY_INTERFACE_ESCALATE", 1)
+            )
             # Tracks whether the active sorry line was closed during this iteration.
             _active_sorry_closed = False
 
@@ -1357,6 +1386,20 @@ def phase3_prove(
                                 if snapshot_file(_lp_rel) != _loriginal:
                                     registry.call("overwrite_file", path=_lp_rel, content=_loriginal)
                                     console.print(f"  [Layer0] Restored {_lp.name} (was modified by Agent3)")
+                            # Re-verify target file AFTER Glue/Layer0 restoration.
+                            # If the proof relied on Agent3's Glue edits, restoration
+                            # will break it here rather than silently declaring false success.
+                            _post_restore = registry.call("run_lean_verify", target_file)
+                            if not (
+                                int(_post_restore.get("exit_code", 1)) == 0
+                                and int(_post_restore.get("sorry_count", -1)) == 0
+                            ):
+                                console.print(
+                                    "[yellow][Gate1] Target re-verify FAILED after Glue restoration "
+                                    "— proof depended on modified Glue files. Continuing attempt."
+                                )
+                                last_errors = str(_post_restore.get("errors", ""))
+                                break  # exit tool loop, retry attempt
                             return True, attempts, "", {
                                 "execution_history": [r.__dict__ for r in execution_history],
                                 "attempt_failures": attempt_failures,
@@ -2014,6 +2057,18 @@ def phase3_prove(
                                     if snapshot_file(_lp_rel) != _loriginal:
                                         registry.call("overwrite_file", path=_lp_rel, content=_loriginal)
                                         console.print(f"  [Layer0] Restored {_lp.name} (was modified by Agent3)")
+                                # Re-verify target file AFTER Glue/Layer0 restoration.
+                                _auto_post_restore = registry.call("run_lean_verify", target_file)
+                                if not (
+                                    int(_auto_post_restore.get("exit_code", 1)) == 0
+                                    and int(_auto_post_restore.get("sorry_count", -1)) == 0
+                                ):
+                                    console.print(
+                                        "[yellow][AutoDone] Target re-verify FAILED after Glue restoration "
+                                        "— proof depended on modified Glue files. Continuing attempt."
+                                    )
+                                    last_errors = str(_auto_post_restore.get("errors", ""))
+                                    break  # exit tool loop, retry attempt
                                 return True, attempts, "", {
                                     "execution_history": [r.__dict__ for r in execution_history],
                                     "attempt_failures": attempt_failures,
@@ -2048,10 +2103,17 @@ def phase3_prove(
                                 )
 
                     if progress_detail in ("normal", "debug"):
+                        _src_s  = last_sorry_in_attempt
+                        _cln_s  = last_verify_result.get("sorry_declarations", _src_s) if last_verify_result else _src_s
+                        _blk_s  = last_verify_result.get("blocked_sorry_count", 0)     if last_verify_result else 0
+                        _sorry_display = (
+                            f"sorry={_src_s} ({_cln_s} clean, {_blk_s} blocked)"
+                            if _blk_s > 0 else f"sorry={_src_s}"
+                        )
                         console.print(
                             f"  [A3] a{attempt}/{max_retries} "
                             f"t{tool_turn + 1}/{_per_sorry_remaining} — "
-                            f"exit={last_exit_code} sorry={last_sorry_in_attempt}"
+                            f"exit={last_exit_code} {_sorry_display}"
                             + (f" [L{_active_sorry_line} closed]" if _active_sorry_closed else "")
                         )
                     if last_exit_code != 0 and last_verify_text:
@@ -2091,8 +2153,12 @@ def phase3_prove(
                     if error_type == "PROOF_ERROR" and _structured_errors_inner:
                         _primary_for_llm = _structured_errors_inner[0]
                         _pline_fb = _primary_for_llm.get("line", 9999)
-                        _dze_fb = _get_decl_zone_end(PROJECT_ROOT / target_file)
-                        if _pline_fb <= _dze_fb:
+                        try:
+                            _tgt_lines_fb = (PROJECT_ROOT / target_file).read_text(encoding="utf-8").splitlines()
+                            _dz_map_fb = _build_decl_zone_map(_tgt_lines_fb)
+                        except OSError:
+                            _dz_map_fb = []
+                        if _is_in_declaration_zone(_pline_fb, _dz_map_fb):
                             _llm_fb = _llm_classify_error(
                                 _primary_for_llm,
                                 _build_escalation_file_context(target_file, _pline_fb),
@@ -2111,6 +2177,81 @@ def phase3_prove(
                     else:
                         _stale_err_line = None
                         _stale_err_count = 0
+
+                    # ---- Conservative routing override gates ----
+                    # These gates run BEFORE the main error-type dispatch.  They
+                    # upgrade LOCAL_PROOF_ERROR / PROOF_ERROR to DEFINITION_ZONE_ERROR
+                    # when evidence strongly suggests an interface/API mismatch.
+                    #
+                    # Gate A: blocked_sorry + interface-like primary error.
+                    # When ALL source sorrys are blocked (none compile-clean) and the
+                    # primary error message looks like an API/signature problem, skip
+                    # the local self-fix loop and go straight to Agent7/Agent2 analysis.
+                    _conservative_override_reason: str = ""
+                    if (
+                        _conservative_blocked_escalate
+                        and error_type in ("LOCAL_PROOF_ERROR", "PROOF_ERROR")
+                        and last_verify_result is not None
+                        and int(last_verify_result.get("blocked_sorry_count", 0)) > 0
+                        and _structured_errors_inner
+                    ):
+                        _primary_msg_A = str(_structured_errors_inner[0].get("message", ""))
+                        _is_iface_A = bool(
+                            _UNKNOWN_SYMBOL_RE.search(_primary_msg_A)
+                            or _TYPE_MISMATCH_RE.search(_primary_msg_A)
+                            or _FIELD_NOTATION_RE.search(_primary_msg_A)
+                        )
+                        if _is_iface_A:
+                            error_type = "DEFINITION_ZONE_ERROR"
+                            _conservative_override_reason = (
+                                f"blocked_sorry={last_verify_result['blocked_sorry_count']} "
+                                f"+ interface error: {_primary_msg_A[:80]}"
+                            )
+
+                    # Gate B: same interface-like error signature repeated too many times.
+                    # Counts consecutive turns where the primary error is interface-like
+                    # AND the (file:line:msg-prefix) signature hasn't changed.  Escalate
+                    # after CONSERVATIVE_INTERFACE_ERROR_REPEAT_THRESHOLD turns.
+                    if (
+                        not _conservative_override_reason
+                        and error_type in ("LOCAL_PROOF_ERROR", "PROOF_ERROR")
+                        and _structured_errors_inner
+                    ):
+                        _primary_msg_B = str(_structured_errors_inner[0].get("message", ""))
+                        _is_iface_B = bool(
+                            _UNKNOWN_SYMBOL_RE.search(_primary_msg_B)
+                            or _TYPE_MISMATCH_RE.search(_primary_msg_B)
+                            or _FIELD_NOTATION_RE.search(_primary_msg_B)
+                        )
+                        if _is_iface_B:
+                            _iface_sig_now = (
+                                f"{_structured_errors_inner[0].get('file', '')}:"
+                                f"{_structured_errors_inner[0].get('line', 0)}:"
+                                f"{_primary_msg_B[:80]}"
+                            )
+                            if _iface_sig_now == _conservative_iface_sig:
+                                _conservative_iface_repeat_count += 1
+                            else:
+                                _conservative_iface_sig = _iface_sig_now
+                                _conservative_iface_repeat_count = 1
+                            if _conservative_iface_repeat_count >= _conservative_iface_repeat_threshold:
+                                error_type = "DEFINITION_ZONE_ERROR"
+                                _conservative_override_reason = (
+                                    f"interface error repeated {_conservative_iface_repeat_count}x: "
+                                    f"{_primary_msg_B[:80]}"
+                                )
+                        else:
+                            # Non-interface error: reset the interface repeat counter.
+                            _conservative_iface_sig = ""
+                            _conservative_iface_repeat_count = 0
+
+                    # Log conservative override so operators can see why routing changed.
+                    if _conservative_override_reason:
+                        console.print(
+                            f"  [ConservativeOverride] {error_type} ← "
+                            f"{_conservative_override_reason}"
+                        )
+                    # ---- End conservative routing override gates ----
 
                     if error_type == "SIGNATURE_HALLUCINATION":
                         console.print(
@@ -2623,10 +2764,17 @@ def phase3_prove(
         if progress_detail == "normal":
             _closed_str  = ",".join(str(l) for l in _closed_ln)  or "—"
             _skipped_str = ",".join(str(l) for l in _skipped_ln) or "—"
+            _sum_src = last_sorry_in_attempt
+            _sum_cln = last_verify_result.get("sorry_declarations", _sum_src) if last_verify_result else _sum_src
+            _sum_blk = last_verify_result.get("blocked_sorry_count", 0)       if last_verify_result else 0
+            _sum_sorry_display = (
+                f"sorry={_sum_src} ({_sum_cln} clean, {_sum_blk} blocked)"
+                if _sum_blk > 0 else f"sorry={_sum_src}"
+            )
             console.print(
                 f"  [AttemptSummary] a{attempt}/{max_retries} "
                 f"turns={_total_turns_this_attempt} "
-                f"exit={last_exit_code} sorry={last_sorry_in_attempt} | "
+                f"exit={last_exit_code} {_sum_sorry_display} | "
                 f"closed=[{_closed_str}] skipped=[{_skipped_str}] "
                 f"esc=A2:{_attempt_esc_a2}/A6:{_attempt_esc_a6}/A7:{_attempt_esc_a7}"
             )
@@ -3198,6 +3346,7 @@ def phase3_prove(
         guidance,
         last_errors,
         best_checkpoint=best_checkpoint,
+        agent9_plan=_agent9_plan,
     )
     if _agent8_success:
         # Restore Glue/Layer0 if Agent8 agents modified them
@@ -3209,9 +3358,18 @@ def phase3_prove(
             _lp2_rel = str(_lp2.relative_to(PROJECT_ROOT))
             if snapshot_file(_lp2_rel) != _loriginal2:
                 registry.call("overwrite_file", path=_lp2_rel, content=_loriginal2)
-        # Verify with run_repo_verify for full-project clean build
+        # Verify full-project build is clean, then re-verify the target file
+        # specifically.  run_repo_verify builds the whole project (lake build) and
+        # only checks exit_code; it does NOT verify that the target algorithm has
+        # sorry=0 after Glue/Layer0 restoration.  We must confirm target is still
+        # clean to avoid a false-success when restoration reintroduces a sorry.
         _repo_result = registry.call("run_repo_verify")
-        if int(_repo_result.get("exit_code", 1)) == 0:
+        _target_recheck = registry.call("run_lean_verify", target_file)
+        if (
+            int(_repo_result.get("exit_code", 1)) == 0
+            and int(_target_recheck.get("exit_code", 1)) == 0
+            and int(_target_recheck.get("sorry_count", -1)) == 0
+        ):
             console.print("[green bold][Agent8] Decision Hub succeeded — Phase 3 complete.")
             return True, attempts, "", {
                 "execution_history": [r.__dict__ for r in execution_history],

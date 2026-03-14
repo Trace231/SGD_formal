@@ -1368,9 +1368,24 @@ AGENT_FILES: dict[str, list[str]] = {
         "Lib/Glue/Measurable.lean",
         "Lib/Glue/Calculus.lean",
     ],
+    "glue_filler": [
+        "docs/GLUE_TRICKS.md",
+        "docs/CATALOG.md",
+        "Lib/Glue/Algebra.lean",
+        "Lib/Glue/Calculus.lean",
+        "Lib/Glue/Probability.lean",
+        "Lib/Glue/Measurable.lean",
+        "Lib/Layer0/ConvexFOC.lean",
+        "Lib/Layer0/GradientFTC.lean",
+        "Lib/Layer0/IndepExpect.lean",
+    ],
     "diagnostician": [
         "docs/CONVENTIONS.md",
         "docs/GLUE_TRICKS.md",
+        "Lib/Glue/Algebra.lean",
+        "Lib/Glue/Probability.lean",
+        "Lib/Glue/Measurable.lean",
+        "Lib/Layer0/IndepExpect.lean",
     ],
     "interface_auditor": [
         "docs/CONVENTIONS.md",
@@ -1381,12 +1396,91 @@ AGENT_FILES: dict[str, list[str]] = {
         "Lib/Layer0/ConvexFOC.lean",
         "Lib/Layer0/GradientFTC.lean",
         "Lib/Layer0/IndepExpect.lean",
+        "Lib/Layer1/StochasticDescent.lean",
     ],
     "decision_hub": [
         "docs/CONVENTIONS.md",
         "docs/GLUE_TRICKS.md",
     ],
+    "strategy_planner": [
+        "docs/CONVENTIONS.md",
+        "docs/GLUE_TRICKS.md",
+        "Lib/Glue/Algebra.lean",
+        "Lib/Glue/Calculus.lean",
+        "Lib/Glue/Probability.lean",
+        "Lib/Glue/Measurable.lean",
+        "Lib/Layer0/ConvexFOC.lean",
+        "Lib/Layer0/GradientFTC.lean",
+        "Lib/Layer0/IndepExpect.lean",
+        "Lib/Layer1/StochasticDescent.lean",
+    ],
 }
+
+# -------------------------------------------------------------------
+# Agent 9 — Strategy Planner
+# -------------------------------------------------------------------
+
+SYSTEM_PROMPTS["strategy_planner"] = """\
+You are the Strategy Planner (Agent9) for the StochOptLib Lean 4 proof automation pipeline.
+
+## Your role
+You receive a compiled Lean 4 scaffold file (all theorem/lemma statements with `sorry`
+proof bodies) and a summary of the approved mathematical plan.  Your task is to produce
+a structured JSON proof plan that Agent8 (the Decision Hub) will use when dispatching
+repair actions during Phase 3.
+
+## Step-by-step protocol (MANDATORY)
+
+1. **Locate every theorem/lemma** in the scaffold file.
+   For each declaration, call `search_in_file` to find its exact line number:
+   ```json
+   {"type": "lookup", "tool_calls": [
+     {"tool": "search_in_file", "arguments": {"path": "<target_file>", "pattern": "theorem <name>"}}
+   ]}
+   ```
+   You MUST do this for every theorem — never guess line numbers.
+
+2. **Identify dependencies** by reading the declaration statement: which other
+   theorems or lemmas in the same file does each proof body rely on?
+
+3. **Map to library lemmas** by scanning the provided Lib file context and the
+   approved mathematical plan.  Use `search_codebase` if needed to confirm a lemma exists.
+
+4. **Estimate difficulty**: `low` = direct by `simp`/`ring`/`linarith`;
+   `medium` = requires 2-5 Mathlib lemmas; `high` = requires bridging lemmas or novel construction.
+
+5. **Determine recommended order**: topological sort by dependency (leaves first).
+
+## Output format (STRICT — JSON only, no prose)
+
+Output ONLY a single JSON object of this exact schema after all lookups are complete:
+
+```json
+{
+  "target_algo": "<algorithm name>",
+  "theorems": [
+    {
+      "name": "<theorem/lemma name>",
+      "lean_statement_line": <exact line number from search_in_file>,
+      "dependencies": ["<name of other theorems in this file it depends on>"],
+      "proof_strategy": "<1-3 sentence description of the proof approach>",
+      "key_lib_lemmas": ["<fully-qualified Lean identifier or short name>"],
+      "estimated_difficulty": "low|medium|high"
+    }
+  ],
+  "recommended_order": ["<theorem names in dependency-first order>"]
+}
+```
+
+Rules:
+- Output ONLY the JSON object. No markdown fences, no commentary.
+- `lean_statement_line` MUST be obtained via `search_in_file` — never invented.
+- `dependencies` lists only theorems in the SAME target file, not Lib lemmas.
+- `key_lib_lemmas` lists Lib/Mathlib identifiers referenced by the proof strategy.
+- `recommended_order` must be a permutation of all theorem names in `theorems`.
+- If a theorem has no identifiable proof strategy from the given plan, set
+  `proof_strategy` to `"unknown — inspect scaffold and plan"`.
+"""
 
 # -------------------------------------------------------------------
 # Agent 8 — Decision Hub (State Machine)
@@ -1424,6 +1518,45 @@ of each remaining error and dispatch the single best-suited agent to fix it.
 - **Human (Missing Assumption Gate):** Pauses automation and presents a
   diagnostic to the human operator. Used when a required mathematical
   assumption is missing from the theorem statement and cannot be inferred.
+
+## Investigation Protocol (optional, up to {AGENT8_INVESTIGATION_TURNS} rounds)
+
+Before producing your final JSON decision, you MAY issue read-only tool lookups
+by outputting a JSON object of the form:
+
+  {"type": "lookup", "tool_calls": [{"tool": "<tool_name>", "arguments": {...}}]}
+
+Supported tools: `read_file`, `search_codebase`, `search_in_file`, `run_lean_verify`.
+
+Use this when:
+- The error references a function/lemma whose signature is not visible in context.
+- You need to confirm whether a glue lemma already exists in staging or Lib/.
+- You want to see the full definition of a called function before routing.
+
+Do NOT investigate if the provided context already contains the needed information.
+After all lookups (or immediately), output your final JSON decision as specified below.
+
+## Error Delta Interpretation (read the Decision History carefully)
+
+Each entry in the Decision History now includes `before`, `after` (first 300 chars of
+errors before/after the action), and `sorry` delta information.  Use these to avoid
+repeating actions that made zero progress:
+
+- **`before` ≈ `after` AND sorry delta = 0**: the previous action made ZERO progress.
+  Do NOT choose the same action again. Escalate to the next level.
+- **sorry delta > 0** (sorry count increased): the previous action introduced regressions.
+  Deprioritize that action type; prefer `agent2_replan` or `agent7_signature` instead.
+- **sorry delta < 0** (sorry count decreased): partial progress was made.
+  Staying with the same action family is acceptable if the error type changed.
+- **`before` ≈ `after` across ALL recent ticks, multiple actions tried**: the error
+  is structurally unfixable by local patching. Escalate to `human_missing_assumption`.
+
+## Agent9 Structured Plan (if provided)
+
+When an Agent9 plan is available in the context, use `recommended_order` and
+`estimated_difficulty` to prioritize which theorem to target. Prefer to tackle
+low-difficulty, no-dependency theorems first, and hold high-difficulty theorems
+for after structural issues (signatures, missing glue) are resolved.
 
 ## PRIORITY RULES (STRICT — follow in order)
 
@@ -1491,3 +1624,10 @@ Rules:
 - For `agent2_replan`: `targeted_prompt` should explain what is wrong with the
   current strategy and suggest revision directions.
 """
+
+# Replace the investigation-turns placeholder with the configured value.
+from orchestrator.config import RETRY_LIMITS as _RL  # noqa: E402
+SYSTEM_PROMPTS["decision_hub"] = SYSTEM_PROMPTS["decision_hub"].replace(
+    "{AGENT8_INVESTIGATION_TURNS}",
+    str(_RL.get("AGENT8_INVESTIGATION_TURNS", 3)),
+)

@@ -10,6 +10,7 @@ from rich.panel import Panel
 from orchestrator.config import (
     AGENT_CONFIGS,
     MAX_TOKENS,
+    RETRY_LIMITS,
 )
 from orchestrator.file_io import generate_project_manifest, load_files
 from orchestrator.prompts import AGENT_FILES, SYSTEM_PROMPTS
@@ -85,15 +86,27 @@ class ToolRegistry:
         self.register("search_in_file_readonly", search_in_file_readonly)
         self.register("search_codebase", search_codebase)
 
+    def register_investigation_tools(self) -> None:
+        """Read-only tools + run_lean_verify for Agent8 investigation phase.
+
+        Intentionally excludes all write tools and check_lean_have to prevent
+        side-effects during the decision phase.
+        """
+        from orchestrator.tools import run_lean_verify
+
+        self.register_readonly_tools()
+        self.register("run_lean_verify", run_lean_verify)
+
     def register_staging_tools(self, target_algo: str = "") -> None:
         """Read-only tools + write_staging_lemma.  Used by Agent2 during mid-proof escalation."""
         import functools
 
-        from orchestrator.tools import edit_file_patch, run_lean_verify, write_staging_lemma
+        from orchestrator.tools import edit_file_patch, get_lean_goal, run_lean_verify, write_staging_lemma
 
         self.register_readonly_tools()
         self.register("run_lean_verify", run_lean_verify)
         self.register("edit_file_patch", edit_file_patch)
+        self.register("get_lean_goal", get_lean_goal)
         if target_algo:
             self.register(
                 "write_staging_lemma",
@@ -251,11 +264,13 @@ def diagnose(
     """
     from orchestrator.assumption_repair import parse_diagnosis_json
 
+    _a5_err_chars = RETRY_LIMITS.get("AGENT5_ERRORS_CHARS", 3000)
+    _a5_plan_chars = RETRY_LIMITS.get("AGENT5_PLAN_CHARS", 2000)
     raw = agent5.call(
         _DIAG_PROMPT_TEMPLATE.format(
             sorry_context=sorry_context,
-            build_errors=build_errors[:3000],
-            plan_text=plan_text[:2000],
+            build_errors=build_errors[:_a5_err_chars],
+            plan_text=plan_text[:_a5_plan_chars],
         )
     )
     structured = parse_diagnosis_json(raw)
