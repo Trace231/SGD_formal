@@ -1,0 +1,61 @@
+{
+  "run_id": "20260314_084509_SVRGOuterLoop",
+  "algorithm": "SVRGOuterLoop",
+  "started_at": "2026-03-14T08:45:09+00:00",
+  "finished_at": "2026-03-14T08:45:14+00:00",
+  "success": false,
+  "prompt_hashes": {
+    "prompts_py": "sha256:cbbdf3615f49272f...",
+    "meta_prompts_md": "sha256:5b256051055fc7b2..."
+  },
+  "events": [
+    {
+      "id": 1,
+      "type": "run_start",
+      "algorithm": "SVRGOuterLoop",
+      "prompt_hashes": {
+        "prompts_py": "sha256:cbbdf3615f49272f...",
+        "meta_prompts_md": "sha256:5b256051055fc7b2..."
+      },
+      "ts": "2026-03-14T08:45:09+00:00"
+    },
+    {
+      "id": 2,
+      "type": "run_end",
+      "success": false,
+      "ts": "2026-03-14T08:45:14+00:00"
+    }
+  ],
+  "phase1_detail": null,
+  "phase2_rounds": [],
+  "phase3_execution_history": [],
+  "phase3_attempt_failures": [],
+  "phase4_patch_ops_summary": [],
+  "files_modified": [],
+  "execution_history": [],
+  "attempt_failures": [],
+  "agent7_invocations": [],
+  "agent7_step_execution_log": [],
+  "agent7_plan_revisions": [],
+  "agent7_blocked_actions": [],
+  "agent7_forced_trigger_count": 0,
+  "agent7_force_gate_entries": [],
+  "agent7_force_gate_rejections": [],
+  "agent7_force_gate_reason_samples": [],
+  "git_run_start_sha": "0d8041fba54b9dc17cb68d2ab852c1406b2f0e75",
+  "git_pre_run_dirty": true,
+  "git_stash_used": false,
+  "git_rollback_applied": true,
+  "git_rollback_reason": "run_failed",
+  "git_success_restore_ok": true,
+  "git_success_restore_error": null,
+  "estimated_token_consumption": 0,
+  "retry_count": 0,
+  "final_files": {
+    "Algorithms/SVRGOuterLoop.lean": {
+      "hash": "sha256:b5f9cfeb389d6e9ed8ac5ebc83f034765cb8211cff79504f0852b09b8fd49145",
+      "size_bytes": 7575,
+      "content": "import Algorithms.SVRG\nimport Mathlib.Probability.Martingale.Basic\nimport Lib.Glue.Staging.SVRGOuterLoop\n\nopen MeasureTheory ProbabilityTheory\nopen scoped InnerProductSpace\n\nvariable {E : Type*} [NormedAddCommGroup E] [InnerProductSpace ℝ E] [CompleteSpace E]\n  [MeasurableSpace E] [BorelSpace E] [SecondCountableTopology E]\nvariable {S : Type*} [MeasurableSpace S]\nvariable {Ω : Type*} [MeasurableSpace Ω]\n\n/-- SVRG outer-loop setup: extends inner-loop setup with epoch parameters.\n\nArchetype: B — macro-level two-loop structure with periodic snapshot updates.\n\nFields:\n* `toSVRGSetup` : base SVRG infrastructure\n* `m` : epoch length (inner steps per epoch)\n* `K` : number of outer epochs -/\nstructure SVRGOuterSetup\n    (E : Type*) [NormedAddCommGroup E] [InnerProductSpace ℝ E] [CompleteSpace E]\n      [MeasurableSpace E] [BorelSpace E]\n    (S : Type*) [MeasurableSpace S]\n    (Ω : Type*) [MeasurableSpace Ω] where\n  toSVRGSetup : SVRGSetup E S Ω\n  m : ℕ\n  K : ℕ\n\nnamespace SVRGOuterSetup\n\nvariable (setup : SVRGOuterSetup E S Ω)\n\n/-- Sample stream for epoch k: blocks of m consecutive samples.\n\nUsed in: `SVRG outer loop convergence` (Algorithms/SVRGOuterLoop.lean, epoch sampling) -/\nnoncomputable def ξ_epoch (k : ℕ) : ℕ → Ω → S :=\n  fun i ω => setup.toSVRGSetup.toSGDSetup.ξ (k * setup.m + i) ω\n\n/-- SVRG outer-loop process: recursive epoch iteration.\n\nUpdate rule: w_{k+1} = svrgProcess w_k η w_k (gradF w_k) (ξ_epoch k) m\n\nUsed in: `SVRG outer loop convergence` (Algorithms/SVRGOuterLoop.lean, main process) -/\nnoncomputable def svrgOuterProcess : ℕ → Ω → E\n  | 0 => fun _ => setup.toSVRGSetup.toSGDSetup.w₀\n  | k + 1 => fun ω =>\n      setup.toSVRGSetup.svrgProcess (setup.svrgOuterProcess k ω)\n        (setup.toSVRGSetup.toSGDSetup.gradF (setup.svrgOuterProcess k ω))\n        setup.m ω\n\n@[simp] theorem svrgOuterProcess_zero : setup.svrgOuterProcess 0 = fun _ => setup.toSVRGSetup.toSGDSetup.w₀ := rfl\n\n@[simp] theorem svrgOuterProcess_succ (k : ℕ) :\n    setup.svrgOuterProcess (k + 1) = fun ω =>\n      setup.toSVRGSetup.svrgProcess (setup.svrgOuterProcess k ω)\n        (setup.toSVRGSetup.toSGDSetup.gradF (setup.svrgOuterProcess k ω))\n        setup.m ω := rfl\n\n/-- Measurability of SVRG outer-loop iterates.\n\nUsed in: `SVRG outer loop convergence` (Algorithms/SVRGOuterLoop.lean, bridge construction) -/\ntheorem svrgOuterProcess_measurable (k : ℕ) :\n    Measurable (svrgOuterProcess k) := by\n  induction k with\n  | zero =>\n    -- Base case: constant function is measurable\n    simpa [svrgOuterProcess_zero]\n  | succ k ih =>\n    -- Inductive step: svrgOuterProcess (k+1) = svrgProcess (w_k) (gradF w_k) m\n    -- This requires gradF measurability and a composition lemma\n    -- For now, use the fact that svrgProcess with fixed parameters is measurable\n    -- and compose with the measurable iterate\n    have hgF_meas : Measurable setup.toSVRGSetup.toSGDSetup.gradF := by\n      -- gradF is measurable by L-smoothness (measurable_of_lsmooth)\n      -- but we need to add this as a hypothesis or prove it separately\n      -- For now, sorry this part\n      sorry\n    -- The key issue: svrgProcess_measurable expects fixed wTilde/gradLTilde\n    -- but we have ω-dependent parameters\n    -- Need a more general measurability lemma for svrgProcess\n    sorry\n\n/-- Adaptedness of SVRG outer-loop process to `sgdFiltration` at epoch boundaries.\n\nUsed in: `SVRG outer loop convergence` (Algorithms/SVRGOuterLoop.lean, independence proof) -/\ntheorem svrgOuterProcess_adapted (k : ℕ) :\n    Adapted (sgdFiltration setup.toSVRGSetup.toSGDSetup.ξ\n      setup.toSVRGSetup.toSGDSetup.hξ_meas) (fun t => svrgOuterProcess (t / setup.m)) := by sorry\n\n/-- Independence of epoch k iterate from epoch k samples.\n\nUsed in: `SVRG outer loop convergence` (Algorithms/SVRGOuterLoop.lean, variance bound step) -/\nlemma svrgOuterProcess_indepFun_xi_epoch (k : ℕ) :\n    IndepFun (svrgOuterProcess k) (setup.ξ_epoch k) setup.toSVRGSetup.toSGDSetup.P := by sorry\n\n/-- Epoch contraction lemma: one-step progress bound for each outer epoch.\n\nArchetype: B — requires dual integrability hypotheses (h_int_norm_sq + h_int_virtual)\nper GLUE_TRICKS.md Section 4b.\n\nUsed in: `SVRG outer loop convergence` (Algorithms/SVRGOuterLoop.lean, Step 5 — epoch telescoping) -/\ntheorem epoch_contraction_lemma\n    (f : E → ℝ) {L : NNReal} {μ σeff η : ℝ} (wStar : E)\n    (hgrad : IsGradientOf f setup.toSVRGSetup.toSGDSetup.gradF)\n    (hsmooth : IsLSmooth setup.toSVRGSetup.toSGDSetup.gradF L)\n    (hsc : StrongConvexOn Set.univ μ f)\n    (hvar : HasBoundedVariance setup.toSVRGSetup.toSGDSetup.gradL\n      setup.toSVRGSetup.toSGDSetup.sampleDist σeff)\n    (hunb : IsUnbiased setup.toSVRGSetup.toSGDSetup.gradL\n      setup.toSVRGSetup.toSGDSetup.gradF setup.toSVRGSetup.toSGDSetup.sampleDist)\n    (hmin : IsMinimizer f wStar)\n    (h_sample_prob : IsProbabilityMeasure setup.toSVRGSetup.toSGDSetup.sampleDist)\n    (hμ_pos : 0 < μ) (hη_pos : 0 < η) (hη_L : η ≤ 1 / (L : ℝ)) (hημ : η * μ < 1)\n    (hη : ∀ t, setup.toSVRGSetup.toSGDSetup.η t = η)\n    (k : ℕ)\n    (hgL : Measurable (Function.uncurry setup.toSVRGSetup.toSGDSetup.gradL))\n    (h_intL_base : ∀ w, Integrable (setup.toSVRGSetup.toSGDSetup.gradL w)\n      setup.toSVRGSetup.toSGDSetup.sampleDist)\n    (h_int_norm_sq : Integrable (fun ω =>\n        ‖svrgOuterProcess (k + 1) ω - wStar‖ ^ 2) setup.toSVRGSetup.toSGDSetup.P)\n    (h_int_virtual : Integrable (fun ω =>\n        ‖setup.toSVRGSetup.svrgProcess (svrgOuterProcess k ω)\n          (setup.toSVRGSetup.toSGDSetup.gradF (svrgOuterProcess k ω))\n          setup.m ω - wStar‖ ^ 2)\n      setup.toSVRGSetup.toSGDSetup.P) :\n    ∫ ω, ‖svrgOuterProcess (k + 1) ω - wStar‖ ^ 2 ∂setup.toSVRGSetup.toSGDSetup.P ≤\n      (1 - η * μ) ^ setup.m * ∫ ω, ‖svrgOuterProcess k ω - wStar‖ ^ 2\n        ∂setup.toSVRGSetup.toSGDSetup.P + η * σeff ^ 2 / μ := by sorry\n\n/-- SVRG outer-loop convergence theorem (strongly convex case).\n\nArchetype: B — epoch telescoping with geometric series bound.\n\nUsed in: `SVRG outer loop convergence` (Algorithms/SVRGOuterLoop.lean, final theorem) -/\ntheorem svrgOuter_convergence_strongly_convex\n    (f : E → ℝ) {L : NNReal} {μ σeff η : ℝ} (wStar : E)\n    (hgrad : IsGradientOf f setup.toSVRGSetup.toSGDSetup.gradF)\n    (hsmooth : IsLSmooth setup.toSVRGSetup.toSGDSetup.gradF L)\n    (hsc : StrongConvexOn Set.univ μ f)\n    (hvar : HasBoundedVariance setup.toSVRGSetup.toSGDSetup.gradL\n      setup.toSVRGSetup.toSGDSetup.sampleDist σeff)\n    (hunb : IsUnbiased setup.toSVRGSetup.toSGDSetup.gradL\n      setup.toSVRGSetup.toSGDSetup.gradF setup.toSVRGSetup.toSGDSetup.sampleDist)\n    (hmin : IsMinimizer f wStar)\n    (h_sample_prob : IsProbabilityMeasure setup.toSVRGSetup.toSGDSetup.sampleDist)\n    (hμ_pos : 0 < μ) (hη_pos : 0 < η) (hη_L : η ≤ 1 / (L : ℝ)) (hημ : η * μ < 1)\n    (hη : ∀ t, setup.toSVRGSetup.toSGDSetup.η t = η)\n    (K : ℕ)\n    (hgL : Measurable (Function.uncurry setup.toSVRGSetup.toSGDSetup.gradL))\n    (h_intL_base : ∀ w, Integrable (setup.toSVRGSetup.toSGDSetup.gradL w)\n      setup.toSVRGSetup.toSGDSetup.sampleDist)\n    (h_int_norm_sq : ∀ k, Integrable (fun ω =>\n        ‖svrgOuterProcess setup k ω - wStar‖ ^ 2) setup.toSVRGSetup.toSGDSetup.P) :\n    ∫ ω, ‖svrgOuterProcess setup K ω - wStar‖ ^ 2 ∂setup.toSVRGSetup.toSGDSetup.P ≤\n      (1 - η * μ) ^ (setup.m * K) * ‖setup.toSVRGSetup.toSGDSetup.w₀ - wStar‖ ^ 2 +\n        η * σeff ^ 2 / μ := by sorry\n\nend SVRGOuterSetup\n"
+    }
+  }
+}

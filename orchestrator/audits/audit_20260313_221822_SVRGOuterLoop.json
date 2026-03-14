@@ -1,0 +1,61 @@
+{
+  "run_id": "20260313_221822_SVRGOuterLoop",
+  "algorithm": "SVRGOuterLoop",
+  "started_at": "2026-03-13T22:18:22+00:00",
+  "finished_at": "2026-03-13T22:18:42+00:00",
+  "success": false,
+  "prompt_hashes": {
+    "prompts_py": "sha256:ae3ad7ba5675ac2a...",
+    "meta_prompts_md": "sha256:5b256051055fc7b2..."
+  },
+  "events": [
+    {
+      "id": 1,
+      "type": "run_start",
+      "algorithm": "SVRGOuterLoop",
+      "prompt_hashes": {
+        "prompts_py": "sha256:ae3ad7ba5675ac2a...",
+        "meta_prompts_md": "sha256:5b256051055fc7b2..."
+      },
+      "ts": "2026-03-13T22:18:22+00:00"
+    },
+    {
+      "id": 2,
+      "type": "run_end",
+      "success": false,
+      "ts": "2026-03-13T22:18:42+00:00"
+    }
+  ],
+  "phase1_detail": null,
+  "phase2_rounds": [],
+  "phase3_execution_history": [],
+  "phase3_attempt_failures": [],
+  "phase4_patch_ops_summary": [],
+  "files_modified": [],
+  "execution_history": [],
+  "attempt_failures": [],
+  "agent7_invocations": [],
+  "agent7_step_execution_log": [],
+  "agent7_plan_revisions": [],
+  "agent7_blocked_actions": [],
+  "agent7_forced_trigger_count": 0,
+  "agent7_force_gate_entries": [],
+  "agent7_force_gate_rejections": [],
+  "agent7_force_gate_reason_samples": [],
+  "git_run_start_sha": "5aa0b20e8d9bb938b55b5da7465334f3efe30199",
+  "git_pre_run_dirty": true,
+  "git_stash_used": false,
+  "git_rollback_applied": true,
+  "git_rollback_reason": "run_failed",
+  "git_success_restore_ok": true,
+  "git_success_restore_error": null,
+  "estimated_token_consumption": 0,
+  "retry_count": 0,
+  "final_files": {
+    "Algorithms/SVRGOuterLoop.lean": {
+      "hash": "sha256:6dd3a028257c54fb8e1ed84128c8470eee0c2aa83ea47d1e06a3ed46d2c715f6",
+      "size_bytes": 3944,
+      "content": "import Algorithms.SVRG\nimport Lib.Glue.Probability\nimport Lib.Glue.Algebra\nimport Lib.Glue.Measurable\nimport Lib.Glue.Calculus\n\nopen MeasureTheory ProbabilityTheory\nopen scoped InnerProductSpace\n\nvariable {E : Type*} [NormedAddCommGroup E] [InnerProductSpace ℝ E] [CompleteSpace E]\n  [MeasurableSpace E] [BorelSpace E] [SecondCountableTopology E]\nvariable {S : Type*} [MeasurableSpace S]\nvariable {Ω : Type*} [MeasurableSpace Ω]\n\n/-- SVRG outer-loop setup: manages epoch-level snapshot updates.\n\nEach epoch k computes a snapshot wTilde_k and its full gradient gradLTilde_k,\nthen runs an inner loop of m_k steps using the SVRG oracle.\n\nUsed in: `svrg_outer_convergence_strongly_convex` (Algorithms/SVRGOuterLoop.lean, main theorem) -/\nstructure SVRGOuterSetup\n    (E : Type*) [NormedAddCommGroup E] [InnerProductSpace ℝ E] [CompleteSpace E]\n      [MeasurableSpace E] [BorelSpace E]\n    (S : Type*) [MeasurableSpace S]\n    (Ω : Type*) [MeasurableSpace Ω] where\n  toSVRGSetup : SVRGSetup E S Ω\n  /-- Number of inner-loop steps per outer epoch. -/\n  m : ℕ\n  /-- Step size for inner loop. -/\n  η : ℝ\n  /-- Initial snapshot for epoch 0. -/\n  wTilde₀ : E\n\nnamespace SVRGOuterSetup\n\n/-- Sample distribution inherited from the base setup.\n\nUsed in: `svrg_outer_convergence_strongly_convex` (Algorithms/SVRGOuterLoop.lean, measure hypothesis) -/\nnoncomputable def sampleDist (setup : SVRGOuterSetup E S Ω) : Measure S :=\n  setup.toSVRGSetup.toSGDSetup.sampleDist\n\n/-- Full gradient computation at a snapshot point.\n\nFor finite-sum problems: gradF(w) = (1/n) * ∑_{i=1}^n gradL_i(w).\nThis is a deterministic computation (not stochastic).\n\nUsed in: `svrg_outer_process_def` (Algorithms/SVRGOuterLoop.lean, epoch transition) -/\nnoncomputable def fullGradient (setup : SVRGOuterSetup E S Ω) (f : E → ℝ) (w : E) : E :=\n  setup.toSVRGSetup.toSGDSetup.gradF w\n\n/-- Outer-loop process: tracks snapshots across epochs.\n\n`outerProcess k ω` = snapshot wTilde_k at the start of epoch k (random variable).\nThe process evolves as:\n  - wTilde_0 = wTilde₀ (deterministic)\n  - wTilde_{k+1}(ω) = result of inner loop (step m) starting from wTilde_k\n\nNote: This uses a simplified model where all inner-loop randomness for epoch k\nis compressed into a single sample. A more detailed model would use a product\nspace Ω^ℕ for independent samples across epochs.\n\nUsed in: `svrg_outer_convergence_strongly_convex` (Algorithms/SVRGOuterLoop.lean, main theorem) -/\nnoncomputable def outerProcess (setup : SVRGOuterSetup E S Ω) (f : E → ℝ) : ℕ → Ω → E\n  | 0 => fun _ => setup.wTilde₀\n  | k + 1 => fun ω =>\n      let wTilde := outerProcess setup f k ω\n      let gradLTilde := fullGradient setup f wTilde\n      -- After m inner steps, the final iterate becomes the next snapshot\n      setup.toSVRGSetup.svrgProcess wTilde gradLTilde setup.m ω\n\n/-- Inner-loop process for epoch k with a fixed (deterministic) snapshot.\n\nFor convergence analysis, we condition on the snapshot wTilde_k from epoch k\nand analyze the inner loop as a fixed-snapshot SVRG process.\n\nUsed in: `svrg_outer_convergence_strongly_convex` (Algorithms/SVRGOuterLoop.lean, epoch analysis) -/\nnoncomputable def innerProcess (setup : SVRGOuterSetup E S Ω) (f : E → ℝ)\n    (wTilde : E) : ℕ → Ω → E :=\n  let gradLTilde := fullGradient setup f wTilde\n  setup.toSVRGSetup.svrgProcess wTilde gradLTilde\n\n/-- Constant step size for inner loop (derived from setup.η).\n\nUsed in: `svrg_outer_convergence_strongly_convex` (Algorithms/SVRGOuterLoop.lean, step size hypothesis) -/\ntheorem inner_step_size_const (setup : SVRGOuterSetup E S Ω) (t : ℕ) : setup.η = setup.η := rfl\n\n/-- Snapshot at epoch 0.\n\nUsed in: `svrg_outer_convergence_strongly_convex` (Algorithms/SVRGOuterLoop.lean, base case) -/\n@[simp] theorem outerProcess_zero (setup : SVRGOuterSetup E S Ω) (f : E → ℝ) :\n    outerProcess setup f 0 = fun _ => setup.wTilde₀ := rfl\n\nend SVRGOuterSetup\n\n"
+    }
+  }
+}
