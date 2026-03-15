@@ -101,7 +101,7 @@ def read_file(
         Returns an error string (not an exception) for out-of-bounds requests.
     """
     resolved = _resolve_allowed_path(path, _READ_WRITE_ALLOWLIST)
-    read_path = _map_for_read(resolved)
+    read_path = resolved
     lines = read_path.read_text(encoding="utf-8").splitlines(keepends=True)
     total = len(lines)
 
@@ -161,7 +161,7 @@ def search_in_file(
           matches (list of {line, content, context}).
     """
     resolved = _resolve_allowed_path(path, _READ_WRITE_ALLOWLIST)
-    read_path = _map_for_read(resolved)
+    read_path = resolved
     lines = read_path.read_text(encoding="utf-8").splitlines()
 
     all_match_indices: list[int] = [
@@ -227,7 +227,7 @@ def read_file_readonly(
         with_line_numbers: Prefix each line with its line number (default: True).
     """
     resolved = _resolve_allowed_path(path, _READ_ONLY_ALLOWLIST)
-    read_path = _map_for_read(resolved)
+    read_path = resolved
     lines = read_path.read_text(encoding="utf-8").splitlines(keepends=True)
     total = len(lines)
 
@@ -280,7 +280,7 @@ def search_in_file_readonly(
         max_matches: Maximum number of matches to return (default 20).
     """
     resolved = _resolve_allowed_path(path, _READ_ONLY_ALLOWLIST)
-    read_path = _map_for_read(resolved)
+    read_path = resolved
     lines = read_path.read_text(encoding="utf-8").splitlines()
 
     all_match_indices: list[int] = [
@@ -336,7 +336,7 @@ def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, A
         raise ValueError("old_str must be non-empty for precise patching")
 
     resolved = _resolve_allowed_path(path, _READ_WRITE_ALLOWLIST)
-    write_path = _map_for_write(resolved)
+    write_path = resolved
     if not write_path.exists():
         raise FileNotFoundError(f"Target file does not exist: {path}")
 
@@ -386,7 +386,7 @@ def write_new_file(path: str | Path, content: str) -> dict[str, Any]:
     to modify an existing file.
     """
     resolved = _resolve_allowed_path(path, _READ_WRITE_ALLOWLIST)
-    write_path = _map_for_write(resolved)
+    write_path = resolved
     if write_path.exists():
         raise FileExistsError(
             f"File already exists: {path}. Use edit_file_patch to modify it."
@@ -403,7 +403,7 @@ def write_new_file(path: str | Path, content: str) -> dict[str, Any]:
 def overwrite_file(path: str | Path, content: str) -> dict[str, Any]:
     """Overwrite an existing file with content. Used for restore/rollback."""
     resolved = _resolve_allowed_path(path, _READ_WRITE_ALLOWLIST)
-    write_path = _map_for_write(resolved)
+    write_path = resolved
     if not write_path.exists():
         raise FileNotFoundError(f"Target file does not exist: {path}")
     original = write_path.read_text(encoding="utf-8")
@@ -509,7 +509,7 @@ def check_lean_have(
     # Allow reading from all allowed paths (read-write AND read-only)
     _all_readable = _READ_WRITE_ALLOWLIST + _READ_ONLY_ALLOWLIST
     resolved_ws = _resolve_allowed_path(file_path, _all_readable)
-    source_path = _map_for_read(resolved_ws)
+    source_path = resolved_ws
 
     if not source_path.exists():
         return {
@@ -604,6 +604,101 @@ def check_lean_have(
         tmp_path.unlink(missing_ok=True)
 
 
+def check_lean_expr(
+    expr: str,
+    context_imports: str = "import Main",
+) -> dict[str, Any]:
+    """Query the actual Lean-inferred type of *expr* without modifying any file.
+
+    Creates a minimal temp file containing *context_imports* followed by
+    ``#check @<expr>``, elaborates it with ``lake env lean``, and parses the
+    ``information:`` line from the output.  All pre-compiled ``.olean``
+    dependencies are reused via the lake environment, so this is fast.
+
+    Typical use-cases for Agent7:
+    - Verify the current Mathlib signature of a lemma (e.g. ``integral_nonneg``)
+      before writing a ``direct_apply`` patch.
+    - Check whether an identifier exists at all (unknown identifier → lemma absent
+      or renamed).
+    - Confirm argument counts and implicit/explicit structure for any function.
+
+    Args:
+        expr:             Lean expression to ``#check``, e.g. ``"integral_nonneg"``.
+                          The ``@`` prefix is added automatically to expose all
+                          implicit arguments in the printed type.
+        context_imports:  Import preamble placed at the top of the temp file.
+                          Defaults to ``"import Main"`` which transitively pulls
+                          in all project dependencies including Mathlib.  Pass a
+                          more specific import (e.g. ``"import Mathlib.MeasureTheory.Integral.Bochner.Basic"``)
+                          to reduce elaboration time.
+
+    Returns::
+
+        {
+          "success":  bool,        # True when #check compiled without error
+          "expr":     str,         # echo of input expr
+          "type":     str,         # inferred type string (empty on failure)
+          "raw":      str,         # full lake output for debugging
+          "errors":   list[str],   # error lines (empty on success)
+        }
+
+    The original project files are never modified.
+    """
+    import subprocess
+    import uuid
+
+    tmp_name = f"_LeanExprCheck_{uuid.uuid4().hex[:8]}.lean"
+    tmp_path = PROJECT_ROOT / tmp_name
+    content = f"{context_imports.strip()}\n\n#check @{expr}\n"
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        proc = subprocess.run(
+            ["lake", "env", "lean", tmp_name],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        raw = proc.stdout + proc.stderr
+
+        # Extract the type from "information: <type>" line emitted by #check.
+        inferred_type = ""
+        for line in raw.splitlines():
+            stripped = line.strip()
+            # Lean 4 emits: "_LeanExprCheck_xxx.lean:N:M: information: @foo : <type>"
+            # or simply:    "information: @foo : <type>"
+            if "information:" in stripped:
+                # Take everything after the last "information:" token
+                info_part = stripped.split("information:", 1)[-1].strip()
+                # Drop the leading "@<expr> :" prefix to isolate the type
+                colon_idx = info_part.find(" : ")
+                if colon_idx != -1:
+                    inferred_type = info_part[colon_idx + 3:].strip()
+                else:
+                    inferred_type = info_part.strip()
+                break
+
+        error_lines = _extract_lean_error_lines(raw)
+        success = proc.returncode == 0 and bool(inferred_type)
+        return {
+            "success": success,
+            "expr": expr,
+            "type": inferred_type,
+            "raw": raw[:4000],
+            "errors": error_lines,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "expr": expr,
+            "type": "",
+            "raw": "",
+            "errors": ["check_lean_expr timed out after 120 s"],
+        }
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def get_lean_goal(
     file_path: str | Path,
     sorry_line: int,
@@ -667,7 +762,7 @@ def get_lean_goal(
 def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     """Run Lean verification and return a JSON-serializable result."""
     resolved = _resolve_allowed_path(file_path, _LEAN_VERIFY_ALLOWLIST)
-    source_path = _map_for_read(resolved)
+    source_path = resolved
 
     # Guard: do not run lake build if the target file does not yet exist.
     if not source_path.exists():
@@ -944,7 +1039,7 @@ def apply_doc_patch(path: str | Path, anchor: str, new_content: str) -> dict[str
         raise ValueError("new_content must be non-empty")
 
     resolved = _resolve_allowed_path(path, _DOC_ALLOWLIST)
-    write_path = _map_for_write(resolved)
+    write_path = resolved
     if not write_path.exists():
         raise FileNotFoundError(f"Target doc file does not exist: {path}")
 

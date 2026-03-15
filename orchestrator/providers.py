@@ -66,7 +66,7 @@ _RETRYABLE_ERRORS = frozenset({
     "APIConnectionError",
     "APITimeoutError",
 })
-_RETRY_DELAYS = (2, 4, 8)  # seconds between attempts 1→2, 2→3, 3→4
+_RETRY_DELAYS = (2, 4, 8, 16, 32)  # seconds between attempts 1→2 … 5→6
 
 
 def call_llm(
@@ -80,7 +80,7 @@ def call_llm(
     """Send *messages* to the LLM behind *provider*/*model* and return the
     assistant reply as a plain string.
 
-    Retries up to 3 times (4 total attempts) with exponential backoff on
+    Retries up to 5 times (6 total attempts) with exponential backoff on
     transient network errors (timeouts, connection drops).  All other
     exceptions are re-raised immediately.
     """
@@ -92,7 +92,7 @@ def call_llm(
             if type(exc).__name__ not in _RETRYABLE_ERRORS or delay is None:
                 raise
             last_exc = exc
-            print(f"[LLM] {type(exc).__name__} on attempt {attempt}/3, retrying in {delay}s…")
+            print(f"[LLM] {type(exc).__name__} on attempt {attempt}/5, retrying in {delay}s…")
             time.sleep(delay)
     raise last_exc  # type: ignore[misc]  # unreachable, satisfies type checker
 

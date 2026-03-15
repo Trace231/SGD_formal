@@ -11,6 +11,37 @@ For how to structure a new algorithm's file within THIS library, see
 
 ---
 
+## Section 0 — Known Mathlib API Changes
+
+**Read this FIRST before using any lemma listed below.**
+These are confirmed API changes between Mathlib versions that have caused
+proof failures in this project. Always use `check_lean_expr` to verify the
+current signature when uncertain.
+
+| Symbol | Broken usage | Correct usage | Notes |
+|--------|-------------|---------------|-------|
+| `integral_nonneg` | `integral_nonneg h_int hf` (2 args: Integrable + nonneg) | `integral_nonneg hf` (1 arg: `∀ a, 0 ≤ f a`) | Integrable arg was removed; the lemma now only requires pointwise non-negativity |
+| `real_inner_comm` | `rw [real_inner_comm]` (bare, no explicit args) | `rw [real_inner_comm u v]` (explicit universe args required) | Always supply the two vectors explicitly: `real_inner_comm (u : E) (v : E)` |
+| `norm_sq_nonneg` | `norm_sq_nonneg x` | `sq_nonneg ‖x‖` | Renamed; `norm_sq_nonneg` no longer exists as a standalone lemma |
+| `inner_comm` | `inner_comm` (bare) | `inner_comm u v` (explicit) | Same as `real_inner_comm` — explicit args required in both |
+
+**Verification workflow (MANDATORY before any `direct_apply` patch):**
+```lean
+-- Use check_lean_expr to get the actual current signature:
+check_lean_expr("integral_nonneg")
+-- Expected output: (h : ∀ (a : α), 0 ≤ f a) → 0 ≤ ∫ a, f a ∂μ
+-- If output differs, update your patch accordingly.
+```
+
+**Ghost symbol detection:**
+If `search_codebase` and `check_lean_expr` both fail for an identifier, it is a
+"ghost" — likely a reference to a lemma in a file that was deleted or renamed.
+Search for similar names with `search_codebase("<partial_name>")` and look in the
+local namespace (e.g., if `sgdProcess_zero` is missing, try `process_zero` within
+the `SubgradientSetup` namespace).
+
+---
+
 ## Section 1 — Gap Classification
 
 Before searching for a proof, classify what kind of gap you have. This determines

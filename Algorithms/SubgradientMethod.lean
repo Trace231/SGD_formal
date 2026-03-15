@@ -73,9 +73,12 @@ noncomputable def process : ℕ → Ω → E
   | 0, _ => setup.w₀
   | t + 1, ω => process t ω - setup.η t • setup.gradL (process t ω) (setup.ξ t ω)
 
-@[simp] theorem process_zero (ω : Ω) : process 0 ω = w₀ := rfl
-@[simp] theorem process_succ (t : ℕ) (ω : Ω) :
-    process (t + 1) ω = process t ω - η t • gradL (process t ω) (ξ t ω) := rfl
+omit [SecondCountableTopology E] in
+@[simp]
+theorem process_zero : process 0 = fun _ => setup.w₀ := rfl
+omit [SecondCountableTopology E] in
+@[simp]
+theorem process_succ (t : ℕ) : process (t + 1) = fun ω => process t ω - setup.η t • setup.gradL (process t ω) (setup.ξ t ω) := rfl
 
 end SubgradientSetup
 
@@ -116,7 +119,7 @@ theorem subgradient_convergence_convex
               setup.process t ω - wStar⟫_ℝ
           + (setup.η t) ^ 2 * ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 :=
       fun ω => by
-        simp [process_succ]
+        simp [setup.process_succ t]
         rw [norm_sq_sgd_step (setup.process t ω)
           (setup.gradL (setup.process t ω) (setup.ξ t ω)) wStar (setup.η t)]
         rw [real_inner_comm]
@@ -197,7 +200,7 @@ theorem subgradient_convergence_convex
         (∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P -
           ∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P) =
         ∫ ω, ‖setup.process T ω - wStar‖ ^ 2 ∂setup.P - ∫ ω, ‖setup.process 0 ω - wStar‖ ^ 2 ∂setup.P := by
-      rw [Finset.sum_range_sub, SubgradientSetup.process, sgdProcess_zero]
+      rw [Finset.sum_range_sub]
       <;> simp
     have h_tel_bound : ∑ t ∈ Finset.range T,
         (∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P -
@@ -210,7 +213,7 @@ theorem subgradient_convergence_convex
     have h_nonneg : 0 ≤ ∫ ω, ‖setup.process T ω - wStar‖ ^ 2 ∂setup.P :=
       integral_nonneg (h_int_norm_sq T) (fun _ => norm_sq_nonneg _ _)
     have h_w0 : ∫ ω, ‖setup.process 0 ω - wStar‖ ^ 2 ∂setup.P = ‖setup.w₀ - wStar‖ ^ 2 := by
-      rw [process_zero]
+      rw [SubgradientSetup.process_zero setup]
       simp
     calc
       2 * η * ∑ t ∈ Finset.range T, (∫ ω, f (setup.process t ω) ∂setup.P - f wStar)

@@ -319,7 +319,7 @@ RETRY_LIMITS: dict[str, int] = {
     "AGENT7_FORCE_AFTER_SOFT_WARN": 1,
     "DEFINITION_ZONE_FORCE_AGENT7_AFTER_N": 2,
     # Per-sorry turn budget (used by per-sorry loop)
-    "PER_SORRY_TURNS": 20,
+    "PER_SORRY_TURNS": 30,
     # Context eviction: clear Agent3 conversation history every N attempts to prevent
     # context pollution from accumulated failed attempts.
     "AGENT3_CONTEXT_EVICT_EVERY_N": 3,

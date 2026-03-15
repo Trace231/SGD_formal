@@ -282,7 +282,7 @@ def _build_preemptive_agent7_prompt(
         "[Preemptive invocation — triggered by Agent2 routing decision]\n\n"
         f"Agent2 diagnosis:\n{hint[:1200]}\n\n"
         f"Latest build errors:\n```\n{last_verify_text[:2000]}\n```\n\n"
-        f"Current file snippet:\n```lean\n{snippet[:8000]}\n```\n\n"
+        f"Current file (full when ≤500 lines):\n```lean\n{snippet[:20000]}\n```\n\n"
         f"Dependency signatures:\n```lean\n{dep_sigs[:4000]}\n```\n\n"
         "Return strict JSON only as specified in your system prompt."
     )
@@ -657,8 +657,8 @@ def phase3_prove(
     # ------------------------------------------------------------------
     # Phase 5/7 — Proof Fill: Agent3 / Agent8 close all sorry placeholders.
     # ------------------------------------------------------------------
-    console.rule("[bold cyan]Phase 5/7 — Proof Fill  [Agent3 / Agent8]")
-    _prog_update("Phase 5/7: Proof filling  [Agent3 / Agent8]...")
+    console.rule("[bold cyan]Phase 5/7 — Proof Fill  [Agent8]")
+    _prog_update("Phase 5/7: Proof filling  [Agent8]...")
 
     for attempt in range(1, max_retries + 1):
         attempts = attempt
@@ -861,6 +861,21 @@ def phase3_prove(
         _err_sig: str = ""
 
         # -------------------------------------------------------------------
+        # Baseline error snapshot: capture errors BEFORE Agent3 touches the file.
+        # Used by Agent8 MidCheck to distinguish pre-existing API/structural errors
+        # from errors Agent3 introduces during its attempts.
+        # -------------------------------------------------------------------
+        try:
+            _baseline_verify = registry.call("run_lean_verify", target_file)
+            _baseline_errors_text: str = "\n".join(
+                _baseline_verify.get("errors", [])
+            ) or _baseline_verify.get("errors", "")
+            if isinstance(_baseline_errors_text, list):
+                _baseline_errors_text = "\n".join(_baseline_errors_text)
+        except Exception:
+            _baseline_errors_text = ""
+
+        # -------------------------------------------------------------------
         # Per-sorry loop: each iteration focuses Agent3 on one sorry line.
         # -------------------------------------------------------------------
         for _active_sorry_line in _sorry_iter:
@@ -1027,6 +1042,7 @@ def phase3_prove(
                             agent9_plan=locals().get("_agent9_plan"),
                             decision_history=None,  # fresh per mid-check; no shared history
                             turns_elapsed=_total_turns_this_attempt,
+                            baseline_errors=_baseline_errors_text,
                         )
                         _mc_action = _mc_decision.get("action", "agent3_tactical")
                         _mc_prompt = _mc_decision.get("targeted_prompt", "")
@@ -1275,7 +1291,7 @@ def phase3_prove(
                         f"Diagnosis:\n{diagnosis}\n\n"
                         f"Dependency symbols hint:\n{_dep_syms_text}\n\n"
                         f"Recent failures:\n```\n{_recent_failures_text}\n```\n\n"
-                        f"Current snippet:\n```lean\n{current_snippet[:8000]}\n```\n\n"
+                        f"Current file (full when ≤500 lines):\n```lean\n{current_snippet[:20000]}\n```\n\n"
                         f"Dependency signatures:\n```lean\n{dep_sigs[:4000]}\n```\n\n"
                         "Return strict JSON only as specified in your system prompt."
                     )
@@ -1762,7 +1778,7 @@ def phase3_prove(
                             f"Diagnosis:\n{diagnosis}\n\n"
                             + (f"Agent2 routing hint:\n{_a7_hint_mid}\n\n" if _a7_hint_mid else "")
                             + f"Agent2 analysis:\n{new_guidance[:2000]}\n\n"
-                            f"Current snippet:\n```lean\n{_agent7_esc_snippet[:6000]}\n```\n\n"
+                            f"Current file (full when ≤500 lines):\n```lean\n{_agent7_esc_snippet[:20000]}\n```\n\n"
                             "Return strict JSON only as specified in your system prompt."
                         )
                         _plan_obj_esc, _raw_plan_esc = _call_agent7_with_tools(
@@ -2026,7 +2042,7 @@ def phase3_prove(
                                 f"Line: {_line_int}\n"
                                 f"Latest verify errors:\n```\n{last_verify_text[:2000]}\n```\n\n"
                                 f"Recent failures:\n```\n{_recent_failures}\n```\n\n"
-                                f"Current snippet:\n```lean\n{current_snippet[:8000]}\n```\n\n"
+                                f"Current file (full when ≤500 lines):\n```lean\n{current_snippet[:20000]}\n```\n\n"
                                 f"Dependency signatures:\n```lean\n{dep_sigs[:4000]}\n```\n\n"
                                 "Return strict JSON protocol only."
                             )
@@ -2730,11 +2746,13 @@ def phase3_prove(
                 )
                 last_sorry_in_attempt = int(best_checkpoint["sorry_count"])
                 last_sorry_count = last_sorry_in_attempt
-                last_exit_code = 0
-                last_errors = ""
+                _restore_result = registry.call("run_lean_verify", target_file)
+                last_exit_code = 0 if _restore_result["success"] else 1
+                last_errors = "\n".join(_restore_result.get("errors", []))
                 console.print(
                     f"  [InvariantRestore] exit=1 at sorry boundary — "
                     f"restored checkpoint (sorry={best_checkpoint['sorry_count']})"
+                    f" → re-verify exit={last_exit_code}"
                 )
 
             if _break_attempt:

@@ -1073,10 +1073,33 @@ JSON protocol for Agent3. You do NOT edit files directly.
 
 ## Input
 You receive:
-- target file snippets around failing lines
+- target file content (full file when ≤500 lines, otherwise snippets around failing lines)
 - dependency snippets/signatures
 - recent failure history (line oscillation, sorry trajectory)
 - primary error and diagnosis text
+- baseline errors (errors that existed BEFORE Agent3 started — distinguish these from
+  errors Agent3 introduced. Focus your protocol on fixing baseline errors first.)
+
+## MANDATORY FIRST STEP: check_lean_expr for any unknown identifier or API mismatch
+
+Before writing your protocol, for EVERY symbol involved in the error:
+1. Call check_lean_expr(expr="<symbol>") to get the current Lean-inferred type.
+2. If the symbol is unknown → it was renamed or is absent. search_codebase for similar names.
+3. Compare the inferred type against the callsite usage. The argument count, implicit/explicit
+   distinction, and return type must all match.
+
+This is NON-NEGOTIABLE. Do not guess a signature — verify it with check_lean_expr first.
+The tool is fast (reuses pre-built .olean files). It prevents wrong direct_apply patches.
+
+Examples of check_lean_expr usage:
+  check_lean_expr("integral_nonneg")
+  → type reveals: "(h : ∀ (a : α), 0 ≤ f a) → 0 ≤ ∫ a, f a ∂μ"  (1 argument, not 2)
+
+  check_lean_expr("real_inner_comm")
+  → type reveals: requires explicit (u v : E) arguments
+
+  check_lean_expr("sgdProcess_zero")
+  → error: unknown identifier → symbol absent, search for replacement
 
 ## Output (JSON only, no markdown/prose)
 Return ONLY:
@@ -1085,9 +1108,9 @@ Return ONLY:
   "mismatch_table": [
     {
       "symbol": "<callee>",
-      "declared_signature": "<observed declaration>",
+      "declared_signature": "<check_lean_expr result or observed declaration>",
       "callsite_signature": "<observed usage>",
-      "mismatch_kind": "arity|domain|codomain|field_missing|namespace|other",
+      "mismatch_kind": "arity|domain|codomain|field_missing|namespace|unknown_identifier|other",
       "evidence": "<short evidence>"
     }
   ],
@@ -1096,7 +1119,7 @@ Return ONLY:
       "step_id": "S1",
       "direct_apply": false,
       "purpose": "<why this step>",
-      "tool": "read_file|search_in_file|search_codebase|edit_file_patch|request_agent6_glue",
+      "tool": "check_lean_expr|read_file|search_in_file|search_codebase|edit_file_patch|request_agent6_glue",
       "required_args": {"...": "..."},
       "acceptance": "<what must be true after run_lean_verify>"
     }
@@ -1118,18 +1141,22 @@ Return ONLY:
 }
 
 Constraints:
-- ordered_steps must be minimal and deterministic (3-6 steps).
+- ALWAYS start with check_lean_expr steps (direct_apply=false) for any symbol in the error
+  before emitting edit_file_patch steps. This ensures the patch's new_str uses the verified
+  current signature, not a guessed or outdated one.
+- ordered_steps must be minimal and deterministic (3-6 steps, plus leading check_lean_expr steps).
 - Every step must be executable by Agent3 tools.
 - Prefer reconciling declaration/callsite mismatch BEFORE tactic-level steps.
 - When you diagnose that a bridge lemma is truly missing (not a wrong Mathlib name or interface fix),
   add a step with tool "request_agent6_glue" and required_args (stuck_at_line, error_message,
   diagnosis, attempts_tried). Prefer interface/signature fixes in earlier steps; use request_agent6_glue
   only when a new lemma must be proven.
-- Do NOT route to Agent6 for Unknown identifier that looks like a Mathlib lemma (e.g. pow_le_one).
-  Use search_codebase or Agent2-style guidance instead.
+- For unknown identifier: first check_lean_expr to confirm it's absent, then search_codebase for
+  the correct name. Do NOT route to Agent6 for identifiers that are Mathlib renames.
 - Never output free-form commentary outside JSON.
 - direct_apply: true may ONLY be set for fully-specified mechanical edits (haveI, letI, instance
-  injection, single-line fix) where both old_str and new_str are completely determined. When
+  injection, single-line fix) where both old_str and new_str are completely determined AND you
+  have verified the new_str is correct via check_lean_expr or read_file. When
   direct_apply is true, the orchestrator applies the patch directly (bypassing Agent3) and the
   inserted content is protected — Agent3 must not remove it. Reasoning/search steps must never
   set direct_apply: true.
@@ -1766,6 +1793,22 @@ inform your decision without being mechanically bound to them:
   this first when diagnosing an "unknown identifier" error: if the identifier
   appears in `dependency_map`, its source file is already recorded, saving you
   an investigation lookup round.
+
+## Baseline vs. Current Error Analysis (MANDATORY in Mid-Check Mode)
+
+When the context includes a `## Baseline Errors` section alongside `## Current Build Errors`:
+
+1. **Pre-existing errors** (appear in BOTH baseline and current) are the root cause — these
+   are API drift, unknown identifiers, or structural mismatches that existed BEFORE Agent3 ran.
+   → Route Agent7 to fix these.
+
+2. **Agent3-introduced errors** (appear ONLY in current, NOT in baseline) were caused by
+   Agent3's patch attempts. A line that was clean in the baseline but now shows "type class
+   synthesis failed" or "application type mismatch" was broken by Agent3.
+   → Do NOT route Agent7 for Agent3-introduced errors. Prefer `agent3_tactical` to undo the
+   damage, OR if the Agent3 corruption is severe, `agent2_replan` with a rollback instruction.
+
+3. If baseline and current errors are identical → Agent3 made no progress → escalate to Agent7.
 
 ## PRIORITY RULES (STRICT — follow in order)
 

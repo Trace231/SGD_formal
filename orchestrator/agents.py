@@ -42,6 +42,7 @@ class ToolRegistry:
         """Register built-in controlled tools."""
         from orchestrator.tools import (
             apply_doc_patch,
+            check_lean_expr,
             check_lean_have,
             edit_file_patch,
             get_lean_goal,
@@ -65,6 +66,7 @@ class ToolRegistry:
         self.register("overwrite_file", overwrite_file)
         self.register("edit_file_patch", edit_file_patch)
         self.register("check_lean_have", check_lean_have)
+        self.register("check_lean_expr", check_lean_expr)
         self.register("get_lean_goal", get_lean_goal)
         self.register("run_lean_verify", run_lean_verify)
         self.register("run_repo_verify", run_repo_verify)
@@ -73,6 +75,7 @@ class ToolRegistry:
     def register_readonly_tools(self) -> None:
         """Register read-only tools for agents that may only inspect files."""
         from orchestrator.tools import (
+            check_lean_expr,
             read_file,
             read_file_readonly,
             search_codebase,
@@ -85,6 +88,7 @@ class ToolRegistry:
         self.register("search_in_file", search_in_file)
         self.register("search_in_file_readonly", search_in_file_readonly)
         self.register("search_codebase", search_codebase)
+        self.register("check_lean_expr", check_lean_expr)
 
     def register_investigation_tools(self) -> None:
         """Read-only tools + run_lean_verify for Agent8 investigation phase.

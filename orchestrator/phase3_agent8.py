@@ -86,6 +86,7 @@ def _build_agent8_tick_context(
     midcheck_mode: bool = False,
     midcheck_turns_elapsed: int = 0,
     pending_lemma_status: dict | None = None,
+    baseline_errors: str = "",
 ) -> str:
     """Build a minimal, non-truncated diagnostic prompt for Agent8.
 
@@ -244,13 +245,32 @@ def _build_agent8_tick_context(
             + "\n\n"
         )
 
+    # Baseline errors block: shown only when available and different from current errors.
+    _baseline_block = ""
+    if baseline_errors and baseline_errors.strip():
+        _baseline_block = (
+            "## Baseline Errors (BEFORE Agent3 started this attempt)\n"
+            "These errors existed BEFORE Agent3 ran. They are the root cause to fix.\n"
+            "```\n"
+            f"{baseline_errors[:_err_chars]}\n"
+            "```\n"
+            "## Current Build Errors (AFTER Agent3 attempts)\n"
+            "Compare with baseline to identify errors Agent3 introduced vs. pre-existing.\n"
+            "**Route Agent7 to fix pre-existing (baseline) API errors, NOT Agent3-introduced errors.**\n"
+            "**If a line that was clean in the baseline now has errors, Agent3 introduced them —\n"
+            "prefer agent3_tactical or a rollback + replan rather than agent7_signature for those.**\n"
+        )
+    else:
+        _baseline_block = "## Build Errors\n"
+
     return (
         f"{_midcheck_banner}"
         f"{_new_plan_banner}"
         "## Current Algorithm File (smart-truncated around error lines)\n"
         f"File: {target_file}\n"
         f"```lean\n{algo_display}\n```\n\n"
-        f"## Build Errors\n```\n{errors_text[:_err_chars]}\n```\n\n"
+        f"{_baseline_block}"
+        f"```\n{errors_text[:_err_chars]}\n```\n\n"
         f"## Proof Plan (current)\n{agent2_plan[:_plan_chars]}\n\n"
         f"## Library Files Available\n{lib_desc}\n\n"
         f"{_a9_block}"
@@ -484,7 +504,7 @@ def _agent8_run_agent7(
         "[Agent8 Decision Hub dispatch — signature diagnosis]\n\n"
         f"Agent8 diagnosis:\n{agent7_targeted_prompt[:RETRY_LIMITS.get('AGENT8_A7_PROMPT_CHARS', 1500)]}\n\n"
         f"Latest build errors:\n```\n{errors_text[:2000]}\n```\n\n"
-        f"Current file snippet:\n```lean\n{snippet[:8000]}\n```\n\n"
+        f"Current file (full when ≤500 lines):\n```lean\n{snippet[:20000]}\n```\n\n"
         f"Dependency signatures:\n```lean\n{dep_sigs[:4000]}\n```\n\n"
         "Return strict JSON only as specified in your system prompt."
     )
@@ -1232,6 +1252,7 @@ def run_agent8_midcheck(
     agent9_plan: dict | None = None,
     decision_history: list[dict] | None = None,
     turns_elapsed: int = 0,
+    baseline_errors: str = "",
 ) -> dict:
     """Make a single Agent8 routing decision during the Agent3 per-sorry loop.
 
@@ -1270,6 +1291,7 @@ def run_agent8_midcheck(
         plan_updated_tick=0,
         midcheck_mode=True,
         midcheck_turns_elapsed=turns_elapsed,
+        baseline_errors=baseline_errors,
     )
 
     # Call Agent8 (single round, reduced investigation budget for speed).
