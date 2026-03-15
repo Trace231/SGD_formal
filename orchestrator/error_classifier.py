@@ -120,7 +120,7 @@ def _classify_lean_error_structured(
       DEFINITION_ZONE_ERROR    — type mismatch in declaration/definition zone
                                  (before proof body) → verify callee signature first.
       DEPENDENCY_COMPILE_ERROR — first/primary errors originate in a non-target file
-                                 (e.g. staging/import dep) → fix dep, do NOT rewrite target.
+                                 (e.g. import dep) → fix dep, do NOT rewrite target.
       LOCAL_PROOF_ERROR        — errors are in target but in proof body, or typeclass
                                  synthesis failures → patch only.
       PROOF_ERROR              — all other errors (type mismatch, unsolved goals, etc.).
@@ -452,40 +452,6 @@ def _format_agent3_tool_feedback(
     return "\n".join(parts)
 
 
-def _lint_staging_content(staging_text: str) -> list[tuple[str, str]]:
-    """Run the staging API lint pass on staging file content.
-
-    Returns a list of (wrong_pattern, correction_hint) pairs for each violation found.
-    An empty list means the content passed all lint checks.
-    """
-    violations: list[tuple[str, str]] = []
-    for pattern, hint in _STAGING_API_MISSPELLINGS.items():
-        if re.search(pattern, staging_text):
-            violations.append((pattern.strip(r"\b"), hint))
-    return violations
-
-
-def _format_staging_lint_feedback(
-    violations: list[tuple[str, str]],
-    staging_file: str,
-) -> str:
-    """Format staging lint violations into an actionable Agent3 feedback message."""
-    lines = [
-        "## ⚠ STAGING FILE API LINT VIOLATIONS",
-        f"The following known API misspellings were detected in {staging_file}:",
-        "",
-    ]
-    for wrong, hint in violations:
-        lines.append(f"  - `{wrong}` → correct form: `{hint}`")
-    lines += [
-        "",
-        "These misspellings WILL cause Lean compilation errors.",
-        "Fix each occurrence in the staging file BEFORE calling run_lean_verify.",
-        "Use edit_file_patch with <<<SEARCH>>>/<<<REPLACE>>> targeting the staging file.",
-    ]
-    return "\n".join(lines)
-
-
 def _check_patch_symbols(
     arguments: dict,
     registry: "ToolRegistry",
@@ -571,8 +537,7 @@ def _prioritize_error_text(
     Replaces bare ``last_verify_text[:N]`` truncation with an ordered view:
     1. Errors near the last edited line (±10 lines) — highest signal
     2. Errors in the target file
-    3. Errors in the staging file
-    4. All other dependency errors
+    3. All other dependency errors
 
     When structured_errors is empty, falls back to raw_text[:max_chars].
     """
@@ -588,9 +553,8 @@ def _prioritize_error_text(
             last_edit_line is not None
             and abs(eline - last_edit_line) <= 10
         )
-        is_target = efile == target_basename and "Staging" not in e["file"]
-        is_staging = "Staging" in e["file"]
-        tier = 0 if near_edit else (1 if is_target else (2 if is_staging else 3))
+        is_target = efile == target_basename
+        tier = 0 if near_edit else (1 if is_target else 2)
         return (tier, eline)
 
     sorted_errors = sorted(structured_errors, key=_priority)

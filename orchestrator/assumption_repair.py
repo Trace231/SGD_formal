@@ -3,19 +3,13 @@
 When Agent5 (diagnostician) identifies missing assumptions, this module
 applies patches without human intervention.
 
-Two repair categories:
+Repair category:
 
 1. Missing Assumption Repair:
    - Extract unsolved goals from Lean build errors
    - Classify each goal as MISSING_ASSUMPTION or PROOF_OBLIGATION
    - Generate a hypothesis name and type
    - Patch the theorem signature (and propagate upward to callers)
-
-2. Staging Auto-Fix:
-   - Rule-based repair for two known deterministic error patterns in
-     Lib/Glue/Staging/ files:
-     (a) Over-specified simp set (def-unfold item causes unsolved goals)
-     (b) `exact h_xxx` after `convert ... using 1` needs `funext`
 """
 
 from __future__ import annotations
@@ -342,107 +336,6 @@ def apply_assumption_patches(
                 propagate_assumption(file_path, theorem, hyp_name, hyp_type)
 
     return patched
-
-
-# ---------------------------------------------------------------------------
-# Staging auto-fix rules
-# ---------------------------------------------------------------------------
-
-# Pattern: line reports "unsolved goals" and the offending code line contains
-# a simp call that mixes a *definition* simp lemma with @[simp] lemmas.
-#
-# We detect this by checking if the simp set contains a term that looks like
-# a namespace-qualified *definition* (e.g. SVRGSetup.svrgProcess) alongside
-# @[simp]-tagged lemmas (e.g. SVRGSetup.process_zero).
-#
-# Heuristic: any `Namespace.name` where `name` starts with a lowercase letter
-# and does NOT end in a recognisable simp-lemma suffix pattern is a def unfold.
-
-_SIMP_CALL_RE = re.compile(r"(simp\s*\[)([^\]]+)(\])")
-_DEF_UNFOLD_ITEM_RE = re.compile(
-    r"\b([A-Z]\w+\.[a-z]\w+)\b"  # e.g. SVRGSetup.svrgProcess
-)
-_SIMP_LEMMA_SUFFIXES = (
-    "process_zero", "process_succ", "process_step",
-    "_zero", "_succ", "_base", "_step", "_def",
-)
-
-
-def _is_def_unfold(item: str) -> bool:
-    """Return True if `item` looks like a definition-unfold (not a simp lemma)."""
-    item = item.strip()
-    m = _DEF_UNFOLD_ITEM_RE.match(item)
-    if not m:
-        return False
-    # If it ends with a known simp-lemma suffix it's a legitimate simp lemma
-    for suffix in _SIMP_LEMMA_SUFFIXES:
-        if item.endswith(suffix):
-            return False
-    return True
-
-
-def _fix_overspecified_simp(line: str) -> str | None:
-    """Remove def-unfold items from a simp call.  Returns fixed line or None."""
-    m = _SIMP_CALL_RE.search(line)
-    if not m:
-        return None
-    items = [i.strip() for i in m.group(2).split(",")]
-    def_unfolds = [i for i in items if _is_def_unfold(i)]
-    if not def_unfolds:
-        return None
-    kept = [i for i in items if i not in def_unfolds]
-    if not kept:
-        return None
-    new_simp = m.group(1) + ", ".join(kept) + m.group(3)
-    return line[: m.start()] + new_simp + line[m.end() :]
-
-
-# Pattern: "No goals to be solved" at an `exact h_xxx` line that follows
-# `convert ... using 1`.  Fix: exact h_xxx → exact funext h_xxx.
-_EXACT_RE = re.compile(r"^(\s*)(exact\s+)(\w+)(\s*)$")
-
-
-def _fix_exact_needs_funext(line: str) -> str | None:
-    """Wrap `exact h` with `exact funext h` if the exact pattern matches."""
-    m = _EXACT_RE.match(line)
-    if not m:
-        return None
-    # Only apply to identifiers that look like hypothesis names (h_xxx)
-    name = m.group(3)
-    if not (name.startswith("h_") or name.startswith("h")):
-        return None
-    return m.group(1) + "exact funext " + name + m.group(4)
-
-
-def _find_actual_tactic_line(lines: list[str], error_lineno: int, error_msg: str) -> int:
-    """Resolve the Lean error line to the actual failing tactic.
-
-    Lean reports "unsolved goals" / "No goals to be solved" at the position of
-    the ``by`` keyword that opens a tactic block (e.g. the end of a long
-    ``have ... := by`` declaration), NOT at the failing tactic inside.
-
-    This helper scans forward from *error_lineno* up to 10 lines to find the
-    first line whose content matches the expected failing tactic:
-    - ``simp`` for "unsolved goals"
-    - ``exact`` for "No goals to be solved"
-
-    If the error line does not end with ``by``, it is returned unchanged.
-    """
-    if error_lineno < 1 or error_lineno > len(lines):
-        return error_lineno
-    line = lines[error_lineno - 1]
-    if not line.rstrip().endswith("by"):
-        return error_lineno
-    for offset in range(1, 10):
-        idx = error_lineno - 1 + offset
-        if idx >= len(lines):
-            break
-        candidate = lines[idx]
-        if "unsolved goals" in error_msg and "simp" in candidate:
-            return error_lineno + offset
-        if "No goals to be solved" in error_msg and "exact" in candidate:
-            return error_lineno + offset
-    return error_lineno
 
 
 # ---------------------------------------------------------------------------

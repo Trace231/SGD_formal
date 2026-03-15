@@ -12,7 +12,6 @@ tick-based decision loop.  Each tick:
 """
 from __future__ import annotations
 
-import functools
 import json
 import re
 import tempfile
@@ -82,7 +81,6 @@ def _build_agent8_tick_context(
     errors_text: str,
     agent2_plan: str,
     decision_history: list[dict],
-    staging_rel: str,
     agent9_plan: dict | None = None,
     plan_updated_tick: int = 0,
     midcheck_mode: bool = False,
@@ -133,12 +131,6 @@ def _build_agent8_tick_context(
         algo_display = "\n".join(
             f"{i + 1:>5}| {line}" for i, line in enumerate(file_lines)
         )
-
-    # --- Staging file ---
-    try:
-        staging_content = load_file(staging_rel)
-    except FileNotFoundError:
-        staging_content = "(no staging file)"
 
     # --- Lib descriptions ---
     lib_desc = "\n".join(f"  - {path}: {desc}" for path, desc in LIB_FILE_DESCRIPTIONS)
@@ -196,7 +188,6 @@ def _build_agent8_tick_context(
     algo_sigs = _extract_imported_algo_sigs(target_file)
 
     _err_chars = RETRY_LIMITS.get("AGENT8_ERROR_CHARS", 3000)
-    _staging_chars = RETRY_LIMITS.get("AGENT8_STAGING_CHARS", 2000)
     _plan_chars = RETRY_LIMITS.get("AGENT8_PLAN_CHARS", 3000)
     _a9_chars = RETRY_LIMITS.get("AGENT9_PLAN_CHARS", 3000)
 
@@ -260,7 +251,6 @@ def _build_agent8_tick_context(
         f"File: {target_file}\n"
         f"```lean\n{algo_display}\n```\n\n"
         f"## Build Errors\n```\n{errors_text[:_err_chars]}\n```\n\n"
-        f"## Staging File ({staging_rel})\n```lean\n{staging_content[:_staging_chars]}\n```\n\n"
         f"## Proof Plan (current)\n{agent2_plan[:_plan_chars]}\n\n"
         f"## Library Files Available\n{lib_desc}\n\n"
         f"{_a9_block}"
@@ -343,7 +333,6 @@ def _build_agent9_theorem_context(
 
 def _agent8_run_agent3(
     target_file: str,
-    staging_rel: str,
     agent2_plan: str,
     targeted_prompt: str,
     allowed_edit_lines: str | None,
@@ -360,11 +349,6 @@ def _agent8_run_agent3(
     registry = ToolRegistry()
     registry.register_default_tools()
     algo_name = Path(target_file).stem
-    from orchestrator.tools import write_staging_lemma
-    registry.register(
-        "write_staging_lemma",
-        functools.partial(write_staging_lemma, target_algo=algo_name),
-    )
 
     # Write full Agent2 plan to a temp file so Agent3 can read it without truncation
     plan_file = Path(tempfile.gettempdir()) / f"agent8_plan_{algo_name}.md"
@@ -377,21 +361,12 @@ def _agent8_run_agent3(
             "of the target file. Do not modify code outside this range."
         )
 
-    try:
-        _staging_snippet = load_file(staging_rel)[
-            : RETRY_LIMITS.get("AGENT8_STAGING_CHARS", 2000)
-        ]
-    except FileNotFoundError:
-        _staging_snippet = "(no staging file)"
-
     initial_msg = (
         f"[AGENT8 DISPATCH — Tactical Fix]\n\n"
         f"{targeted_prompt}\n\n"
         f"The full proof plan is available at: {plan_file}\n"
         f"(Read it with read_file if you need the complete mathematical strategy.)\n"
         f"Target file: {target_file}\n"
-        f"Staging file: {staging_rel}\n\n"
-        f"## Current Staging File\n```lean\n{_staging_snippet}\n```\n"
         f"{scope_instruction}\n\n"
         "Fix the specified error. When done, signal tool=done. "
         "Output ONE JSON action per response: {{thought, tool, arguments}}."
@@ -524,7 +499,6 @@ def _agent8_run_agent7(
 
 def _agent8_run_agent7_then_agent6(
     target_file: str,
-    staging_rel: str,
     errors_text: str,
     agent7_targeted_prompt: str,
     agent6_targeted_prompt: str,
@@ -535,10 +509,13 @@ def _agent8_run_agent7_then_agent6(
 
     Returns a dict with keys:
       exit_code, sorry_count, errors  — final state of target_file
-      stub_compile_failed (bool)      — True when Agent7 stub did not compile
-      lemma_proven (bool)             — True when staging sorry count decreased
+      stub_compile_failed (bool)      — always False (no separate staging file)
+      lemma_proven (bool)             — True when target file sorry count decreased
     """
     from orchestrator.verify import count_sorrys as _count_sorrys
+
+    # Snapshot target sorry count before Agent6 so we can detect lemma-level progress.
+    _sorry_before = _count_sorrys(target_file)
 
     # Phase 1: Agent7 signature audit / stub creation
     a7_plan, _a7_raw = _agent8_run_agent7(
@@ -574,36 +551,23 @@ def _agent8_run_agent7_then_agent6(
                         )
                     except Exception:
                         pass
-                elif _tool == "write_staging_lemma" and req_args.get("lean_code"):
-                    try:
-                        exec_registry.call(
-                            "write_staging_lemma",
-                            staging_path=req_args.get("staging_path", staging_rel),
-                            lean_code=req_args["lean_code"],
-                        )
-                    except Exception:
-                        pass
 
-    # Phase 1.5: Validate staging file compiles after Agent7's writes.
+    # Phase 1.5: Validate target file compiles after Agent7's writes.
     from orchestrator.tools import run_lean_verify as _stub_verify
-    _staging_check = _stub_verify(staging_rel)
-    _stub_exit = int(_staging_check.get("exit_code", 1))
+    _target_check = _stub_verify(target_file)
+    _stub_exit = int(_target_check.get("exit_code", 1))
     if _stub_exit != 0:
         console.print(
-            f"  [Agent7 stub] Staging compile FAILED (exit={_stub_exit}) — "
+            f"  [Agent7 stub] Target compile FAILED (exit={_stub_exit}) — "
             "skipping Agent6, returning stub_compile_failed."
         )
         return {
             "exit_code": 1,
             "sorry_count": -1,
-            "errors": str(_staging_check.get("errors", "")),
+            "errors": str(_target_check.get("errors", "")),
             "stub_compile_failed": True,
             "lemma_proven": False,
         }
-
-    # Snapshot staging sorry count before Agent6 so we can detect lemma-level progress.
-    _staging_path = PROJECT_ROOT / staging_rel
-    _staging_sorry_before = _count_sorrys(staging_rel)
 
     # Phase 2: Extract proposed_signature from agent9_plan for the targeted lemma.
     _proposed_sig: str | None = None
@@ -618,21 +582,16 @@ def _agent8_run_agent7_then_agent6(
             if _proposed_sig:
                 break
 
-    # Phase 2: Agent6 glue lemma proof
+    # Phase 2: Agent6 helper lemma proof
     algo_name = Path(target_file).stem
     agent6 = Agent("glue_filler", extra_files=[target_file])
     agent6_registry = ToolRegistry()
-    agent6_registry.register_staging_tools(target_algo=algo_name)
-    from orchestrator.tools import check_lean_have, get_lean_goal
-    agent6_registry.register("get_lean_goal", get_lean_goal)
-    agent6_registry.register("check_lean_have", check_lean_have)
+    agent6_registry.register_default_tools()
 
     _run_agent6_glue_loop(
         agent6,
         agent6_registry,
         target_file,
-        _staging_path,
-        staging_rel,
         goal=agent6_targeted_prompt,
         error_message=errors_text[:500],
         diagnosis=agent6_targeted_prompt,
@@ -640,9 +599,9 @@ def _agent8_run_agent7_then_agent6(
         proposed_signature=_proposed_sig,
     )
 
-    # Determine lemma_proven by comparing staging sorry count before/after Agent6.
-    _staging_sorry_after = _count_sorrys(staging_rel)
-    _lemma_proven = _staging_sorry_after < _staging_sorry_before
+    # Determine lemma_proven by comparing target sorry count before/after Agent6.
+    _sorry_after = _count_sorrys(target_file)
+    _lemma_proven = _sorry_after < _sorry_before
 
     # Verify final state of the target file.
     from orchestrator.tools import run_lean_verify
@@ -694,9 +653,9 @@ def _agent8_run_agent2_replan(
         "Provide revised guidance with PATCH blocks as usual."
     )
 
-    staging_registry = ToolRegistry()
-    staging_registry.register_staging_tools(target_algo=Path(target_file).stem)
-    new_plan, _ = _call_agent2_with_tools(agent2, staging_registry, replan_prompt)
+    replan_registry = ToolRegistry()
+    replan_registry.register_default_tools()
+    new_plan, _ = _call_agent2_with_tools(agent2, replan_registry, replan_prompt)
     return new_plan
 
 
@@ -837,7 +796,6 @@ def _check_anti_loop(
 def run_agent8_loop(
     agent2: Agent,
     target_file: str,
-    staging_rel: str,
     agent2_plan: str,
     last_errors: str,
     *,
@@ -918,7 +876,7 @@ def run_agent8_loop(
 
         # 1. Build context
         ctx = _build_agent8_tick_context(
-            target_file, current_errors, current_plan, decision_history, staging_rel,
+            target_file, current_errors, current_plan, decision_history,
             agent9_plan=agent9_plan,
             plan_updated_tick=_plan_updated_tick,
             pending_lemma_status=_pending_lemma_status,
@@ -1047,7 +1005,6 @@ def run_agent8_loop(
                 )
                 result = _agent8_run_agent3(
                     target_file,
-                    staging_rel,
                     current_plan,
                     targeted_prompt + _a9_thm_ctx,
                     decision.get("allowed_edit_lines"),
@@ -1097,7 +1054,7 @@ def run_agent8_loop(
                 a7_prompt = decision.get("agent7_targeted_prompt", targeted_prompt)
                 a6_prompt = decision.get("agent6_targeted_prompt", targeted_prompt)
                 result = _agent8_run_agent7_then_agent6(
-                    target_file, staging_rel, current_errors, a7_prompt, a6_prompt,
+                    target_file, current_errors, a7_prompt, a6_prompt,
                     agent9_plan=agent9_plan,
                 )
                 outcome = {
@@ -1268,7 +1225,6 @@ def run_agent8_loop(
 
 def run_agent8_midcheck(
     target_file: str,
-    staging_rel: str,
     current_plan: str,
     current_errors: str,
     *,
@@ -1310,7 +1266,6 @@ def run_agent8_midcheck(
         current_errors,
         current_plan,
         _decision_history,
-        staging_rel,
         agent9_plan=agent9_plan,
         plan_updated_tick=0,
         midcheck_mode=True,

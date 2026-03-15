@@ -41,7 +41,6 @@ from orchestrator.agents import (
 )
 from orchestrator.assumption_repair import (
     apply_assumption_patches,
-    apply_staging_rules,
     all_goals_are_assumptions,
     classify_goal,
     extract_unsolved_goals,
@@ -71,7 +70,6 @@ from orchestrator.file_io import (
 )
 from orchestrator.tools import (
     _path_to_lean_module,
-    write_staging_lemma,
 )
 from orchestrator.metrics import (
     MetricsStore,
@@ -157,17 +155,13 @@ from orchestrator.context_builders import (
     _CATALOG_LEMMA_HEADING_RE,
     _LIB_DECL_RE,
     _MIN_AGENT2_LOOKUP_ROUNDS,
-    _STAGING_API_MISSPELLINGS,
     _PROJECT_IDENT_RE,
     _LEAN_KEYWORDS,
     _TOP_LEVEL_KEYWORDS,
     _DECL_START,
     _ESCALATION_CHAR_LIMIT,
     _extract_imported_algo_sigs,
-    _extract_staging_sigs,
     _format_agent3_tool_feedback,
-    _lint_staging_content,
-    _format_staging_lint_feedback,
     _check_patch_symbols,
     _prioritize_error_text,
     _should_route_to_agent6_for_infra,
@@ -189,7 +183,6 @@ from orchestrator.context_builders import (
     _extract_new_identifiers_from_guidance,
     _extract_declaration_skeleton,
     _build_escalation_file_context,
-    _audit_staging_usage,
 )
 
 console = Console()
@@ -337,36 +330,28 @@ def phase3_prove(
     agent3 = Agent("sorry_closer", extra_files=[target_file])
     registry = ToolRegistry()
     registry.register_default_tools()
-    _algo_name_for_staging = Path(target_file).stem  # e.g. "SVRGOuterLoop"
-    _algo_name = _algo_name_for_staging  # alias used in Phase 3a scaffold block
-    registry.register(
-        "write_staging_lemma",
-        functools.partial(write_staging_lemma, target_algo=_algo_name_for_staging),
-    )
+    _algo_name = Path(target_file).stem
     # Read-only registry for Agent2 lookup rounds (no write tools exposed).
     readonly_registry = ToolRegistry()
     readonly_registry.register_readonly_tools()
-    # Staging registry: read tools + write_staging_lemma for Agent2 mid-proof escalation.
-    staging_registry = ToolRegistry()
-    staging_registry.register_staging_tools(target_algo=_algo_name_for_staging)
-    # Agent6 (Glue Filler): staging tools + get_lean_goal + check_lean_have for glue proof.
+    # Agent2 escalation registry: read tools + edit access for mid-proof escalation.
+    escalation_registry = ToolRegistry()
+    escalation_registry.register_default_tools()
+    # Agent6 (Glue Filler): full write access + goal/have tools for helper lemma proof.
     agent6 = Agent("glue_filler", extra_files=[target_file])
     agent6_registry = ToolRegistry()
-    agent6_registry.register_staging_tools(target_algo=_algo_name_for_staging)
+    agent6_registry.register_default_tools()
     # Agent7 (Interface Auditor): read-only lookup + strict execution protocol output.
     agent7 = Agent("interface_auditor", extra_files=[target_file])
     agent7_registry = ToolRegistry()
     agent7_registry.register_readonly_tools()
-    from orchestrator.tools import check_lean_have, get_lean_goal
-    agent6_registry.register("get_lean_goal", get_lean_goal)
-    agent6_registry.register("check_lean_have", check_lean_have)
     diag_log: list[str] = []
 
     # Pre-check: if the target file already has 0 sorry and builds clean,
     # skip the entire Agent3 loop.  This prevents destructive rewrites when
     # a previous run already completed the proof (e.g., after a Gate 4 crash).
     def _target_exists_overlay() -> bool:
-        """True when target exists in workspace or staging overlay."""
+        """True when target exists in workspace."""
         try:
             load_file(target_file)
             return True
@@ -405,73 +390,12 @@ def phase3_prove(
     )
     _tgt = Path(target_file) if Path(target_file).is_absolute() else PROJECT_ROOT / target_file
 
-    # --- Glue Staging setup (Fix B1) ---
-    # Architecture: algorithm vs staging separation
-    # - Algorithm file: target_file (e.g. Algorithms/<Algo>.lean) — main definitions, theorems.
-    #   Created by Agent2 Phase 3a scaffold or pre-existing. Always lives in Algorithms/.
-    # - Staging file: Lib/Glue/Staging/<Algo>.lean — glue/bridge lemmas only, added by
-    #   Agent3/Agent6 via write_staging_lemma. Algorithm imports staging; never the reverse.
-    # - run_lean_verify(target_file) builds the algorithm module (lake build Algorithms.<Algo>),
-    #   which pulls in staging as a dependency. Build target is always the algorithm, never staging.
-    #
-    # Create a per-algorithm staging file under Lib/Glue/Staging/ so Agent3
-    # never needs to touch the shared Lib/Glue/*.lean infrastructure.
-    _algo_name = Path(target_file).stem  # e.g. "SVRGOuterLoop"
-    _staging_path = PROJECT_ROOT / "Lib" / "Glue" / "Staging" / f"{_algo_name}.lean"
-    _staging_rel = str(_staging_path.relative_to(PROJECT_ROOT))
-
-    def _staging_exists_overlay() -> bool:
-        try:
-            load_file(_staging_rel)
-            return True
-        except FileNotFoundError:
-            return False
-
-    def _staging_read_overlay(default: str = "(staging file is empty)") -> str:
-        try:
-            return load_file(_staging_rel)
-        except FileNotFoundError:
-            return default
-
-    def _staging_physical_path() -> Path:
-        """Return concrete staging glue path in workspace."""
-        return _staging_path
-
-    if not snapshot_file(_staging_rel):
-        registry.call(
-            "write_new_file",
-            path=_staging_rel,
-            content=(
-            f"-- Staging lemmas for {_algo_name} formalization.\n"
-            "-- Add new helper lemmas here. Do NOT modify existing Lib/Glue files.\n"
-            "import Lib.Glue.Probability\n"
-            "import Lib.Glue.Algebra\n"
-            "import Lib.Glue.Measurable\n"
-            "import Lib.Glue.Calculus\n"
-            ),
-        )
-        console.print(f"  [Staging] Created {_staging_rel}")
-
     # Remove write_new_file from Agent3's registry: Phase 3a scaffold guarantees the
     # target file exists before Agent3 starts. Agent3 should only use edit_file_patch.
-    # Pop after staging creation so the orchestrator can create Lib/Glue/Staging/*.lean.
     registry._tools.pop("write_new_file", None)
 
-    # Inject staging import into algorithm file if not already present.
-    if snapshot_file(target_file):
-        _tgt_content = load_file(target_file)
-        _staging_import = f"import Lib.Glue.Staging.{_algo_name}"
-        if _staging_import not in _tgt_content:
-            _lines = _tgt_content.splitlines()
-            last_import_idx = max(
-                (i for i, l in enumerate(_lines) if l.startswith("import")), default=-1
-            )
-            _lines.insert(last_import_idx + 1, _staging_import)
-            registry.call("overwrite_file", path=target_file, content="\n".join(_lines) + "\n")
-            console.print(f"  [Staging] Injected import into {target_file}")
-
     # --- Glue pollution guard (Fix B2) ---
-    # Snapshot all existing Lib/Glue/*.lean files (excluding Staging/) so we
+    # Snapshot all existing Lib/Glue/*.lean files so we
     # can detect and revert any direct edits Agent3 makes to shared infrastructure.
     _glue_dir = PROJECT_ROOT / "Lib" / "Glue"
     _glue_snapshot: dict[Path, str] = {
@@ -546,7 +470,7 @@ def phase3_prove(
     # applied, to avoid re-patching the same theorem with the same hypothesis.
     _assumption_patch_tried: set[str] = set()
 
-    # Loop guard: consecutive DEPENDENCY_COMPILE_ERROR streak (same staging error).
+    # Loop guard: consecutive DEPENDENCY_COMPILE_ERROR streak (same dep error).
     _dep_error_streak: int = 0
     _last_dep_error_sig: str | None = None
 
@@ -576,7 +500,6 @@ def phase3_prove(
     best_checkpoint: dict = {
         "sorry_count": _initial_sorry_for_ckpt,
         "content": load_file(target_file) if _target_exists_overlay() else None,
-        "staging_content": _staging_read_overlay(default="") or None,
     }
 
     # ------------------------------------------------------------------
@@ -606,15 +529,13 @@ def phase3_prove(
         console.rule("[bold cyan]Phase 3/7 — Scaffold  [Agent2 → Agent10]")
         _prog_update("Phase 3/7: Scaffold writing  [Agent2]...")
         _scaffold_registry = ToolRegistry()
-        _scaffold_registry.register_scaffold_tools(target_algo=_algo_name)
-        _algo_name_for_staging = _algo_name
+        _scaffold_registry.register_scaffold_tools()
         _scaffold_ok = _call_agent2_scaffold(
             agent2,
             _scaffold_registry,
             target_file,
             guidance,  # Agent2's approved plan from Phase 2
-            staging_rel=_staging_rel,
-            algo_name=_algo_name_for_staging,
+            algo_name=_algo_name,
         )
         # Collect build errors so Agent10 can use them for Full-Correction mode.
         if not _scaffold_ok:
@@ -666,7 +587,6 @@ def phase3_prove(
         )
         best_checkpoint["sorry_count"] = _initial_sorry_for_ckpt
         best_checkpoint["content"] = load_file(target_file)
-        best_checkpoint["staging_content"] = _staging_read_overlay(default="") or None
         initial_hash = _file_hash(target_file)
         initial_exists = True
 
@@ -781,7 +701,7 @@ def phase3_prove(
                     f"## Failed approaches — do NOT repeat these\n{_distilled_failures}\n\n"
                     "Provide updated proof strategy for the next attempt."
                 )
-                guidance, _ = _call_agent2_with_tools(agent2, staging_registry, _distilled_ctx)
+                guidance, _ = _call_agent2_with_tools(agent2, escalation_registry, _distilled_ctx)
                 console.print(
                     f"  [ContextEvict] a{attempt} — Agent2 context refreshed "
                     f"(every {_a2_evict_n} attempts, distilled)"
@@ -883,7 +803,7 @@ def phase3_prove(
             "write_new_file is NOT available — the scaffold file already exists. "
             "Use ONLY edit_file_patch to modify the target file.\n"
             "Allowed tools: read_file, read_file_readonly, search_in_file, search_in_file_readonly, "
-            "search_codebase, edit_file_patch, write_staging_lemma, get_lean_goal, "
+            "search_codebase, edit_file_patch, get_lean_goal, "
             "check_lean_have, run_lean_verify, request_agent6_glue, request_agent2_help, "
             "request_agent7_interface_audit.\n"
             "SITUATIONAL BEHAVIOR:\n"
@@ -891,49 +811,23 @@ def phase3_prove(
             "execute them exactly — copy old_str and new_str verbatim.\n"
             "- When you receive a tool result: analyze it and decide your next action.\n"
             "- After any edit call run_lean_verify to confirm.\n\n"
-            "GLUE STAGING RULE (non-negotiable):\n"
-            f"- You may edit: {target_file}, {_staging_rel}\n"
+            "FILE EDITING RULES (non-negotiable):\n"
+            f"- You may edit: {target_file}\n"
             "- Lib/Glue/Probability.lean, Algebra.lean, Measurable.lean, Calculus.lean: READ-ONLY.\n"
             "- All Lib/Layer0/*.lean files (ConvexFOC.lean, IndepExpect.lean, GradientFTC.lean) "
             "are READ-ONLY. Use read_file_readonly to inspect them, never edit_file_patch.\n"
-            f"- NEW glue lemmas (Level 2 gaps) go to {_staging_rel}.\n"
-            f"  Agent2 may have already written them there — check the staging file section below.\n"
-            "  A staging lemma may have `sorry` body; that is intentional and not penalized.\n"
-            f"- {_staging_rel} already imports all main Lib/Glue files.\n"
+            "- NEW helper lemmas (Level 2 gaps) go DIRECTLY in the target file, before the main theorem.\n"
+            "  A helper lemma may have `sorry` body; that is intentional and not penalized.\n"
             "- BEFORE adding any new 'import X' statement to any file, call "
             "read_file_readonly(\"Main.lean\") or read_file_readonly(\"lakefile.lean\") "
             "to verify that X does not already import the file you are editing "
             "(which would create a circular dependency).\n"
-            f"- CRITICAL: {_staging_rel} does NOT import {target_file}. Any lemma you "
-            f"add to {_staging_rel} CANNOT reference definitions that are first defined "
-            f"in {target_file} (e.g., `outerProcess`, or any `def`/`theorem` introduced "
-            f"there). Such references always fail with 'Invalid field' or 'unknown "
-            f"identifier'. If a helper needs those definitions, place it INSIDE "
-            f"{target_file} directly.\n"
             + _no_overwrite_rule
             + "\n"
             f"Target file: {target_file}\n"
             + (_imported_sigs_block.lstrip("\n") + "\n" if _imported_sigs_block else "")
-            + (_extract_staging_sigs(_staging_path) if _staging_exists_overlay() else "")
-            + (
-                "\n## Staging file (writable — add new glue lemmas here)\n"
-                f"File: {_staging_rel}\n"
-                "```lean\n"
-                + _staging_read_overlay(default="")
-                + "\n```\n"
-                "If a lemma is NOT in Lib/Glue/*.lean but IS in this staging file, use it directly.\n"
-                f"To add a new lemma: use write_staging_lemma(staging_path=\"{_staging_rel}\", "
-                f"lean_code=\"...\") to append, or edit_file_patch to modify existing content.\n\n"
-            )
             + f"Guidance:\n{guidance}"
         )
-
-        # Staging errors flag (affects goal prequery elaboration).
-        _staging_has_errors = (
-            last_exit_code != 0
-            and last_verify_text
-            and any("Staging" in e.get("file", "") for e in _parse_lean_errors(last_verify_text))
-        ) if attempt > 1 else False
 
         # Per-attempt state (persists across all sorry iterations).
         exec_results: list[ExecutionResult] = []
@@ -947,23 +841,6 @@ def phase3_prove(
         _patch_without_lookup_count: int = 0
         _tools_used_this_attempt: set[str] = set()
         _inner_break_reason = ""
-
-        # Staging file lint check once per attempt before sorry loop.
-        if _staging_exists_overlay():
-            _staging_lint_violations = _lint_staging_content(
-                _staging_read_overlay(default="")
-            )
-            if _staging_lint_violations:
-                _lint_feedback = _format_staging_lint_feedback(
-                    _staging_lint_violations, _staging_rel
-                )
-                console.print(
-                    f"  [StagingLint] attempt {attempt} — "
-                    f"{len(_staging_lint_violations)} lint violation(s) found in staging file"
-                )
-                # Use a temporary agent3 call; result feeds into first sorry's context.
-                _lint_reply = agent3.call(_lint_feedback)
-                token_char_budget += len(_lint_feedback) + len(_lint_reply)
 
         # Scan sorry lines for per-sorry iteration.
         # If no sorries exist (errors only, sorry=0), use a single None sentinel
@@ -1022,7 +899,6 @@ def phase3_prove(
                 target_file,
                 guidance,
                 _goal_cache,
-                _staging_has_errors,
                 errors_text=last_verify_text,
                 target_line=_active_sorry_line,
             )
@@ -1145,7 +1021,6 @@ def phase3_prove(
                         from orchestrator.phase3_agent8 import run_agent8_midcheck
                         _mc_decision = run_agent8_midcheck(
                             target_file,
-                            _staging_rel,
                             guidance,
                             _midcheck_errors,
                             agent2=agent2,
@@ -1196,7 +1071,7 @@ def phase3_prove(
                                     _a7p = _mc_decision.get("agent7_targeted_prompt", _mc_prompt)
                                     _a6p = _mc_decision.get("agent6_targeted_prompt", _mc_prompt)
                                     _agent8_run_agent7_then_agent6(
-                                        target_file, _staging_rel, _midcheck_errors, _a7p, _a6p
+                                        target_file, _midcheck_errors, _a7p, _a6p
                                     )
                                     _attempt_esc_a7 += 1
                                     _attempt_esc_a6 += 1
@@ -1618,7 +1493,7 @@ def phase3_prove(
                                 _gp_rel = str(_gp.relative_to(PROJECT_ROOT))
                                 if snapshot_file(_gp_rel) != _goriginal:
                                     registry.call("overwrite_file", path=_gp_rel, content=_goriginal)
-                                    console.print(f"  [Staging] Restored {_gp.name} (was modified)")
+                                    console.print(f"  [Glue] Restored {_gp.name} (was modified)")
                             for _lp, _loriginal in _layer0_snapshot.items():
                                 _lp_rel = str(_lp.relative_to(PROJECT_ROOT))
                                 if snapshot_file(_lp_rel) != _loriginal:
@@ -1742,12 +1617,10 @@ def phase3_prove(
                         agent6,
                         agent6_registry,
                         target_file,
-                        _staging_path,
-                        _staging_rel,
                         goal,
                         error_message,
                         diagnosis,
-                        _algo_name_for_staging,
+                        _algo_name,
                         hypotheses=hypotheses,
                         extra_context=extra_context or None,
                         stuck_line=_line_int,
@@ -1787,16 +1660,14 @@ def phase3_prove(
                     else:
                         _stuck_line_int = int(stuck_at_line) if str(stuck_at_line).isdigit() else None
                         _current_snippet = _build_escalation_file_context(target_file, _stuck_line_int)
-                        _staging_snippet = _staging_read_overlay()
                         new_guidance, _ = _call_agent2_with_tools(
                             agent2,
-                            staging_registry,
-                            f"[AGENT6 FALLBACK — Agent6 could not prove glue]\n"
+                            escalation_registry,
+                            f"[AGENT6 FALLBACK — Agent6 could not prove helper lemma]\n"
                             f"Agent3 escalated with infrastructure diagnosis. Agent6 failed.\n\n"
                             f"Error: {error_message}\nDiagnosis: {diagnosis}\n\n"
                             f"Target: {target_file} line {stuck_at_line}. Goal: {goal[:500]}...\n\n"
                             f"=== CURRENT FILE ({target_file}) ===\n```lean\n{_current_snippet}\n```\n\n"
-                            f"=== STAGING FILE ({_staging_rel}) ===\n```lean\n{_staging_snippet}\n```\n\n"
                             f"Provide revised guidance. Agent3 continues in the SAME attempt.",
                         )
                         raw_reply = agent3.call(
@@ -1835,10 +1706,9 @@ def phase3_prove(
                     )
                     _stuck_line_int = int(stuck_at_line) if str(stuck_at_line).isdigit() else None
                     current_file_snippet = _build_escalation_file_context(target_file, _stuck_line_int)
-                    _staging_snippet = _staging_read_overlay()
                     new_guidance, _a2_route_mid = _call_agent2_with_tools(
                         agent2,
-                        staging_registry,
+                        escalation_registry,
                         f"[AGENT3 ESCALATION — MID-ATTEMPT HELP REQUEST]\n"
                         f"Agent3 is stuck on line {stuck_at_line} after "
                         f"{attempts_tried} turns.\n\n"
@@ -1846,14 +1716,12 @@ def phase3_prove(
                         f"Agent3's diagnosis:\n{diagnosis}\n\n"
                         f"=== CURRENT FILE ({target_file}) ===\n"
                         f"```lean\n{current_file_snippet}\n```\n\n"
-                        f"=== STAGING FILE ({_staging_rel}) ===\n"
-                        f"```lean\n{_staging_snippet}\n```\n\n"
                         "Apply your Sorry-Fill Proof Path Protocol. "
                         "Classify the problem as structural (A) or tactical (B) "
                         "and provide revised, concrete guidance with exact Lean API "
                         "calls. Agent3 will continue in the SAME attempt.\n"
-                        "If a Level-2 missing glue lemma is needed, use write_staging_lemma "
-                        f"to add it to {_staging_rel} NOW — do not just describe it.\n"
+                        "If a Level-2 missing glue lemma is needed, add it directly "
+                        f"in {target_file} before the main theorem.\n"
                         "ROUTING RULE: If this error is a structural INTERFACE problem — "
                         "invalid field notation, wrong function signature, mismatched "
                         "dot-access path — output exactly `ROUTE_TO: agent7` on its own "
@@ -2046,26 +1914,6 @@ def phase3_prove(
 
                 if edited:
                     edited_this_attempt = True
-                    # Post-edit staging lint: if the edited file is the staging file,
-                    # run lint immediately and feed violations back to Agent3.
-                    _edited_path_str = str(arguments.get("path", ""))
-                    if (
-                        _edited_path_str
-                        and "Staging" in _edited_path_str
-                        and _staging_exists_overlay()
-                    ):
-                        _post_lint = _lint_staging_content(
-                            _staging_read_overlay(default="")
-                        )
-                        if _post_lint:
-                            _post_lint_msg = _format_staging_lint_feedback(
-                                _post_lint, _staging_rel
-                            )
-                            console.print(
-                                f"  [StagingLint] post-edit — "
-                                f"{len(_post_lint)} violation(s) remain in staging file"
-                            )
-                            result_msg = result_msg + "\n\n" + _post_lint_msg
                 if "PATCH MISMATCH" in result_msg:
                     patch_mismatch_in_attempt = True
 
@@ -2221,10 +2069,6 @@ def phase3_prove(
                         best_checkpoint = {
                             "sorry_count": last_sorry_in_attempt,
                             "content": load_file(target_file),
-                            "staging_content": (
-                                snapshot_file(_staging_rel)
-                                if snapshot_file(_staging_rel) else None
-                            ),
                         }
                         console.print(
                             f"  [Checkpoint] Updated: sorry={last_sorry_in_attempt}"
@@ -2236,12 +2080,6 @@ def phase3_prove(
                         and snapshot_file(target_file) != ""
                     ):
                         registry.call("overwrite_file", path=target_file, content=best_checkpoint["content"])
-                        if best_checkpoint.get("staging_content") is not None:
-                            registry.call(
-                                "overwrite_file",
-                                path=_staging_rel,
-                                content=best_checkpoint["staging_content"],
-                            )
                         result_msg = (
                             "## REGRESSION DETECTED\n"
                             f"Sorry count regressed from {best_checkpoint['sorry_count']} to {last_sorry_in_attempt}. "
@@ -2289,7 +2127,7 @@ def phase3_prove(
                                     _gp_rel = str(_gp.relative_to(PROJECT_ROOT))
                                     if snapshot_file(_gp_rel) != _goriginal:
                                         registry.call("overwrite_file", path=_gp_rel, content=_goriginal)
-                                        console.print(f"  [Staging] Restored {_gp.name} (was modified)")
+                                        console.print(f"  [Glue] Restored {_gp.name} (was modified)")
                                 for _lp, _loriginal in _layer0_snapshot.items():
                                     _lp_rel = str(_lp.relative_to(PROJECT_ROOT))
                                     if snapshot_file(_lp_rel) != _loriginal:
@@ -2506,19 +2344,12 @@ def phase3_prove(
                             initial_hash = _file_hash(target_file)
                             initial_exists = True
                             file_changed = True
-                            # Also restore staging file to its checkpointed state.
-                            if best_checkpoint.get("staging_content") is not None:
-                                registry.call(
-                                    "overwrite_file",
-                                    path=_staging_rel,
-                                    content=best_checkpoint["staging_content"],
-                                )
                             # Restore any Glue files Agent3 may have corrupted.
                             for _gp, _goriginal in _glue_snapshot.items():
                                 _gp_rel = str(_gp.relative_to(PROJECT_ROOT))
                                 if snapshot_file(_gp_rel) != _goriginal:
                                     registry.call("overwrite_file", path=_gp_rel, content=_goriginal)
-                                    console.print(f"  [Staging] Restored {_gp.name} (SIGNATURE_HALLUCINATION rollback)")
+                                    console.print(f"  [Glue] Restored {_gp.name} (SIGNATURE_HALLUCINATION rollback)")
                             # Restore any Layer0 files Agent3 may have corrupted.
                             for _lp, _loriginal in _layer0_snapshot.items():
                                 _lp_rel = str(_lp.relative_to(PROJECT_ROOT))
@@ -2538,9 +2369,7 @@ def phase3_prove(
                             file_changed = False
                             # Re-run Phase 3a scaffold so Agent3 has a clean compilable base.
                             _halluc_scaffold_registry = ToolRegistry()
-                            _halluc_scaffold_registry.register_scaffold_tools(
-                                target_algo=_algo_name_for_staging
-                            )
+                            _halluc_scaffold_registry.register_scaffold_tools()
                             _halluc_err_ctx = (
                                 f"[STATEMENT ERROR — SIGNATURE HALLUCINATION]\n"
                                 f"Lean error excerpt:\n```\n"
@@ -2558,7 +2387,7 @@ def phase3_prove(
                             )
                             guidance, _ = _call_agent2_with_tools(
                                 agent2,
-                                staging_registry,
+                                escalation_registry,
                                 _halluc_err_ctx + "Provide updated strategy for the re-scaffold.",
                             )
                             _scaffold_ok_h = _call_agent2_scaffold(
@@ -2566,8 +2395,7 @@ def phase3_prove(
                                 _halluc_scaffold_registry,
                                 target_file,
                                 guidance,
-                                staging_rel=_staging_rel,
-                                algo_name=_algo_name_for_staging,
+                                algo_name=_algo_name,
                             )
                             if _scaffold_ok_h:
                                 initial_exists = True
@@ -2669,12 +2497,10 @@ def phase3_prove(
                                     agent6,
                                     agent6_registry,
                                     target_file,
-                                    _staging_path,
-                                    _staging_rel,
                                     goal,
                                     str(_primary_local.get("message", ""))[:600],
                                     infra_diag,
-                                    _algo_name_for_staging,
+                                    _algo_name,
                                     hypotheses=hypotheses,
                                     stuck_line=_line_int,
                                 )
@@ -2708,16 +2534,14 @@ def phase3_prove(
                                     )
                                 else:
                                     _current_snippet = _build_escalation_file_context(target_file, _line_int)
-                                    _staging_snippet = _staging_read_overlay()
                                     new_guidance, _ = _call_agent2_with_tools(
                                         agent2,
-                                        staging_registry,
-                                        f"[AGENT6 AUTO-ROUTE FALLBACK — Agent6 could not prove glue]\n"
+                                        escalation_registry,
+                                        f"[AGENT6 AUTO-ROUTE FALLBACK — Agent6 could not prove helper lemma]\n"
                                         f"System detected infra gap: {infra_diag}\n\n"
                                         f"Error: {_primary_local.get('message', '')}\n\n"
                                         f"Target: {target_file} line {err_line_no}. Goal: {goal[:500]}...\n\n"
                                         f"=== CURRENT FILE ({target_file}) ===\n```lean\n{_current_snippet}\n```\n\n"
-                                        f"=== STAGING FILE ({_staging_rel}) ===\n```lean\n{_staging_snippet}\n```\n\n"
                                         f"Provide revised guidance. Agent3 continues in the SAME attempt.",
                                     )
                                     result_msg = (
@@ -2792,7 +2616,7 @@ def phase3_prove(
                             continue
 
                     if error_type == "DEPENDENCY_COMPILE_ERROR":
-                        # Errors originate from a staging/dependency file, not target.
+                        # Errors originate from a dependency/import file, not target.
                         # Do NOT rewrite target — route to dependency fix via Agent2.
                         _dep_only = [
                             e for e in _structured_errors_inner
@@ -2804,18 +2628,8 @@ def phase3_prove(
                         )
                         console.print(
                             f"  [Agent3] attempt {attempt}/{max_retries} — "
-                            "[cyan]DEPENDENCY_COMPILE_ERROR — routing to dep-fix (staging fix)"
+                            "[cyan]DEPENDENCY_COMPILE_ERROR — routing to dep-fix via Agent2"
                         )
-                        # Try deterministic rule-based staging fix first (no LLM call).
-                        _staging_rule_fixes = apply_staging_rules(_staging_physical_path(), last_verify_text)
-                        if _staging_rule_fixes > 0:
-                            console.print(
-                                f"  [Auto-fix] Applied {_staging_rule_fixes} rule-based "
-                                f"fix(es) to {_staging_path.name} — skipping Agent2 call."
-                            )
-                            _inner_break_reason = "dep_compile_error"
-                            _break_attempt = True
-                            break
                         execution_history.extend(exec_results)
                         _attempt_failures_current = [
                             a for a in attempt_failures if a.get("attempt") == attempt
@@ -2829,19 +2643,18 @@ def phase3_prove(
                         )
                         guidance, _ = _call_agent2_with_tools(
                             agent2,
-                            staging_registry,
+                            escalation_registry,
                             _attempt_diag
                             +
-                            f"[DEPENDENCY COMPILE ERROR — STAGING/IMPORT FILE BROKEN]\n"
-                            f"Errors are in a dependency or staging file, NOT in {target_file}.\n\n"
+                            f"[DEPENDENCY COMPILE ERROR — IMPORT FILE BROKEN]\n"
+                            f"Errors are in a dependency file, NOT in {target_file}.\n\n"
                             f"Failing dependency errors:\n```\n{_dep_errors_text}\n```\n\n"
                             f"Target file ({target_file}) is NOT the source of errors — "
                             "do NOT rewrite or delete the target.\n\n"
                             "REQUIRED ACTION:\n"
                             "1. search_codebase to find the correct Lean 4 / Mathlib API names "
                             "for any unknown identifiers.\n"
-                            "2. Use write_staging_lemma or edit_file_patch to fix the staging "
-                            f"file ({_staging_rel}) only.\n"
+                            "2. Use edit_file_patch to fix the dependency file directly.\n"
                             "3. Output a PATCH block (<<<SEARCH>>>/<<<REPLACE>>>) with the "
                             "exact fix. Reference verified API names only.",
                         )
@@ -2881,9 +2694,6 @@ def phase3_prove(
                         best_checkpoint = {
                             "sorry_count": last_sorry_in_attempt,
                             "content": load_file(target_file),
-                            "staging_content": (
-                                _staging_read_overlay(default="") or None
-                            ),
                         }
                         console.print(
                             f"  [Checkpoint] Updated at turn limit: sorry={last_sorry_in_attempt}"
@@ -2918,11 +2728,6 @@ def phase3_prove(
                     "overwrite_file", path=target_file,
                     content=best_checkpoint["content"],
                 )
-                if best_checkpoint.get("staging_content") is not None:
-                    registry.call(
-                        "overwrite_file", path=_staging_rel,
-                        content=best_checkpoint["staging_content"],
-                    )
                 last_sorry_in_attempt = int(best_checkpoint["sorry_count"])
                 last_sorry_count = last_sorry_in_attempt
                 last_exit_code = 0
@@ -2968,7 +2773,7 @@ def phase3_prove(
                 + "\n```\n\n"
                 "Provide updated proof strategy for the unresolved sorry lines. "
                 "Apply your Sorry-Fill Proof Path Protocol. "
-                "If a Level-2 missing glue lemma is needed, write it to staging NOW.\n\n"
+                "If a Level-2 missing helper lemma is needed, add it directly in the target file before the main theorem.\n\n"
                 "## ROUTING DECISION REQUIRED\n"
                 "End your response with a ROUTE_DECISION JSON block indicating which agent "
                 "should handle the next attempt:\n"
@@ -2985,7 +2790,7 @@ def phase3_prove(
                 + ", ".join(f"line {ln}" for ln in _skipped_sorry_lines)
             )
             guidance, _a2_route_replan = _call_agent2_with_tools(
-                agent2, staging_registry, _round_replan_prompt
+                agent2, escalation_registry, _round_replan_prompt
             )
 
             # Execute Agent2's routing decision for the NEXT attempt.
@@ -3017,7 +2822,7 @@ def phase3_prove(
                     "Revise the overall proof approach fundamentally. Do NOT reuse the same tactics.\n\n"
                     + guidance
                 )
-                guidance, _ = _call_agent2_with_tools(agent2, staging_registry, _self_msg_replan)
+                guidance, _ = _call_agent2_with_tools(agent2, escalation_registry, _self_msg_replan)
                 console.print("  [A2Router→Self] Agent2 self-revision triggered (replan)")
 
         # ---------------------------------------------------------------
@@ -3097,7 +2902,7 @@ def phase3_prove(
         attempt_file_changed = _target_exists_overlay() and (current_hash_end != attempt_start_hash)
 
         # No-op trap: file unchanged regardless of build status.
-        # NOTE: DEPENDENCY_COMPILE_ERROR is excluded — when staging is broken
+        # NOTE: DEPENDENCY_COMPILE_ERROR is excluded — when a dependency is broken
         # Agent3 correctly leaves the target file untouched; falling through to
         # the dep-error handler below is the right behaviour.
         if not attempt_file_changed and _target_exists_overlay():
@@ -3119,7 +2924,7 @@ def phase3_prove(
                     "(<<<SEARCH>>>/<<<REPLACE>>>) with the exact Lean code to apply. "
                     "Be specific — no natural language, no explanation without a patch."
                 )
-                guidance, _a2_route_noop = _call_agent2_with_tools(agent2, staging_registry, _noop_ctx)
+                guidance, _a2_route_noop = _call_agent2_with_tools(agent2, escalation_registry, _noop_ctx)
                 console.print(
                     f"  [Agent3] attempt {attempt}/{max_retries} — "
                     f"build={last_exit_code} (file UNCHANGED — NOOP forced)"
@@ -3155,11 +2960,11 @@ def phase3_prove(
                         "Revise the overall proof approach fundamentally. Do NOT reuse the same tactics.\n\n"
                         + guidance
                     )
-                    guidance, _ = _call_agent2_with_tools(agent2, staging_registry, _self_msg_noop)
+                    guidance, _ = _call_agent2_with_tools(agent2, escalation_registry, _self_msg_noop)
                     console.print("  [A2Router\u2192Self] Agent2 self-revision triggered (NOOP)")
                 continue
 
-        # DEPENDENCY_COMPILE_ERROR: staging/dep broken — fix dep, never rewrite target
+        # DEPENDENCY_COMPILE_ERROR: dep broken — fix dep file directly, never rewrite target
         if error_type_final == "DEPENDENCY_COMPILE_ERROR":
             _dep_only_final = [
                 e for e in _structured_errors_final
@@ -3180,40 +2985,28 @@ def phase3_prove(
             else:
                 _dep_error_streak = 0
             _last_dep_error_sig = _dep_sig_now
-            # Try deterministic rule-based staging fix first (no LLM call).
-            _staging_rule_fixes_post = apply_staging_rules(_staging_physical_path(), last_verify_text)
-            if _staging_rule_fixes_post > 0:
-                console.print(
-                    f"  [Auto-fix] Applied {_staging_rule_fixes_post} rule-based "
-                    f"fix(es) to {_staging_path.name} — retrying without Agent2 call."
-                )
-                _dep_error_streak = 0  # reset streak after a fix
-                continue
-            _dep_staging_ctx = _staging_read_overlay()
             _ref_files_dep = _get_reference_files_with_descriptions(target_file)
             _ref_class_dep = _format_ref_and_classification_blocks(
                 _ref_files_dep, None
             )
             guidance, _ = _call_agent2_with_tools(
                 agent2,
-                staging_registry,
+                escalation_registry,
                 _attempt_diag
                 + _format_failed_approaches(_failed_approaches[-5:])
                 + (
-                    f"[DEP-ERROR STREAK: {_dep_error_streak} consecutive identical staging errors]\n"
+                    f"[DEP-ERROR STREAK: {_dep_error_streak} consecutive identical dep errors]\n"
                     "You MUST change your approach — previous fixes did not work.\n\n"
                     if _dep_error_streak >= 2 else ""
                 )
                 + f"[DEPENDENCY COMPILE ERROR — ATTEMPT {attempt} FAILED]\n"
-                f"Errors are in a dependency/staging file, NOT in {target_file}.\n\n"
+                f"Errors are in a dependency file, NOT in {target_file}.\n\n"
                 f"Dependency errors:\n```\n{_dep_errors_final}\n```\n\n"
-                f"=== STAGING FILE ({_staging_rel}) ===\n"
-                f"```lean\n{_dep_staging_ctx}\n```\n\n"
                 "Do NOT rewrite or delete the target file.\n\n"
                 "REQUIRED:\n"
                 "1. search_codebase to find the correct Lean 4 / Mathlib API for each "
                 "unknown identifier shown above.\n"
-                "2. Fix the staging file using write_staging_lemma or edit_file_patch.\n"
+                "2. Fix the dependency file directly using edit_file_patch.\n"
                 "3. Output a PATCH block (<<<SEARCH>>>/<<<REPLACE>>>) with exact correct API.\n"
                 "Use only API names you have verified via search_codebase."
                 + _ref_class_dep,
@@ -3226,7 +3019,6 @@ def phase3_prove(
             target_file,
             "",
             _goal_cache,
-            staging_has_errors=False,
             errors_text=last_verify_text,
         )
         _classification_request = (
@@ -3245,7 +3037,7 @@ def phase3_prove(
             "STRUCTURAL_GLUE: goal requires a NEW lemma (not present in any imported Lib/ file) "
             "to be proved — e.g. a bridge between two process definitions, a measurability "
             "result for a custom function, an expectation bound for a specific algorithm step. "
-            "Use when Agent6 (glue filler) must be invoked to prove a new staging lemma.\n"
+            "Use when Agent6 (glue filler) must be invoked to prove a new helper lemma.\n"
             "STRUCTURAL_INTERFACE: goal fails because of a wrong API call, missing typeclass "
             "instance, wrong dot-notation, or function signature mismatch that is fixable "
             "WITHOUT proving a new lemma — just correcting the call site. "
@@ -3271,7 +3063,6 @@ def phase3_prove(
                 else last_verify_text[:120].replace("\n", " ")
             )
             _escalation_file_ctx = _build_escalation_file_context(target_file, _err_line_int)
-            _staging_content_ctx = _staging_read_overlay()
             _primary_local = _structured_errors_final[0] if _structured_errors_final else None
             _ref_files_local = _get_reference_files_with_descriptions(target_file)
             _llm_class_local = (
@@ -3284,11 +3075,11 @@ def phase3_prove(
             # Fetch the actual Lean goal state at the error line so Agent2 can
             # generate PATCH blocks with correctly-typed terms (no coercion guessing).
             _error_line_goal = _prequery_error_line_goal(
-                staging_registry, target_file, _err_line_int, _goal_cache
+                escalation_registry, target_file, _err_line_int, _goal_cache
             )
             guidance, _a2_route_local = _call_agent2_with_tools(
                 agent2,
-                staging_registry,
+                escalation_registry,
                 _attempt_diag
                 + _format_failed_approaches(_failed_approaches[-5:])
                 + _ref_class_local
@@ -3300,16 +3091,14 @@ def phase3_prove(
                 + _error_line_goal
                 + f"\n=== AGENT3'S CURRENT FILE ({target_file}) ===\n"
                 f"```lean\n{_escalation_file_ctx}\n```\n\n"
-                f"=== STAGING FILE ({_staging_rel}) ===\n"
-                f"```lean\n{_staging_content_ctx}\n```\n\n"
                 f"Agent3 used all {max_tool_turns} turns on line {line_no_display_final} "
                 f"and could not fix the error.\n\n"
                 f"DIAGNOSE FIRST — apply your Sorry-Fill Proof Path Protocol:\n\n"
                 f"(A) STRUCTURAL error (type incompatibility, missing glue lemma, wrong proof\n"
                 f"    approach that cannot be fixed by patching the current code):\n"
                 f"    → Do NOT sorry-degrade. Provide a NEW proof strategy for the next attempt.\n"
-                f"    → If a Level-2 glue lemma is missing, use write_staging_lemma to add it\n"
-                f"      to {_staging_rel} NOW (with sorry body). Do not just describe it.\n"
+                f"    → If a Level-2 helper lemma is missing, add it DIRECTLY in the target file\n"
+                f"      before the main theorem using edit_file_patch (with sorry body).\n"
                 f"    → Explain why the current approach fails at the type level.\n\n"
                 f"(B) TACTICAL error (wrong tactic name, wrong lemma identifier, minor\n"
                 f"    type mismatch fixable with a one-line rewrite):\n"
@@ -3323,8 +3112,8 @@ def phase3_prove(
                 f"1. Do NOT use write_new_file — the file must NOT be deleted or overwritten.\n"
                 f"2. Use edit_file_patch with <<<SEARCH>>>/<<<REPLACE>>> for any patch.\n"
                 f"3. SEARCH must be copied verbatim from the current file shown above.\n"
-                f"4. For case A with a missing glue lemma: use write_staging_lemma first,\n"
-                f"   then reference it in your guidance for Agent3.\n\n"
+                f"4. For case A with a missing helper lemma: add it inline in the target file\n"
+                f"   before the main theorem, then reference it in your guidance for Agent3.\n\n"
                 + _retrieve_catalog_context(
                     _extract_new_identifiers_from_guidance(last_verify_text + "\n" + err_summary)
                 )
@@ -3361,7 +3150,7 @@ def phase3_prove(
                     "Revise the overall proof approach fundamentally. Do NOT reuse the same tactics.\n\n"
                     + guidance
                 )
-                guidance, _ = _call_agent2_with_tools(agent2, staging_registry, _self_msg_local)
+                guidance, _ = _call_agent2_with_tools(agent2, escalation_registry, _self_msg_local)
                 console.print("  [A2Router→Self] Agent2 self-revision triggered (LOCAL_PROOF_ERROR)")
             continue
 
@@ -3421,7 +3210,7 @@ def phase3_prove(
         if _inner_break_reason == "json_error":
             guidance, _ = _call_agent2_with_tools(
                 agent2,
-                staging_registry,
+                escalation_registry,
                 f"Attempt {attempt} failed.\n"
                 "Agent3 returned invalid JSON. Last error: " + last_errors + "\n"
                 "Adjust your guidance so Agent3 outputs strict single-action JSON."
@@ -3477,7 +3266,6 @@ def phase3_prove(
             _consecutive_repeat_count = 0  # reset after intervention
 
         _gen_file_ctx = _build_escalation_file_context(target_file, _err_line_int)
-        _gen_staging_ctx = _staging_read_overlay()
         _surgeon_prefix = (
             "[CIRCUIT BREAKER — SURGEON MODE FORCED]\n"
             "The same Lean error has occurred in 3 or more consecutive attempts.\n"
@@ -3519,7 +3307,7 @@ def phase3_prove(
         _history_prefix = _format_failed_approaches(_failed_approaches[-5:])
         guidance, _a2_route_gen = _call_agent2_with_tools(
             agent2,
-            staging_registry,
+            escalation_registry,
             _attempt_diag + _surgeon_prefix + _assumption_context_prefix + _history_prefix + mismatch_prefix
             + f"Attempt {attempt} failed.\n"
             f"Build exit code: {last_exit_code} | Sorry count: {last_sorry_in_attempt}\n"
@@ -3529,15 +3317,13 @@ def phase3_prove(
             f"\n```\n"
             f"\n=== AGENT3'S CURRENT FILE ({target_file}) ===\n"
             f"```lean\n{_gen_file_ctx}\n```\n\n"
-            f"=== STAGING FILE ({_staging_rel}) ===\n"
-            f"```lean\n{_gen_staging_ctx}\n```\n\n"
             f"SURGEON MODE: Diagnose the root cause of the Lean error above. "
             f"Focus on line {line_no_display_final} and its surrounding context. "
             "Then output one PATCH block per error in the <<<SEARCH>>>/<<<REPLACE>>> format. "
             "SEARCH must be copied verbatim from the current file (exact whitespace/indentation). "
             "Write the exact correct Mathlib 4 code in REPLACE — no vague suggestions. "
-            "If a Level-2 glue lemma is missing, use write_staging_lemma to add it to "
-            f"{_staging_rel} (with sorry body) before writing guidance for Agent3. "
+            "If a Level-2 helper lemma is missing, add it DIRECTLY in the target file "
+            "before the main theorem using edit_file_patch (with sorry body). "
             "If REPLACE uses a Lib/ lemma, add a comment above the patch: "
             "# Source: Lib/Glue/<File>.lean or Lib/Layer0/<File>.lean — <lemma name>. "
             "Do NOT name a lemma you have not verified in the file context provided. "
@@ -3578,20 +3364,15 @@ def phase3_prove(
                 "Revise the overall proof approach fundamentally. Do NOT reuse the same tactics.\n\n"
                 + guidance
             )
-            guidance, _ = _call_agent2_with_tools(agent2, staging_registry, _self_msg_gen)
+            guidance, _ = _call_agent2_with_tools(agent2, escalation_registry, _self_msg_gen)
             console.print("  [A2Router→Self] Agent2 self-revision triggered (general failure)")
-
-    # Staging lemma usage audit (6c): report which staging lemmas were referenced.
-    if snapshot_file(_staging_rel) and snapshot_file(target_file):
-        console.rule("[dim]Staging usage audit")
-        _audit_staging_usage(target_file, _staging_path, console.print)
 
     # Restore any shared Glue/Layer0 files Agent3 may have edited before exiting Phase 3.
     for _gp, _goriginal in _glue_snapshot.items():
         _gp_rel = str(_gp.relative_to(PROJECT_ROOT))
         if snapshot_file(_gp_rel) != _goriginal:
             registry.call("overwrite_file", path=_gp_rel, content=_goriginal)
-            console.print(f"  [Staging] Restored {_gp.name} (was modified by Agent3)")
+            console.print(f"  [Glue] Restored {_gp.name} (was modified by Agent3)")
     for _lp, _loriginal in _layer0_snapshot.items():
         _lp_rel = str(_lp.relative_to(PROJECT_ROOT))
         if snapshot_file(_lp_rel) != _loriginal:
@@ -3617,7 +3398,6 @@ def phase3_prove(
     _agent8_success, _agent8_plan, _agent8_errors = run_agent8_loop(
         agent2,
         target_file,
-        _staging_rel,
         guidance,
         last_errors,
         best_checkpoint=best_checkpoint,
@@ -3696,13 +3476,9 @@ def phase3_prove(
         if _target_exists_overlay()
         else f"(File '{target_file}' does not exist — Prover Agent never created it.)"
     )
-    _staging_file_for_repair = (
-        str(_staging_physical_path()) if _staging_exists_overlay() else None
-    )
     action = auto_repair_loop(
         agent5,
         target_file,
-        _staging_file_for_repair,
         last_errors,
         guidance,
         sorry_context,

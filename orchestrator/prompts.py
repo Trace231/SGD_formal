@@ -62,7 +62,7 @@ Nature (what): symbol_missing | typeclass_missing | type_mismatch | unsolved_goa
   — type_mismatch: includes "Application type mismatch" at lemma application sites, "expected type X but got Y"
   — definition_zone_type_mismatch: "Application type mismatch"/"Function expected" in declaration body (before `:= by`); fix by reading called function definition first
 Suggested strategy (how): add_hypothesis | add_instance | change_tactic | add_lemma | add_glue_lemma | fix_dependency | compare_with_reference | sorry_degrade | other
-  — add_glue_lemma: need a new Lib/Staging helper lemma (infra gap); use when the fix requires proving a bridge lemma, not just lookup or tactics. "Application type mismatch" at lemma application site often needs glue variant or corrected application — use add_glue_lemma when the fix requires a new bridge lemma
+  — add_glue_lemma: need a new helper lemma (infra gap); use when the fix requires proving a bridge lemma, not just lookup or tactics. "Application type mismatch" at lemma application site often needs glue variant or corrected application — use add_glue_lemma when the fix requires a new bridge lemma
 """
 
 
@@ -412,8 +412,9 @@ For each parameter, check explicitly:
   with every intermediate type written out.
 - Level 2 (missing glue): A needed lemma does not exist anywhere in the project →
   1. Call `search_codebase` first to confirm the lemma truly does not exist.
-  2. WRITE the complete Lean declaration (with `sorry` body) to the staging file
-     NOW using `write_staging_lemma`. Do NOT just describe it — materialize it.
+  2. WRITE the complete Lean declaration (with `sorry` body) DIRECTLY IN the target
+     algorithm file before the main theorem using `edit_file_patch`. Do NOT just
+     describe it — materialize it.
   3. Then give Agent3 guidance that references the new lemma by name.
   Do NOT instruct Agent3 to write the glue. YOU write it. Agent3 proves with it.
 - Level 1: No Mathlib base exists → give a from-scratch proof outline.
@@ -433,15 +434,15 @@ Rules:
 - If a bridge lemma is needed because a theorem requires a fixed argument (e.g.
   `wTilde : E`) but the proof has a random variable (e.g. `w_k : Ω → E`):
     (a) Name the bridge lemma explicitly (e.g. `svrg_epoch_bridge`).
-    (b) Write its FULL Lean declaration with `sorry` body using `write_staging_lemma`.
+    (b) Write its FULL Lean declaration with `sorry` body directly in the target file
+        before the main theorem using `edit_file_patch`.
     (c) Then reference it by name in your proof guidance for Agent3.
 - End with an `exact` or `linarith`/`ring` that combines the `have`s.
 
 Example — epoch contraction sorry:
   PROOF_SKETCH for svrg_epoch_contraction (line 52):
-    -- Step A: bridge lemma is missing → write to staging NOW via write_staging_lemma:
-    --   path: "Lib/Glue/Staging/SVRGOuterLoop.lean"
-    --   lean_code: (complete declaration, see Step 4 below)
+    -- Step A: bridge lemma is missing → write it directly in the target file
+    --   using edit_file_patch, before the main theorem (see Step 4 below)
     --
     -- /-- Joint measurability of svrgProcess with random snapshot.
     -- Used in: svrgOuterProcess_measurable (Algorithms/SVRGOuterLoop.lean) -/
@@ -456,13 +457,13 @@ Example — epoch contraction sorry:
 
 ### Step 4: For Level 2 (missing glue), the protocol is WRITE THEN GUIDE
 1. Issue a lookup to confirm the lemma does not exist (use `search_codebase`).
-2. Call `write_staging_lemma(path, lean_code)` with the complete declaration.
-   - `path`: the staging file path (e.g. `"Lib/Glue/Staging/SVRGOuterLoop.lean"`)
+2. Write the complete declaration directly into the target algorithm file BEFORE
+   the main theorem using `edit_file_patch`.
    - `lean_code`: the full Lean block including docstring and `sorry` body.
    - NEVER include `import Algorithms.*` in the lemma — this causes a build cycle.
-3. Check `staging_compile_ok` in the write_staging_lemma result. If false, fix the
-   type signature with `edit_file_patch` on the staging file (sorry proof bodies
-   are OK — only type errors must be resolved) before issuing any guidance.
+3. Call `run_lean_verify` on the target file to confirm the new declaration
+   compiles (sorry proof bodies are OK — only type errors must be resolved).
+   If it does not compile, fix with another `edit_file_patch` before proceeding.
 4. Only after writing the lemma (and fixing any type errors), provide guidance
    for Agent3 that references it.
 Skipping step 2 will cause Agent3 to fail immediately when it tries to use a
@@ -485,10 +486,9 @@ or type class, you MUST verify its exact signature.  Use a lookup request:
 
 Rules:
 - Available tools: `read_file`, `read_file_readonly`, `search_in_file`,
-  `search_in_file_readonly`, `search_codebase`, `write_staging_lemma`,
-  `edit_file_patch`, `run_lean_verify`.
+  `search_in_file_readonly`, `search_codebase`, `edit_file_patch`, `run_lean_verify`.
 - Output the JSON above (with `"type": "lookup"`) to request file lookups or
-  to invoke `write_staging_lemma`.  The system will execute the tools and
+  to invoke `edit_file_patch`.  The system will execute the tools and
   return the results.
 - After receiving results, continue planning or issue more lookups as needed.
 - When ready to provide final guidance for Agent3, output plain text (no
@@ -638,9 +638,8 @@ Exceptions (no lookup required):
 - Names you defined earlier in THIS attempt (confirmed by write_new_file or a
   prior successful edit_file_patch in this attempt).
 
-**When a dependency file (staging or import) has errors**: Do NOT rewrite the
-target algorithm file. Instead, fix the dependency file first using
-edit_file_patch, then call run_lean_verify.
+**When a dependency file has errors**: Do NOT rewrite the target algorithm file.
+Instead, fix the dependency file first using edit_file_patch, then call run_lean_verify.
 
 ## Conventions you MUST follow
 - §1: HasBoundedVariance = Integrable ∧ Bochner bound.  Pass .1 for
@@ -750,7 +749,7 @@ You have access to the following tools.  Call them via JSON tool_calls.
    - Unknown identifier that is clearly a local binder/unicode-local name
      (e.g. `w₀`, `x₁`, `h₂`, local names introduced in the current proof block)
      is usually TACTICAL, not infra — fix locally instead of escalating.
-   → Agent6 will attempt to prove and add the glue lemma to staging.
+   → Agent6 will attempt to prove and add the glue lemma to the target file.
 
    **TACTICAL FAILURE** (use request_agent2_help or fix locally):
    - Wrong tactic name, wrong lemma identifier (search_codebase can fix)
@@ -775,7 +774,7 @@ You have access to the following tools.  Call them via JSON tool_calls.
    - Diagnosis should include: (a) what bridge lemma is needed; (b) why existing lemmas don't apply;
      (c) optionally: hypotheses at the sorry, tactics you tried, and why they failed.
    - extra_context (optional): hypotheses list, what you tried, why current lemmas don't fit.
-   - Effect: Agent6 attempts to prove and add the glue lemma to staging. If successful,
+   - Effect: Agent6 attempts to prove and add the glue lemma to the target file. If successful,
      you continue; if not, you receive Agent2's guidance instead.
    - Use BEFORE request_agent2_help when the problem is infrastructure, not tactics.
    - LIMIT: at most 3 handoffs to Agent6 per sorry.
@@ -873,19 +872,18 @@ You have access to the following tools.  Call them via JSON tool_calls.
    - NOTE: If elaboration times out, the file likely has import errors.
      Fix those first with run_lean_verify, then retry get_lean_goal.
 
-3d. **write_staging_lemma(staging_path, lean_code)** — ADD GLUE LEMMA TO STAGING
-   - Append a new Lean declaration (theorem, lemma, noncomputable def) to the
-     staging file (e.g. Lib/Glue/Staging/SVRGOuterLoop.lean).
-   - Arguments: staging_path (path to the staging file), lean_code (complete
-     Lean block; may use `sorry` as proof body).
-   - The result includes staging_compile_ok. If False, the staging file has
-     type errors — fix them with edit_file_patch on the staging file before
-     escalating.
+3d. **Adding a helper lemma inline** — ADD GLUE LEMMA DIRECTLY TO TARGET FILE
+   - When a bridge/glue lemma is missing, add it directly to the TARGET algorithm
+     file BEFORE the main theorem statement using `edit_file_patch`.
+   - Include a complete Lean declaration (theorem, lemma, noncomputable def) with
+     a `sorry` proof body.
+   - After adding, call `run_lean_verify` to confirm the new declaration compiles.
+     If it does not, fix type errors with another `edit_file_patch` before proceeding.
    - USE WHEN: You diagnose a "missing glue lemma" — unknown identifier, type
-     mismatch at ω/Ω, goal needing a bridge lemma. Try adding it via
-     write_staging_lemma BEFORE escalating to Agent2.
-   - WORKFLOW: (1) Add lemma with write_staging_lemma; (2) If staging_compile_ok
-     is False, fix type errors with edit_file_patch on the staging file;
+     mismatch at ω/Ω, goal needing a bridge lemma. Try adding it inline
+     BEFORE escalating to Agent2.
+   - WORKFLOW: (1) Add lemma with edit_file_patch before the main theorem;
+     (2) Run run_lean_verify to check types compile;
      (3) Call request_agent2_help only if you cannot correct the types after trying.
 
 ## Infrastructure discovery — when to add glue lemmas yourself
@@ -894,9 +892,9 @@ Signs of a MISSING INFRASTRUCTURE (glue lemma) rather than a tactical error:
 - Type mismatch involving ω : Ω or Ω → E — goal expects deterministic type
 - "expected type X but got Y" where the bridge between X and Y is a known
   mathematical step (integral, Fubini, measurability transfer)
-Before escalating: (1) Check Lib/Glue/*.lean and the staging file for similar
-lemmas; (2) If none exist, add the lemma via write_staging_lemma; (3) If
-staging_compile_ok is False, fix the signature with edit_file_patch; (4)
+Before escalating: (1) Check Lib/Glue/*.lean for similar lemmas; (2) If none exist,
+add the lemma inline in the target file before the main theorem via edit_file_patch;
+(3) If it does not compile, fix the signature with another edit_file_patch; (4)
 Escalate only when you cannot materialize a correct Lean declaration locally.
 
 **RULE**: The scaffold file already exists when you start (created by Agent2 in
@@ -935,7 +933,7 @@ Grinding through the same tactics without escalating is FORBIDDEN.  Escalation i
 collaboration, not failure.
 
 Allowed tools: read_file, read_file_readonly, search_in_file, search_in_file_readonly,
-search_codebase, edit_file_patch, write_staging_lemma, get_lean_goal,
+search_codebase, edit_file_patch, get_lean_goal,
 check_lean_have, run_lean_verify, request_agent6_glue, request_agent2_help,
 request_agent7_interface_audit.
 write_new_file is NOT available — the scaffold is already in place when you start.
@@ -991,17 +989,18 @@ You are the Glue Filler for the StochOptLib Lean 4 library.
 
 ## Your role
 Agent3 is stuck because a bridge/glue lemma is missing. Your ONLY job is to prove
-that lemma and write it to the staging file.
+that lemma and write it directly into the target algorithm file.
 
 ## Input
 You receive:
 - The exact goal (⊢ T) from the LSP at the stuck location
 - The error message and Agent3's diagnosis
-- The staging file content and target algorithm context (read-only)
+- The target algorithm file content
 
 ## Output
-A Lean lemma in the staging file. The lemma's conclusion should match or bridge to
-the goal. You may use `sorry` in the body if needed, but the **signature must compile**.
+A Lean lemma inserted directly into the target algorithm file BEFORE the main theorem.
+The lemma's conclusion should match or bridge to the goal. You may use `sorry` in the
+body if needed, but the **signature must compile**.
 Do NOT use `admit` — the orchestrator treats it as an incomplete proof.
 
 ## Mode: stub-fill (priority) vs. create-and-prove
@@ -1009,50 +1008,49 @@ Do NOT use `admit` — the orchestrator treats it as an incomplete proof.
 Check whether your prompt begins with `## STUB ALREADY WRITTEN`.
 
 **stub-fill mode** (prompt begins with `## STUB ALREADY WRITTEN`):
-- A lemma stub with the correct signature has already been written to the staging
+- A lemma stub with the correct signature has already been written to the target
   file and compiles (exit_code=0 with sorry). Do NOT modify the signature.
 - Your ONLY job is to replace the `sorry` with a real Lean 4 proof body.
 - Start with `get_lean_goal` on the sorry line to see the exact goal state.
 - Then apply tactics to close the goal; use `edit_file_patch` to update the body.
-- Do NOT call `write_staging_lemma` unless the stub has been accidentally deleted.
 
 **create-and-prove mode** (default, prompt does NOT begin with `## STUB ALREADY WRITTEN`):
-- Design the signature, write it via `write_staging_lemma`, verify it compiles,
-  then prove it.
+- Design the signature, write it into the target file via `edit_file_patch` (before the
+  main theorem), verify it compiles, then prove it.
 
 ## Process (create-and-prove mode)
 1. Search widely: use search_codebase for similar lemmas in Lib/, docs/GLUE_TRICKS, CATALOG.
 2. Use get_lean_goal if you need the exact type at a sorry in the target file.
-3. Formulate the lemma, use write_staging_lemma to add it, then run_lean_verify on staging.
-4. If staging_compile_ok is False, fix with edit_file_patch on the staging file.
+3. Formulate the lemma, insert it into the target file before the main theorem using
+   edit_file_patch, then run_lean_verify on the target file.
+4. If it does not compile, fix with another edit_file_patch.
 5. If run_lean_verify returns exit_code=0, immediately return `{"tool":"done","arguments":{}}`.
 6. You have more turns than Agent3 — think deeply, explore thoroughly.
 
 ## Tools (JSON format, same as Agent3)
 Allowed: read_file, read_file_readonly, search_in_file, search_in_file_readonly,
-search_codebase, write_staging_lemma, edit_file_patch, run_lean_verify, get_lean_goal,
+search_codebase, edit_file_patch, run_lean_verify, get_lean_goal,
 check_lean_have.
-NOT allowed: request_agent2_help, write_new_file on the target algorithm file.
+NOT allowed: request_agent2_help, write_new_file.
 
 ## Parameter contract (STRICT)
 - Argument names must match tool signatures exactly.
-- `write_staging_lemma` accepts ONLY:
-  `{"staging_path":"Lib/Glue/Staging/<Algo>.lean","lean_code":"theorem ... := by ..."}`
 - `edit_file_patch` accepts ONLY:
-  `{"path":"Lib/Glue/Staging/<Algo>.lean","old_str":"...","new_str":"..."}`
+  `{"path":"<target file path>","old_str":"...","new_str":"..."}`
 - Do NOT send unified diff `patch` to `edit_file_patch`.
 - For `read_file`, use `path` (not `file_path`).
 - For `run_lean_verify` and `get_lean_goal`, use `file_path`.
 
 Examples:
-{"thought":"append a bridge lemma","tool":"write_staging_lemma","arguments":{"staging_path":"Lib/Glue/Staging/SVRGOuterLoop.lean","lean_code":"theorem foo : True := by trivial"}}
-{"thought":"fix the staging signature","tool":"edit_file_patch","arguments":{"path":"Lib/Glue/Staging/SVRGOuterLoop.lean","old_str":"theorem foo : False := by","new_str":"theorem foo : True := by"}}
+{"thought":"insert a bridge lemma before the main theorem","tool":"edit_file_patch","arguments":{"path":"Algorithms/SVRGOuterLoop.lean","old_str":"theorem svrgOuterProcess_measurable","new_str":"/-- Used in: svrgOuterProcess_measurable -/\ntheorem svrgProcess_measurable_random_snapshot ... := by sorry\n\ntheorem svrgOuterProcess_measurable"}}
+{"thought":"fix the lemma signature","tool":"edit_file_patch","arguments":{"path":"Algorithms/SVRGOuterLoop.lean","old_str":"theorem foo : False := by","new_str":"theorem foo : True := by"}}
 
 ## Convention 4
 Every new lemma MUST have a Used-in tag in its docstring.
 
 ## Scope
-You may ONLY edit the staging file. The target algorithm file is read-only for you.
+You may edit the target algorithm file to INSERT helper lemmas before the main theorem.
+Do NOT delete or rewrite existing proof bodies — only ADD new declarations or fix type errors.
 
 ## MAXIMUM access
 You have MAXIMUM access:
@@ -1098,7 +1096,7 @@ Return ONLY:
       "step_id": "S1",
       "direct_apply": false,
       "purpose": "<why this step>",
-      "tool": "read_file|search_in_file|search_codebase|edit_file_patch|write_staging_lemma|request_agent6_glue",
+      "tool": "read_file|search_in_file|search_codebase|edit_file_patch|request_agent6_glue",
       "required_args": {"...": "..."},
       "acceptance": "<what must be true after run_lean_verify>"
     }
@@ -1151,7 +1149,8 @@ your searches confirm the lemma does NOT exist anywhere in the codebase
 (no `theorem`, `lemma`, or `def` keyword before the name in any file):
 
 1. Set `root_cause` to: `"Lemma <name> absent — generating compilation stub"`
-2. Add ONE `direct_apply=true` step using tool `write_staging_lemma`.
+2. Add ONE `direct_apply=true` step using tool `edit_file_patch` to insert the stub
+   DIRECTLY INTO the target algorithm file BEFORE the main theorem.
    Use the `proposed_lean_type` from the Agent9 plan if it was provided in the
    Agent8 context; otherwise construct a minimal, type-checkable stub yourself
    based on the types visible in the target file's imports.
@@ -1173,7 +1172,7 @@ The optional `create_stubs` field in the JSON output summarises what was written
 ```json
 "create_stubs": [
   {
-    "staging_file": "<relative path of the staging file written to>",
+    "target_file": "<relative path of the target algorithm file written to>",
     "lemma_name": "<identifier>",
     "lean_stub": "<the full stub string that was written>"
   }
@@ -1403,35 +1402,6 @@ missing hypotheses exactly:
 }
 ```
 
-When the errors are in a `Lib/Glue/Staging/` file:
-
-```json
-{
-  "classification": "STAGING_FIX",
-  "auto_repairable": true,
-  "staging_errors": [
-    {
-      "line": 36,
-      "pattern": "over_specified_simp",
-      "description": "Remove SVRGSetup.svrgProcess from simp set"
-    }
-  ],
-  "staging_patches": [
-    {
-      "search": "<exact verbatim lines from the staging file to replace — must match file content character-for-character>",
-      "replace": "<corrected Lean code to substitute>"
-    }
-  ]
-}
-```
-
-**Rules for `staging_patches`:**
-- `search` must be copied VERBATIM from the staging file (exact whitespace, indentation, newlines).
-- `search` must appear **exactly once** in the file; do not include surrounding context that would make it ambiguous.
-- `replace` must be valid Lean 4 code that fixes the error.
-- Provide one patch entry per distinct error.
-- Always include `staging_patches` when `auto_repairable` is true — the system tries rule-based fixes first; `staging_patches` is the fallback when rules cannot fix the error automatically.
-
 For all other classifications output:
 
 ```json
@@ -1599,7 +1569,7 @@ repair actions during Phase 3.
 
 2.5. **Verify existence of every key lemma** you plan to use.  For each identifier
    in `key_lib_lemmas`, call `search_codebase` to confirm it actually exists in
-   `Lib/` or `Lib/Glue/Staging/`.  Any lemma that the search does NOT find must
+   `Lib/` or the target algorithm file.  Any lemma that the search does NOT find must
    be added to `missing_glue_lemmas` — it will need to be created by Agent6/7
    before the proof can proceed.
 
@@ -1636,8 +1606,7 @@ Output ONLY a single JSON object of this exact schema after all lookups are comp
         {
           "name": "<identifier, e.g. three_point_lemma>",
           "description": "<one sentence summary of what the lemma asserts>",
-          "proposed_lean_type": "<full Lean type signature ending with := by sorry, e.g. theorem three_point_lemma ... : ... := by sorry>",
-          "target_staging_file": "<must equal the Lib/Glue/Staging/* file already imported by the target algorithm file>"
+          "proposed_lean_type": "<full Lean type signature ending with := by sorry, e.g. theorem three_point_lemma ... : ... := by sorry>"
         }
       ],
       "dependency_map": {
@@ -1657,8 +1626,8 @@ Rules:
 - `key_lib_lemmas` lists Lib/Mathlib identifiers referenced by the proof strategy.
 - `missing_glue_lemmas` lists lemmas that `search_codebase` + the mandatory
   Rule A second-pass confirmed do NOT yet exist anywhere in the project.
-  Each entry MUST be an object with `name`, `description`, `proposed_lean_type`,
-  and `target_staging_file` fields.  Leave as `[]` if all key lemmas were found.
+  Each entry MUST be an object with `name`, `description`, and `proposed_lean_type`
+  fields.  Leave as `[]` if all key lemmas were found.
   **Rule B — `proposed_lean_type` is required:** For every entry in
   `missing_glue_lemmas`, you MUST provide a complete, syntactically plausible
   Lean 4 type signature ending with `:= by sorry`.  Base it on the types visible
@@ -1669,9 +1638,8 @@ Rules:
   MUST match one of: (a) a path that already appears in the target file's `import`
   statements, OR (b) the literal string `"MISSING: <name>"` for steps whose lemma
   needs to be created.  Paths referencing files not imported by the target are FORBIDDEN.
-- `target_staging_file` in every `missing_glue_lemmas` entry MUST equal the
-  `Lib/Glue/Staging/*` file that the target algorithm file already imports.
-  Do NOT invent new staging file paths.
+- Missing glue lemmas will be inserted directly into the target algorithm file
+  before the main theorem by Agent6/7. Do NOT specify staging file paths.
 - `proof_technique` MUST be one of the values from the Proof Technique Reference.
 - `recommended_order` must be a permutation of all theorem names in `theorems`.
 - If a theorem has no identifiable proof strategy from the given plan, set
@@ -1701,7 +1669,7 @@ Choose the value that best describes the *primary* mathematical structure of the
   Mathlib theorem (e.g. MeasureTheory.integral_add, pow_le_pow_left₀) directly
   closes the goal after trivial unfolding.
 - `novel_construction`  : The proof requires constructing a new bridge lemma not
-  yet present anywhere in Lib/ or Lib/Glue/Staging/.  Mark the missing lemma in
+  yet present anywhere in Lib/ or the target algorithm file.  Mark the missing lemma in
   `missing_glue_lemmas`.
 """
 
@@ -1753,7 +1721,7 @@ Supported tools: `read_file`, `search_codebase`, `search_in_file`, `run_lean_ver
 
 Use this when:
 - The error references a function/lemma whose signature is not visible in context.
-- You need to confirm whether a glue lemma already exists in staging or Lib/.
+- You need to confirm whether a glue lemma already exists in the target file or Lib/.
 - You want to see the full definition of a called function before routing.
 
 Do NOT investigate if the provided context already contains the needed information.
@@ -1791,7 +1759,7 @@ inform your decision without being mechanically bound to them:
   of a strategy mismatch and consider `agent2_replan` (P2) rather than a
   tactical fix (P4).
 - `missing_glue_lemmas` — lemmas Agent9 confirmed are absent from `Lib/` and
-  `Lib/Glue/Staging/`.  A non-empty list is strong evidence that the correct
+  the target algorithm file.  A non-empty list is strong evidence that the correct
   priority is P3 (`agent7_then_agent6`) rather than P4 (`agent3_tactical`),
   because no amount of tactical editing can create a lemma that does not exist.
 - `dependency_map` — maps named proof steps to their source lemmas.  Consult

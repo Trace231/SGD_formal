@@ -31,15 +31,6 @@ _LIB_DECL_RE = re.compile(
 
 _MIN_AGENT2_LOOKUP_ROUNDS = 2
 
-# Known Lean 4 API misspellings in staging files: wrong_pattern → correct_name_hint.
-_STAGING_API_MISSPELLINGS: dict[str, str] = {
-    r"\bMeasurable\.prod_mk\b": "Measurable.prodMk",
-    r"\b\.prod_mk\b": ".prodMk",
-    r"\bsgdProcess_zero\b": "SVRGSetup.process_zero (dot notation)",
-    r"\bsgdProcess_succ\b": "SVRGSetup.process_succ (dot notation)",
-    r"\bsgdProcess_measurable\b": "SVRGSetup.svrgProcess_measurable",
-}
-
 # Snake_case identifiers that look like project-specific lemma names.
 _PROJECT_IDENT_RE = re.compile(r"\b([a-z][a-z0-9]*(?:_[a-z][a-z0-9]*){1,})\b")
 
@@ -140,59 +131,6 @@ def _extract_imported_algo_sigs(target_file: str) -> str:
     )
 
 
-def _extract_staging_sigs(staging_path: "Path") -> str:
-    """Return a compact signature block for all theorem/lemma/def in a staging file.
-
-    Reuses the same parsing logic as _extract_imported_algo_sigs: collect declaration
-    lines until proof body, strip at `:=`. Generic — works for any staging file.
-    """
-    try:
-        rel = (
-            str(staging_path.relative_to(PROJECT_ROOT))
-            if staging_path.is_absolute()
-            else str(staging_path)
-        )
-        content = snapshot_file(rel)
-    except Exception:  # noqa: BLE001
-        return ""
-    if not content:
-        return ""
-    algo_lines = content.splitlines()
-    sigs: list[str] = []
-    i = 0
-    while i < len(algo_lines):
-        line = algo_lines[i]
-        if not _DECL_START.match(line):
-            i += 1
-            continue
-        sig: list[str] = [line]
-        j = i + 1
-        while j < len(algo_lines):
-            next_line = algo_lines[j]
-            if next_line.strip() == "" or _TOP_LEVEL_KEYWORDS.match(next_line):
-                break
-            stripped = next_line.lstrip()
-            if stripped.startswith("| ") or re.match(r"^\s*by\b", next_line):
-                break
-            sig.append(next_line)
-            j += 1
-        sig_text = "\n".join(sig)
-        if ":=" in sig_text:
-            sig_text = sig_text[: sig_text.index(":=")].rstrip()
-        if sig_text.strip():
-            sigs.append(sig_text)
-        i = j
-    if not sigs:
-        return ""
-    staging_rel = str(staging_path.relative_to(PROJECT_ROOT)) if PROJECT_ROOT in staging_path.parents else str(staging_path)
-    return (
-        f"## Staging lemma signatures (auto-extracted from {staging_rel})\n\n"
-        + "\n\n".join(sigs)
-        + "\n\n"
-    )
-
-
-
 def _format_agent3_tool_feedback(
     exec_results: list,
     verify_result: dict,
@@ -248,40 +186,6 @@ def _format_agent3_tool_feedback(
         "```",
     ])
     return "\n".join(parts)
-
-
-def _lint_staging_content(staging_text: str) -> list[tuple[str, str]]:
-    """Run the staging API lint pass on staging file content.
-
-    Returns a list of (wrong_pattern, correction_hint) pairs for each violation found.
-    An empty list means the content passed all lint checks.
-    """
-    violations: list[tuple[str, str]] = []
-    for pattern, hint in _STAGING_API_MISSPELLINGS.items():
-        if re.search(pattern, staging_text):
-            violations.append((pattern.strip(r"\b"), hint))
-    return violations
-
-
-def _format_staging_lint_feedback(
-    violations: list[tuple[str, str]],
-    staging_file: str,
-) -> str:
-    """Format staging lint violations into an actionable Agent3 feedback message."""
-    lines = [
-        "## ⚠ STAGING FILE API LINT VIOLATIONS",
-        f"The following known API misspellings were detected in {staging_file}:",
-        "",
-    ]
-    for wrong, hint in violations:
-        lines.append(f"  - `{wrong}` → correct form: `{hint}`")
-    lines += [
-        "",
-        "These misspellings WILL cause Lean compilation errors.",
-        "Fix each occurrence in the staging file BEFORE calling run_lean_verify.",
-        "Use edit_file_patch with <<<SEARCH>>>/<<<REPLACE>>> targeting the staging file.",
-    ]
-    return "\n".join(lines)
 
 
 def _check_patch_symbols(
@@ -369,8 +273,7 @@ def _prioritize_error_text(
     Replaces bare ``last_verify_text[:N]`` truncation with an ordered view:
     1. Errors near the last edited line (±10 lines) — highest signal
     2. Errors in the target file
-    3. Errors in the staging file
-    4. All other dependency errors
+    3. All other dependency errors
 
     When structured_errors is empty, falls back to raw_text[:max_chars].
     """
@@ -386,9 +289,8 @@ def _prioritize_error_text(
             last_edit_line is not None
             and abs(eline - last_edit_line) <= 10
         )
-        is_target = efile == target_basename and "Staging" not in e["file"]
-        is_staging = "Staging" in e["file"]
-        tier = 0 if near_edit else (1 if is_target else (2 if is_staging else 3))
+        is_target = efile == target_basename
+        tier = 0 if near_edit else (1 if is_target else 2)
         return (tier, eline)
 
     sorted_errors = sorted(structured_errors, key=_priority)
@@ -700,7 +602,7 @@ def _prequery_dependency_signatures(
 
     # Also search all Lib/ subdirectories so glue/layer lemmas are found before
     # Agent8 concludes they are absent and routes to agent7_then_agent6.
-    _lib_dirs = ["Lib/Glue", "Lib/Layer0", "Lib/Layer1", "Lib/Glue/Staging"]
+    _lib_dirs = ["Lib/Glue", "Lib/Layer0", "Lib/Layer1"]
     for _d in _lib_dirs:
         for _p in sorted((PROJECT_ROOT / _d).glob("*.lean")):
             _rel = str(_p.relative_to(PROJECT_ROOT))
@@ -796,7 +698,6 @@ def _prequery_sorry_goals(
     target_file: str,
     guidance: str,
     goal_cache: dict,
-    staging_has_errors: bool,
     errors_text: str = "",
     target_line: int | None = None,
 ) -> str:
@@ -810,16 +711,12 @@ def _prequery_sorry_goals(
     them (deduped) with the file-scan results.
 
     Degradation conditions (any one triggers a skip for that line):
-    - staging_has_errors is True (staging file broken → elaboration will fail)
     - get_lean_goal returns error field non-None
     - elapsed_s > 90
 
     The cache key is (target_file, sorry_line, file_content_hash) so repeated
     calls on an unchanged file cost 0 extra elaboration time.
     """
-    if staging_has_errors:
-        return ""
-
     tgt_path = PROJECT_ROOT / target_file
     if not tgt_path.exists():
         return ""
@@ -1218,41 +1115,5 @@ def _build_escalation_file_context(target_file: str, stuck_line: int | None = No
     return f"-- SKELETON (proof bodies omitted; file exceeds {_ESCALATION_CHAR_LIMIT} chars)\n{skeleton}"
 
 
-def _audit_staging_usage(
-    target_file: str,
-    staging_path: "Path",
-    console_print: "Any",
-) -> dict[str, bool]:
-    """Return ``{lemma_name: used}`` for all declarations in the staging file.
-
-    Scans the final algorithm file for each declaration name found in the
-    staging file and reports whether it is referenced at least once.
-    """
-    staging_content = ""
-    if staging_path.exists():
-        staging_content = staging_path.read_text(encoding="utf-8")
-    else:
-        try:
-            _rel = str(staging_path.relative_to(PROJECT_ROOT))
-            staging_content = snapshot_file(_rel)
-        except Exception:  # noqa: BLE001
-            staging_content = ""
-    if not staging_content:
-        return {}
-    try:
-        target_content = load_file(target_file)
-    except Exception:  # noqa: BLE001
-        target_content = ""
-
-    decl_names = re.findall(r"(?:theorem|lemma|def)\s+(\w+)", staging_content)
-
-    usage: dict[str, bool] = {}
-    for name in decl_names:
-        used = bool(re.search(rf"\b{re.escape(name)}\b", target_content))
-        usage[name] = used
-        status = "USED" if used else "UNUSED (candidate for cleanup)"
-        console_print(f"  [Staging] {name} — {status}")
-
-    return usage
 
 
