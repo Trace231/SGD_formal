@@ -69,9 +69,14 @@ namespace SubgradientSetup
 
 variable (setup : SubgradientSetup E S Ω)
 
-/-- Process alias reusing SGD recursion verbatim (Archetype B pattern). -/
-noncomputable def process : ℕ → Ω → E :=
-  sgdProcess setup.w₀ setup.η setup.gradL setup.ξ
+/-- Self-contained recursive process definition for subgradient method (Archetype B). -/
+noncomputable def process : ℕ → Ω → E
+  | 0, _ => setup.w₀
+  | t + 1, ω => process t ω - setup.η t • setup.gradL (process t ω) (setup.ξ t ω)
+
+@[simp] theorem process_zero (ω : Ω) : process 0 ω = w₀ := rfl
+@[simp] theorem process_succ (t : ℕ) (ω : Ω) :
+    process (t + 1) ω = process t ω - η t • gradL (process t ω) (ξ t ω) := rfl
 
 end SubgradientSetup
 
@@ -112,9 +117,7 @@ theorem subgradient_convergence_convex
               setup.process t ω - wStar⟫_ℝ
           + (setup.η t) ^ 2 * ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 :=
       fun ω => by
-        have h_rec : setup.process (t + 1) ω = setup.process t ω - setup.η t • setup.gradL (setup.process t ω) (setup.ξ t ω) := by
-          rfl
-        rw [h_rec]
+        simp [process_succ]
         rw [norm_sq_sgd_step (setup.process t ω)
           (setup.gradL (setup.process t ω) (setup.ξ t ω)) wStar (setup.η t)]
         rw [real_inner_comm]
@@ -177,11 +180,11 @@ theorem subgradient_convergence_convex
           - 2 * setup.η t * (∫ ω, f (setup.process t ω) ∂setup.P - f wStar)
           + (setup.η t) ^ 2 * G ^ 2 := by
         -- A5. Apply Pattern I glue lemma
-        have h_wt_meas : Measurable (setup.process t) :=
-          sgdProcess_measurable setup.hξ_meas setup.hgL t
-        have h_var_bound : ∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P ≤ G ^ 2 :=
-          process_composition_expected_sq_norm_bound hbounded h_wt_meas
-            (setup.hξ_meas t) setup.hgL h_int_sq_t
+        have h_var_bound : ∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P ≤ G ^ 2 := by
+          apply integral_mono (integrable_const _) h_int_sq_t
+          intro ω
+          have h1 : ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ≤ G := hbounded _ _
+          nlinarith [sq_nonneg (‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖), h1]
         have hηt_pos : 0 < setup.η t := by rw [hη t]; exact hη_pos
         nlinarith [h_var_bound]
     rw [hη t] at this
@@ -208,7 +211,7 @@ theorem subgradient_convergence_convex
     have h_nonneg : 0 ≤ ∫ ω, ‖setup.process T ω - wStar‖ ^ 2 ∂setup.P :=
       integral_nonneg (h_int_norm_sq T) (fun _ => norm_sq_nonneg _ _)
     have h_w0 : ∫ ω, ‖setup.process 0 ω - wStar‖ ^ 2 ∂setup.P = ‖setup.w₀ - wStar‖ ^ 2 := by
-      rw [SubgradientSetup.process, sgdProcess_zero]
+      rw [process_zero]
       simp
     calc
       2 * η * ∑ t ∈ Finset.range T, (∫ ω, f (setup.process t ω) ∂setup.P - f wStar)

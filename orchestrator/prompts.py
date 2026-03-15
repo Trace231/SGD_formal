@@ -1004,7 +1004,23 @@ A Lean lemma in the staging file. The lemma's conclusion should match or bridge 
 the goal. You may use `sorry` in the body if needed, but the **signature must compile**.
 Do NOT use `admit` — the orchestrator treats it as an incomplete proof.
 
-## Process
+## Mode: stub-fill (priority) vs. create-and-prove
+
+Check whether your prompt begins with `## STUB ALREADY WRITTEN`.
+
+**stub-fill mode** (prompt begins with `## STUB ALREADY WRITTEN`):
+- A lemma stub with the correct signature has already been written to the staging
+  file and compiles (exit_code=0 with sorry). Do NOT modify the signature.
+- Your ONLY job is to replace the `sorry` with a real Lean 4 proof body.
+- Start with `get_lean_goal` on the sorry line to see the exact goal state.
+- Then apply tactics to close the goal; use `edit_file_patch` to update the body.
+- Do NOT call `write_staging_lemma` unless the stub has been accidentally deleted.
+
+**create-and-prove mode** (default, prompt does NOT begin with `## STUB ALREADY WRITTEN`):
+- Design the signature, write it via `write_staging_lemma`, verify it compiles,
+  then prove it.
+
+## Process (create-and-prove mode)
 1. Search widely: use search_codebase for similar lemmas in Lib/, docs/GLUE_TRICKS, CATALOG.
 2. Use get_lean_goal if you need the exact type at a sorry in the target file.
 3. Formulate the lemma, use write_staging_lemma to add it, then run_lean_verify on staging.
@@ -1127,6 +1143,45 @@ Constraints:
   fully determined after the lookup step, these edits qualify for direct_apply=true. If the same
   wrong pattern appears at multiple callsites, emit a separate direct_apply=true step for each.
   Do NOT emit tactic-level steps for definition-zone errors.
+
+## CREATE_STUB mode (activated when a lemma is absent from the codebase)
+
+When the incoming Agent8 diagnosis includes `missing_glue_lemmas` entries AND
+your searches confirm the lemma does NOT exist anywhere in the codebase
+(no `theorem`, `lemma`, or `def` keyword before the name in any file):
+
+1. Set `root_cause` to: `"Lemma <name> absent — generating compilation stub"`
+2. Add ONE `direct_apply=true` step using tool `write_staging_lemma`.
+   Use the `proposed_lean_type` from the Agent9 plan if it was provided in the
+   Agent8 context; otherwise construct a minimal, type-checkable stub yourself
+   based on the types visible in the target file's imports.
+3. The stub body MUST end with `:= by sorry` (do NOT use `admit`).
+4. Set `ordered_steps` to contain ONLY this one stub-writing step.
+   Do NOT add tactic-level steps — Agent6 will fill the sorry separately.
+5. Do NOT issue `request_agent6_glue` in CREATE_STUB mode — Agent8 dispatches
+   Agent6 after the stub has been written and verified to compile.
+
+Stub construction rules:
+- Derive ALL type annotations from what you can read in the target file's
+  `import` statements and the snippets provided in context.
+- NEVER invent a type or namespace that you have not seen in context.
+- Keep the stub as syntactically minimal as possible; do not add hypotheses
+  that are not strictly required for the type to parse.
+
+The optional `create_stubs` field in the JSON output summarises what was written:
+
+```json
+"create_stubs": [
+  {
+    "staging_file": "<relative path of the staging file written to>",
+    "lemma_name": "<identifier>",
+    "lean_stub": "<the full stub string that was written>"
+  }
+]
+```
+
+Include `create_stubs` whenever you operate in CREATE_STUB mode so that Agent8
+can record which stubs were created in this dispatch.
 """
 
 # -------------------------------------------------------------------
@@ -1548,6 +1603,15 @@ repair actions during Phase 3.
    be added to `missing_glue_lemmas` — it will need to be created by Agent6/7
    before the proof can proceed.
 
+   **Rule A — Double-layer existence check (MANDATORY):**
+   After `search_codebase(pattern=<name>)` returns a match, you MUST issue a
+   second `search_in_file` call targeting the matched file with
+   `pattern="def <name>|theorem <name>|lemma <name>"`.
+   A result that appears only inside a comment or docstring does NOT count as
+   existing.  Only a hit that contains `theorem`, `lemma`, or `def` immediately
+   before the name counts as a real implementation.  If the second search finds
+   no such hit, treat the lemma as missing and add it to `missing_glue_lemmas`.
+
 4. **Estimate difficulty**: `low` = direct by `simp`/`ring`/`linarith`;
    `medium` = requires 2-5 Mathlib lemmas; `high` = requires bridging lemmas or novel construction.
 
@@ -1568,7 +1632,14 @@ Output ONLY a single JSON object of this exact schema after all lookups are comp
       "proof_strategy": "<1-3 sentence description of the proof approach>",
       "proof_technique": "<one value from the Proof Technique Reference below>",
       "key_lib_lemmas": ["<fully-qualified Lean identifier or short name>"],
-      "missing_glue_lemmas": ["<short description of each lemma needed but absent from Lib/ and Staging/>"],
+      "missing_glue_lemmas": [
+        {
+          "name": "<identifier, e.g. three_point_lemma>",
+          "description": "<one sentence summary of what the lemma asserts>",
+          "proposed_lean_type": "<full Lean type signature ending with := by sorry, e.g. theorem three_point_lemma ... : ... := by sorry>",
+          "target_staging_file": "<must equal the Lib/Glue/Staging/* file already imported by the target algorithm file>"
+        }
+      ],
       "dependency_map": {
         "<local_have_name_or_step>": "<source file and lemma, e.g. Lib/Glue/Algebra.lean:norm_sq_expand>"
       },
@@ -1584,10 +1655,23 @@ Rules:
 - `lean_statement_line` MUST be obtained via `search_in_file` — never invented.
 - `dependencies` lists only theorems in the SAME target file, not Lib lemmas.
 - `key_lib_lemmas` lists Lib/Mathlib identifiers referenced by the proof strategy.
-- `missing_glue_lemmas` lists lemmas that `search_codebase` confirmed do NOT yet
-  exist anywhere in the project.  Leave as `[]` if all key lemmas were found.
+- `missing_glue_lemmas` lists lemmas that `search_codebase` + the mandatory
+  Rule A second-pass confirmed do NOT yet exist anywhere in the project.
+  Each entry MUST be an object with `name`, `description`, `proposed_lean_type`,
+  and `target_staging_file` fields.  Leave as `[]` if all key lemmas were found.
+  **Rule B — `proposed_lean_type` is required:** For every entry in
+  `missing_glue_lemmas`, you MUST provide a complete, syntactically plausible
+  Lean 4 type signature ending with `:= by sorry`.  Base it on the types visible
+  in the target file's imports.  Do NOT leave this field empty.
 - `dependency_map` maps each major proof step or `have` name to its source lemma.
   Leave as `{}` if the proof has no named intermediate steps.
+  **Rule C — `dependency_map` path constraint:** Every value in `dependency_map`
+  MUST match one of: (a) a path that already appears in the target file's `import`
+  statements, OR (b) the literal string `"MISSING: <name>"` for steps whose lemma
+  needs to be created.  Paths referencing files not imported by the target are FORBIDDEN.
+- `target_staging_file` in every `missing_glue_lemmas` entry MUST equal the
+  `Lib/Glue/Staging/*` file that the target algorithm file already imports.
+  Do NOT invent new staging file paths.
 - `proof_technique` MUST be one of the values from the Proof Technique Reference.
 - `recommended_order` must be a permutation of all theorem names in `theorems`.
 - If a theorem has no identifiable proof strategy from the given plan, set

@@ -87,6 +87,7 @@ def _build_agent8_tick_context(
     plan_updated_tick: int = 0,
     midcheck_mode: bool = False,
     midcheck_turns_elapsed: int = 0,
+    pending_lemma_status: dict | None = None,
 ) -> str:
     """Build a minimal, non-truncated diagnostic prompt for Agent8.
 
@@ -238,6 +239,20 @@ def _build_agent8_tick_context(
             f"```json\n{_a9_text[:_a9_chars]}\n```\n\n"
         )
 
+    # Pending lemma status block — shows per-lemma progress for sorry-only ticks.
+    _pending_lemma_block = ""
+    if pending_lemma_status:
+        _status_lines = [
+            f"  {name}: {info.get('status', '?')} "
+            f"(attempts={info.get('attempts', 0)})"
+            for name, info in pending_lemma_status.items()
+        ]
+        _pending_lemma_block = (
+            "## Pending Lemma Status\n"
+            + "\n".join(_status_lines)
+            + "\n\n"
+        )
+
     return (
         f"{_midcheck_banner}"
         f"{_new_plan_banner}"
@@ -249,6 +264,7 @@ def _build_agent8_tick_context(
         f"## Proof Plan (current)\n{agent2_plan[:_plan_chars]}\n\n"
         f"## Library Files Available\n{lib_desc}\n\n"
         f"{_a9_block}"
+        f"{_pending_lemma_block}"
         f"## Decision History (recent)\n{history_block}\n\n"
         f"{dep_sigs}"
         f"{algo_sigs}\n\n"
@@ -512,12 +528,19 @@ def _agent8_run_agent7_then_agent6(
     errors_text: str,
     agent7_targeted_prompt: str,
     agent6_targeted_prompt: str,
+    *,
+    agent9_plan: dict | None = None,
 ) -> dict:
-    """Run Agent7 for signature check, then Agent6 to prove the bridge lemma.
+    """Run Agent7 for signature check/stub creation, then Agent6 to fill the proof.
 
-    Returns {"exit_code": int, "sorry_count": int, "errors": str}.
+    Returns a dict with keys:
+      exit_code, sorry_count, errors  — final state of target_file
+      stub_compile_failed (bool)      — True when Agent7 stub did not compile
+      lemma_proven (bool)             — True when staging sorry count decreased
     """
-    # Phase 1: Agent7 signature audit
+    from orchestrator.verify import count_sorrys as _count_sorrys
+
+    # Phase 1: Agent7 signature audit / stub creation
     a7_plan, _a7_raw = _agent8_run_agent7(
         target_file, errors_text, agent7_targeted_prompt
     )
@@ -526,13 +549,22 @@ def _agent8_run_agent7_then_agent6(
         console.print(
             f"  [Agent8→Agent7] Root cause: {a7_plan.get('root_cause', '?')}"
         )
+        # If Agent7 is in CREATE_STUB mode, strip any request_agent6_glue steps
+        # to prevent double-dispatch (Agent8 handles Agent6 dispatch itself).
+        if a7_plan.get("create_stubs"):
+            a7_plan["ordered_steps"] = [
+                s for s in a7_plan.get("ordered_steps", [])
+                if s.get("tool") != "request_agent6_glue"
+            ]
+
         # Execute direct_apply steps from Agent7 protocol
         exec_registry = ToolRegistry()
         exec_registry.register_default_tools()
         for step in a7_plan.get("ordered_steps", []):
-            if step.get("direct_apply") and step.get("tool") == "edit_file_patch":
+            if step.get("direct_apply"):
+                _tool = step.get("tool", "")
                 req_args = step.get("required_args", {})
-                if req_args.get("old_str") and req_args.get("new_str"):
+                if _tool == "edit_file_patch" and req_args.get("old_str") and req_args.get("new_str"):
                     try:
                         exec_registry.call(
                             "edit_file_patch",
@@ -542,9 +574,51 @@ def _agent8_run_agent7_then_agent6(
                         )
                     except Exception:
                         pass
+                elif _tool == "write_staging_lemma" and req_args.get("lean_code"):
+                    try:
+                        exec_registry.call(
+                            "write_staging_lemma",
+                            staging_path=req_args.get("staging_path", staging_rel),
+                            lean_code=req_args["lean_code"],
+                        )
+                    except Exception:
+                        pass
+
+    # Phase 1.5: Validate staging file compiles after Agent7's writes.
+    from orchestrator.tools import run_lean_verify as _stub_verify
+    _staging_check = _stub_verify(staging_rel)
+    _stub_exit = int(_staging_check.get("exit_code", 1))
+    if _stub_exit != 0:
+        console.print(
+            f"  [Agent7 stub] Staging compile FAILED (exit={_stub_exit}) — "
+            "skipping Agent6, returning stub_compile_failed."
+        )
+        return {
+            "exit_code": 1,
+            "sorry_count": -1,
+            "errors": str(_staging_check.get("errors", "")),
+            "stub_compile_failed": True,
+            "lemma_proven": False,
+        }
+
+    # Snapshot staging sorry count before Agent6 so we can detect lemma-level progress.
+    _staging_path = PROJECT_ROOT / staging_rel
+    _staging_sorry_before = _count_sorrys(staging_rel)
+
+    # Phase 2: Extract proposed_signature from agent9_plan for the targeted lemma.
+    _proposed_sig: str | None = None
+    if agent9_plan:
+        for _thm in agent9_plan.get("theorems", []):
+            for _mgl in _thm.get("missing_glue_lemmas", []):
+                if isinstance(_mgl, dict):
+                    _mname = _mgl.get("name", "")
+                    if _mname and _mname in agent6_targeted_prompt:
+                        _proposed_sig = _mgl.get("proposed_lean_type") or None
+                        break
+            if _proposed_sig:
+                break
 
     # Phase 2: Agent6 glue lemma proof
-    staging_path = PROJECT_ROOT / staging_rel
     algo_name = Path(target_file).stem
     agent6 = Agent("glue_filler", extra_files=[target_file])
     agent6_registry = ToolRegistry()
@@ -553,25 +627,32 @@ def _agent8_run_agent7_then_agent6(
     agent6_registry.register("get_lean_goal", get_lean_goal)
     agent6_registry.register("check_lean_have", check_lean_have)
 
-    success, msg = _run_agent6_glue_loop(
+    _run_agent6_glue_loop(
         agent6,
         agent6_registry,
         target_file,
-        staging_path,
+        _staging_path,
         staging_rel,
         goal=agent6_targeted_prompt,
         error_message=errors_text[:500],
         diagnosis=agent6_targeted_prompt,
         target_algo=algo_name,
+        proposed_signature=_proposed_sig,
     )
 
-    # Verify final state
+    # Determine lemma_proven by comparing staging sorry count before/after Agent6.
+    _staging_sorry_after = _count_sorrys(staging_rel)
+    _lemma_proven = _staging_sorry_after < _staging_sorry_before
+
+    # Verify final state of the target file.
     from orchestrator.tools import run_lean_verify
     final = run_lean_verify(target_file)
     return {
         "exit_code": int(final.get("exit_code", 1)),
         "sorry_count": int(final.get("sorry_count", -1)),
         "errors": str(final.get("errors", "")),
+        "stub_compile_failed": False,
+        "lemma_proven": _lemma_proven,
     }
 
 
@@ -650,6 +731,8 @@ def _debug_log(
 def _check_anti_loop(
     decision: dict,
     decision_history: list[dict],
+    *,
+    pending_lemma_status: dict | None = None,
 ) -> tuple[str, str]:
     """Decide whether the proposed action should be overridden to break a loop.
 
@@ -664,7 +747,9 @@ def _check_anti_loop(
        action is already ``agent2_replan``).
     2. **Error frozen across all recent actions** — the last 3 history entries
        (regardless of action) all share the same ``errors_after[:120]``.
-       Escalate to ``human_missing_assumption``.
+       Escalate to ``human_missing_assumption`` UNLESS there are known pending
+       lemmas that have not yet exhausted their per-lemma attempt budget
+       (``pending_lemma_status`` exemption).
     3. **Classic heuristic fallback** — ``(action, error_sig[:LEN])`` pair
        repeated too many times (uses ``AGENT8_ERROR_SIG_FULL_LEN`` instead of
        the old 40-char truncation).
@@ -708,11 +793,23 @@ def _check_anti_loop(
         # fire human_missing_assumption on a normally-progressing sequence.
         _all_sorry_frozen = all(e.get("sorry_delta", None) == 0 for e in _last3)
         if _ea_signatures[0] and len(set(_ea_signatures)) == 1 and _all_sorry_frozen:
-            _reason = (
-                f"errors and sorry both unchanged across last 3 ticks: "
-                f"\"{_ea_signatures[0][:60]}\""
+            # Exemption: if there are known pending lemmas that still have attempt
+            # budget remaining, let Agent8 continue dispatching instead of gating.
+            _max_lemma_att = RETRY_LIMITS.get("AGENT8_MAX_LEMMA_ATTEMPTS", 3)
+            _has_pending_budget = pending_lemma_status and any(
+                v.get("status") == "pending"
+                and v.get("attempts", 0) < _max_lemma_att
+                for v in pending_lemma_status.values()
             )
-            return "human_missing_assumption", _reason
+            if _has_pending_budget:
+                # Do not gate; let the next tick continue with lemma proofs.
+                pass
+            else:
+                _reason = (
+                    f"errors and sorry both unchanged across last 3 ticks: "
+                    f"\"{_ea_signatures[0][:60]}\""
+                )
+                return "human_missing_assumption", _reason
 
     # --- Condition 3: classic (action, error_sig) pair heuristic (extended sig) ---
     if _escapable and decision_history:
@@ -762,6 +859,22 @@ def run_agent8_loop(
     _consecutive_same_error: int = 0
     _last_error_sig: str = ""
 
+    # Per-lemma attempt tracking for sorry-only scenarios.
+    # Populated from agent9_plan's missing_glue_lemmas at startup and after replans.
+    # key = lemma name, value = {"attempts": int, "status": "pending"|"success"|"failed"}
+    _pending_lemma_status: dict[str, dict] = {}
+
+    def _init_lemma_status_from_plan(plan: dict) -> None:
+        """Populate _pending_lemma_status from a (re-)plan without overwriting existing entries."""
+        for _thm in plan.get("theorems", []):
+            for _mgl in _thm.get("missing_glue_lemmas", []):
+                _name = _mgl["name"] if isinstance(_mgl, dict) else str(_mgl)
+                if _name and _name not in _pending_lemma_status:
+                    _pending_lemma_status[_name] = {"attempts": 0, "status": "pending"}
+
+    if agent9_plan:
+        _init_lemma_status_from_plan(agent9_plan)
+
     # Running sorry count — updated after every dispatch so we can compute
     # per-tick deltas and record them in decision_history.
     # Seed from best_checkpoint if available (most recent known sorry count before
@@ -808,6 +921,7 @@ def run_agent8_loop(
             target_file, current_errors, current_plan, decision_history, staging_rel,
             agent9_plan=agent9_plan,
             plan_updated_tick=_plan_updated_tick,
+            pending_lemma_status=_pending_lemma_status,
         )
 
         # 2. Call Agent8 with optional investigation rounds
@@ -892,7 +1006,10 @@ def run_agent8_loop(
         console.print(f"  [Agent8] Reason: {decision.get('reason', '?')}")
 
         # 4. Anti-loop check (behavior-driven, replaces old heuristic pair counters).
-        action, _antiloop_reason = _check_anti_loop(decision, decision_history)
+        action, _antiloop_reason = _check_anti_loop(
+            decision, decision_history,
+            pending_lemma_status=_pending_lemma_status,
+        )
         if _antiloop_reason:
             console.print(f"  [AntiLoop] {action} ← {_antiloop_reason}")
             decision["action"] = action
@@ -980,7 +1097,8 @@ def run_agent8_loop(
                 a7_prompt = decision.get("agent7_targeted_prompt", targeted_prompt)
                 a6_prompt = decision.get("agent6_targeted_prompt", targeted_prompt)
                 result = _agent8_run_agent7_then_agent6(
-                    target_file, staging_rel, current_errors, a7_prompt, a6_prompt
+                    target_file, staging_rel, current_errors, a7_prompt, a6_prompt,
+                    agent9_plan=agent9_plan,
                 )
                 outcome = {
                     "outcome": "success" if result["exit_code"] == 0 and result["sorry_count"] == 0 else "failed",
@@ -988,6 +1106,29 @@ def run_agent8_loop(
                     "sorry_count": result["sorry_count"],
                 }
                 current_errors = result.get("errors", current_errors)
+
+                # Update per-lemma status from the dispatch result.
+                _max_lemma_att = RETRY_LIMITS.get("AGENT8_MAX_LEMMA_ATTEMPTS", 3)
+                for _lname in list(_pending_lemma_status.keys()):
+                    if _lname in a6_prompt:
+                        if result.get("stub_compile_failed"):
+                            # Stub itself didn't compile — mark failed immediately.
+                            _pending_lemma_status[_lname]["status"] = "failed"
+                            console.print(
+                                f"  [Agent8] Stub compile failed for '{_lname}' "
+                                "— marking lemma as failed."
+                            )
+                        elif result.get("lemma_proven"):
+                            _pending_lemma_status[_lname]["status"] = "success"
+                        elif outcome["outcome"] != "dispatch_error":
+                            # A real attempt was made but lemma is not proven yet.
+                            _pending_lemma_status[_lname]["attempts"] += 1
+                            if _pending_lemma_status[_lname]["attempts"] >= _max_lemma_att:
+                                _pending_lemma_status[_lname]["status"] = "failed"
+                                console.print(
+                                    f"  [Agent8] Lemma '{_lname}' exhausted "
+                                    f"{_max_lemma_att} attempt(s) — marking failed."
+                                )
 
             elif action == "agent2_replan":
                 console.print("  [Agent8→Agent9] Dispatching strategy re-planning via Agent9...")
@@ -1003,6 +1144,7 @@ def run_agent8_loop(
                     agent9_plan = _new_plan
                     current_plan = json.dumps(_new_plan, indent=2, ensure_ascii=False)
                     _plan_updated_tick = tick
+                    _init_lemma_status_from_plan(_new_plan)
                     console.print(
                         "  [Agent8→Agent9] Re-plan succeeded. "
                         "Agent8 retains control for next tick."
@@ -1076,6 +1218,7 @@ def run_agent8_loop(
             "errors_before": _errors_before,
             "errors_after": _errors_after,
             "sorry_delta": _sorry_delta,
+            "lemma_status": dict(_pending_lemma_status),  # snapshot at this tick
             **outcome,
         })
         _debug_log(

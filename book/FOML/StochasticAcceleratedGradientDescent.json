@@ -1,0 +1,138 @@
+{
+  "algorithm": "StochasticAcceleratedGradientDescent",
+  "full_name": "Stochastic Accelerated Gradient Descent (Composite, General Convex)",
+  "source_reference": "Stochastic Programming Book, Chapter 4 (Sections 4.1, 4.2)",
+  "lean_theorem": "TBD",
+  "archetype": "B",
+  "archetype_note": "Uses a novel momentum-based update structure with three sequences and composite objective handling, distinct from plain SGD.",
+  "formalization_status": "not_started",
+  "formalization_difficulty": "high",
+  "prerequisite_lib_work": [
+    "Definition of Bregman divergence `bregman_divergence` and its strong convexity properties (Eq 3.2.1-3.2.3).",
+    "Definition of Stochastic First-Order Oracle `SFO` with unbiasedness and variance bounds (Assumption 2, 3).",
+    "Definition of generalized smoothness/strong convexity condition (Eq 4.2.2).",
+    "Lemma for martingale concentration inequalities (Lemma 4.1).",
+    "Definition of composite objective function `composite_objective` (\\Psi = f + h)."
+  ],
+  "sections": {
+    "1_assumptions": {
+      "title": "Assumptions and Context",
+      "space_geometry": {
+        "description": "Closed convex set $X \\subset \\mathbb{R}^m$ with norm $\\|\\cdot\\|$ and dual norm $\\|\\cdot\\|_*$. Distance generating function $\\nu$ is strongly convex with modulus $\\sigma_\\nu$ (Eq 3.2.1). Bregman divergence $V(x, z)$ defined (Eq 3.2.2). Diameter $D_X^2 = \\max V(x_1, x)$ (Eq 3.2.4).",
+        "note": "Without loss of generality, assume $\\sigma_\\nu = 1$."
+      },
+      "oracle_properties": {
+        "description": "SFO returns $G(x, \\xi)$ such that $\\mathbb{E}[G(x, \\xi)] = f'(x)$ (Eq 4.1.3) and variance $\\mathbb{E}[\\|G - f'\\|_*^2] \\le \\sigma^2$ (Eq 4.1.4). Optionally, sub-Gaussian tails (Assumption 4, Eq 4.1.15).",
+        "note": "Assumption 1 ensures i.i.d. samples $\\xi_t$."
+      },
+      "objective_properties": {
+        "description": "\\Psi(x) = f(x) + h(x). $f$ satisfies \\mu V(x, y) \\le f(y) - f(x) - \\langle f'(x), y - x \\rangle \\le \\frac{L}{2} \\|y - x\\|^2 + M \\|y - x\\| (Eq 4.2.2). $h$ is simple convex.",
+        "note": "Covers smooth (L>0), nonsmooth (M>0), and strongly convex (\\mu>0) cases."
+      },
+      "stepsize_conditions": {
+        "description": "Parameters \\{\\alpha_t\\}, \\{\\gamma_t\\}, \\{q_t\\} satisfy \\frac{q_t(1-\\alpha_t)}{\\alpha_t(1-q_t)} = \\frac{1}{1+\\mu \\gamma_t} (Eq 4.2.9), 1 + \\mu \\gamma_t > L \\alpha_t \\gamma_t (Eq 4.2.10), and \\frac{\\alpha_t}{\\gamma_t \\Gamma_t} \\le \\frac{\\alpha_{t-1}(1+\\mu \\gamma_{t-1})}{\\gamma_{t-1} \\Gamma_{t-1}} (Eq 4.2.22).",
+        "note": "\\Gamma_t is defined recursively in Eq 4.2.21."
+      }
+    },
+    "2_algorithm": {
+      "title": "Algorithm Specification",
+      "initialization": "x_0 \\in X",
+      "update_rule": {
+        "math": "\\underline{x}_t = (1 - \\alpha_t) \\bar{x}_{t-1} + \\alpha_t x_{t-1}, \\quad x_t = \\arg\\min_{x \\in X} \\{ \\gamma_t [\\langle G(\\underline{x}_t, \\xi_t), x \\rangle + h(x)] + V(x_{t-1}, x) \\}",
+        "ref": "Eq 4.2.36, 4.2.37 (for \\mu=0 case)",
+        "interpretation": "Compute extrapolated point, then perform proximal step with stochastic gradient.",
+        "note": "General \\mu > 0 case follows Prop 4.2 structure (Eq 4.2.5-4.2.7 referenced)."
+      },
+      "output": {
+        "math": "\\bar{x}_k",
+        "ref": "Theorem 4.4",
+        "description": "Weighted average sequence converging to optimum.",
+        "note": "Convergence rate depends on stepsize policy."
+      }
+    },
+    "3_key_lemma_chain": {
+      "title": "Key Lemma Chain",
+      "overview": "Proof relies on basic Mirror Descent inequality, one-step recursion for accelerated method, telescoping sum, and martingale concentration for high-probability bounds.",
+      "lemma_MD_basic": {
+        "id": "lemma_3.4",
+        "title": "Basic Mirror Descent Inequality",
+        "statement_math": "\\gamma_t \\langle g(x_t), x_{t+1} - x \\rangle + V(x_t, x_{t+1}) \\le V(x_t, x) - V(x_{t+1}, x)",
+        "proof_sketch": [
+          "Use optimality condition of prox-mapping (Eq 3.2.5).",
+          "Apply three-point identity for Bregman divergence."
+        ],
+        "key_technique": "Optimality condition",
+        "proof_technique": "direct_calc"
+      },
+      "lemma_martingale": {
+        "id": "lemma_4.1",
+        "title": "Martingale Concentration Bound",
+        "statement_math": "\\forall \\lambda \\ge 0 : \\text{Prob} \\left\\{ \\sum_{t=1}^N \\zeta_t > \\lambda \\sqrt{\\sum_{t=1}^N \\sigma_t^2} \\right\\} \\le \\exp\\{-\\lambda^2/3\\}",
+        "proof_sketch": [
+          "Use exponential moment bound for sub-Gaussian variables.",
+          "Apply Markov inequality to exponential sum."
+        ],
+        "key_technique": "Chernoff bound",
+        "proof_technique": "martingale"
+      },
+      "prop_one_step": {
+        "id": "proposition_4.2",
+        "title": "One-Step Recursion",
+        "statement_math": "\\Psi(\\bar{x}_t) \\le (1 - \\alpha_t) \\Psi(\\bar{x}_{t-1}) + \\alpha_t l_\\Psi(\\underline{x}_t, x) + \\frac{\\alpha_t}{\\gamma_t} [V(x_{t-1}, x) - (1 + \\mu \\gamma_t) V(x_t, x)] + \\Delta_t(x)",
+        "proof_sketch": [
+          "Expand f(\\bar{x}_t) using generalized smoothness (Eq 4.2.2).",
+          "Apply Lemma 3.5 (prox-lemma) to the update step.",
+          "Combine inequalities and define error term \\Delta_t(x) (Eq 4.2.13)."
+        ],
+        "key_technique": "Recursive inequality construction",
+        "proof_technique": "direct_calc"
+      },
+      "prop_telescoping": {
+        "id": "proposition_4.3",
+        "title": "Accumulated Inequality",
+        "statement_math": "\\Psi(\\bar{x}_k) - \\Gamma_k \\sum_{t=1}^k [\\frac{\\alpha_t}{\\Gamma_t} l_\\Psi(\\underline{x}_t, x)] \\le \\Gamma_k (1 - \\alpha_1) \\Psi(\\bar{x}_1) + \\Gamma_k \\sum_{t=1}^k \\frac{\\alpha_t}{\\gamma_t \\Gamma_t} [V(x_{t-1}, x) - (1 + \\mu \\gamma_t) V(x_t, x)] + \\Gamma_k \\sum_{t=1}^k \\frac{\\Delta_t(x)}{\\Gamma_t}",
+        "proof_sketch": [
+          "Divide Prop 4.2 inequality by \\Gamma_t.",
+          "Sum over t=1 to k.",
+          "Use telescoping property of V terms."
+        ],
+        "key_technique": "Telescoping sum",
+        "proof_technique": "telescoping_sum"
+      }
+    },
+    "4_final_theorem": {
+      "title": "Final Convergence Theorem",
+      "lean_identifier": "TBD",
+      "ref": "Theorem 4.4",
+      "statement_math": "\\mathbb{E}[\\Psi(\\bar{x}_k) - \\Psi^*] \\le B_e(k) := \\frac{\\Gamma_k}{\\gamma_1} V(x_0, x^*) + \\Gamma_k \\sum_{t=1}^k \\frac{\\alpha_t \\gamma_t (M^2 + \\sigma^2)}{\\Gamma_t (1 + \\mu \\gamma_t - L \\alpha_t \\gamma_t)} \\quad \\text{(Eq 4.2.23)}",
+      "interpretation": {
+        "first_term": "Initial distance to optimum scaled by stepsizes.",
+        "second_term": "Accumulated stochastic noise and nonsmoothness error.",
+        "rate": "Depends on stepsize policy (e.g. O(1/k^2) for smooth, O(1/sqrt(k)) for nonsmooth)."
+      },
+      "proof_dependency_summary": {
+        "new_lib_required": [
+          "Formalization of generalized smoothness condition (Eq 4.2.2).",
+          "Recursive sequence handling for \\Gamma_t, \\alpha_t.",
+          "High-probability bound logic (Eq 4.2.24)."
+        ],
+        "mathlib_lemmas": [
+          "Convexity inequalities.",
+          "Expectation linearity.",
+          "Markov inequality."
+        ],
+        "patterns_used": [
+          "telescoping_sum",
+          "martingale_concentration",
+          "recursive_descent"
+        ]
+      },
+      "formalization_roadmap": {
+        "phase_1": "Define Bregman divergence, SFO, and generalized smoothness condition.",
+        "phase_2": "Prove Lemma 3.4 (MD basic) and Lemma 4.1 (Martingale).",
+        "phase_3": "Prove Prop 4.2, Prop 4.3, and finally Theorem 4.4.",
+        "note": "Key blocker is managing the complex stepsize relations (Eq 4.2.9, 4.2.10, 4.2.22) in Lean."
+      }
+    }
+  }
+}

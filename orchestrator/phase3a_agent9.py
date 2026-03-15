@@ -26,7 +26,12 @@ _REQUIRED_KEYS = {"theorems", "recommended_order"}
 
 
 def _validate_agent9_plan(obj: Any) -> bool:
-    """Return True if *obj* is a well-formed Agent9 plan dict."""
+    """Return True if *obj* is a well-formed Agent9 plan dict.
+
+    Also emits console warnings for missing_glue_lemmas entries that lack the
+    new required fields (proposed_lean_type, target_staging_file) so that
+    operators can detect degraded plans before dispatch begins.
+    """
     if not isinstance(obj, dict):
         return False
     if not _REQUIRED_KEYS.issubset(obj.keys()):
@@ -35,6 +40,30 @@ def _validate_agent9_plan(obj: Any) -> bool:
         return False
     if not isinstance(obj.get("recommended_order"), list):
         return False
+    # Warn about missing_glue_lemmas entries that lack structured fields.
+    for thm in obj.get("theorems", []):
+        for mgl in thm.get("missing_glue_lemmas", []):
+            if isinstance(mgl, str):
+                console.print(
+                    f"  [Agent9] WARNING: missing_glue_lemma entry is a plain "
+                    f"string '{mgl}' — expected a dict with 'name', "
+                    "'proposed_lean_type', and 'target_staging_file'. "
+                    "Agent6/7 will receive weaker guidance."
+                )
+            elif isinstance(mgl, dict):
+                name = mgl.get("name", "<unnamed>")
+                if not mgl.get("proposed_lean_type"):
+                    console.print(
+                        f"  [Agent9] WARNING: missing_glue_lemma '{name}' "
+                        "has no proposed_lean_type — Agent6 will receive "
+                        "weaker guidance."
+                    )
+                if not mgl.get("target_staging_file"):
+                    console.print(
+                        f"  [Agent9] WARNING: missing_glue_lemma '{name}' "
+                        "has no target_staging_file — Agent7 may write to "
+                        "the wrong file."
+                    )
     return True
 
 

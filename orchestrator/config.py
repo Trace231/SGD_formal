@@ -370,6 +370,10 @@ RETRY_LIMITS: dict[str, int] = {
     # Agent8 anti-loop: length of error-signature string used for loop detection.
     # Replaces the previous 40-char truncation that caused false collisions.
     "AGENT8_ERROR_SIG_FULL_LEN": 120,
+    # Agent8 sorry-only mode: max agent7_then_agent6 attempts per individual
+    # missing_glue_lemma before that lemma is marked "failed" and the anti-loop
+    # exemption for it is revoked.
+    "AGENT8_MAX_LEMMA_ATTEMPTS": 3,
 }
 
 TIMEOUTS: dict[str, int] = {

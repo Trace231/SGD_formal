@@ -205,8 +205,12 @@ def _run_agent6_glue_loop(
     stuck_line: int | None = None,
     max_tool_turns: int = 70,
     max_retries: int = 3,
+    proposed_signature: str | None = None,
 ) -> tuple[bool, str]:
     """Run Agent6 (Glue Filler) to prove a glue lemma that bridges to the given goal.
+
+    When ``proposed_signature`` is provided, Agent6 is told the stub already
+    exists and compiles — its only task is to fill the ``sorry``.
 
     Returns (success, message). On success, staging compiles (exit_code=0); sorry in body OK.
     """
@@ -221,9 +225,25 @@ def _run_agent6_glue_loop(
     target_snippet = _build_escalation_file_context(target_file, stuck_line)
     staging_content = staging_path.read_text(encoding="utf-8") if staging_path.exists() else "(empty)"
 
+    # Build mode-specific header.
+    if proposed_signature:
+        _mode_header = (
+            "## STUB ALREADY WRITTEN — your job is to fill the sorry\n\n"
+            "The following lemma stub has been written to the staging file and compiles "
+            "(exit_code=0 with sorry). Do NOT modify the signature.\n\n"
+            f"```lean\n{proposed_signature}\n```\n\n"
+            "Replace the `sorry` with a real Lean 4 proof body.\n"
+            "Start by calling `get_lean_goal` on the sorry line to see the exact goal state,\n"
+            "then fill the proof using tactics. Use `edit_file_patch` to replace the body.\n\n"
+        )
+    else:
+        _mode_header = (
+            "## GLUE LEMMA REQUEST\n"
+            "Agent3 is stuck on a structural gap. Prove a glue lemma that bridges to this goal.\n\n"
+        )
+
     prompt_parts = [
-        "## GLUE LEMMA REQUEST\n"
-        "Agent3 is stuck on a structural gap. Prove a glue lemma that bridges to this goal.\n\n"
+        _mode_header,
         f"### Goal (⊢ T) from the stuck sorry\n```\n{goal}\n```\n\n"
         f"### Error message\n```\n{error_message}\n```\n\n"
         f"### Diagnosis\n{diagnosis}\n\n"
