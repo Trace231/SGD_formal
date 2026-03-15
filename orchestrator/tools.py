@@ -566,14 +566,13 @@ def check_lean_have(
     tmp_path = PROJECT_ROOT / tmp_name
     try:
         tmp_path.write_text(modified_content, encoding="utf-8")
-        with _workspace_overlay_from_staging():
-            proc = subprocess.run(
-                ["lake", "env", "lean", tmp_name],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
+        proc = subprocess.run(
+            ["lake", "env", "lean", tmp_name],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
         raw = proc.stdout + proc.stderr
         # Replace the temp filename with the original so Agent3 sees meaningful
         # line references in error messages.
@@ -657,13 +656,12 @@ def get_lean_goal(
 
     from orchestrator.lean_lsp import query_goal_at_sorry
 
-    with _workspace_overlay_from_staging():
-        return query_goal_at_sorry(
-            project_root=PROJECT_ROOT,
-            file_path=resolved,
-            sorry_line=sorry_line,
-            timeout=timeout,
-        )
+    return query_goal_at_sorry(
+        project_root=PROJECT_ROOT,
+        file_path=resolved,
+        sorry_line=sorry_line,
+        timeout=timeout,
+    )
 
 
 def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
@@ -696,16 +694,15 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     build_returncode = 1
     build_errors_for_parsing = ""
     compiler_sorry_count = 0  # number of 'declaration uses sorry' warnings from compiler
-    with _workspace_overlay_from_staging():
-        build = lake_build(target=_path_to_lean_module(rel))
-        build_returncode = int(build.returncode)
-        raw_output = build.errors
-        build_errors_for_parsing = build.errors
-        compiler_sorry_count = build.sorry_count
+    build = lake_build(target=_path_to_lean_module(rel))
+    build_returncode = int(build.returncode)
+    raw_output = build.errors
+    build_errors_for_parsing = build.errors
+    compiler_sorry_count = build.sorry_count
 
-        # Fallback: freshly-created modules can temporarily miss lake target
-        # registration; elaborate the file directly instead of failing hard.
-        if build_returncode != 0 and re.search(r"unknown target", build.errors, re.IGNORECASE):
+    # Fallback: freshly-created modules can temporarily miss lake target
+    # registration; elaborate the file directly instead of failing hard.
+    if build_returncode != 0 and re.search(r"unknown target", build.errors, re.IGNORECASE):
             import subprocess
 
             proc = subprocess.run(
