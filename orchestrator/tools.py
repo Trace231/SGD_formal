@@ -703,23 +703,23 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     # Fallback: freshly-created modules can temporarily miss lake target
     # registration; elaborate the file directly instead of failing hard.
     if build_returncode != 0 and re.search(r"unknown target", build.errors, re.IGNORECASE):
-            import subprocess
+        import subprocess
 
-            proc = subprocess.run(
-                ["lake", "env", "lean", rel],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-                timeout=LEAN_BUILD_TIMEOUT,
-            )
-            build_returncode = int(proc.returncode)
-            raw_output = (proc.stdout or "") + (proc.stderr or "")
-            build_errors_for_parsing = raw_output if build_returncode != 0 else ""
-            # Re-count compiler sorry warnings from the direct-elaboration output.
-            from orchestrator.verify import _count_sorry_in_output as _cso
-            compiler_sorry_count = _cso(raw_output)
+        proc = subprocess.run(
+            ["lake", "env", "lean", rel],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=LEAN_BUILD_TIMEOUT,
+        )
+        build_returncode = int(proc.returncode)
+        raw_output = (proc.stdout or "") + (proc.stderr or "")
+        build_errors_for_parsing = raw_output if build_returncode != 0 else ""
+        # Re-count compiler sorry warnings from the direct-elaboration output.
+        from orchestrator.verify import _count_sorry_in_output as _cso
+        compiler_sorry_count = _cso(raw_output)
 
-        sorry_count = count_sorrys(rel)
+    sorry_count = count_sorrys(rel)
 
     all_lines = [line.strip() for line in raw_output.splitlines() if line.strip()]
     # Prefer lines that carry a specific file:line:col: error: location — these
@@ -759,19 +759,13 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
 
 def run_repo_verify() -> dict[str, Any]:
     """Run full-project Lean verification and measure total repo sorry count."""
-    with _workspace_overlay_from_staging():
-        build = lake_build()
-        total_sorry = 0
-        lean_files = list(PROJECT_ROOT.rglob("*.lean"))
-        _staging_root_local = _staging_root()
-        filtered_lean_files = []
-        for lean_file in lean_files:
-            if _staging_root_local and _is_under(lean_file.resolve(), _staging_root_local.resolve()):
-                continue
-            filtered_lean_files.append(lean_file)
-        for lean_file in filtered_lean_files:
-            rel = lean_file.relative_to(PROJECT_ROOT)
-            total_sorry += count_sorrys(rel)
+    build = lake_build()
+    total_sorry = 0
+    lean_files = list(PROJECT_ROOT.rglob("*.lean"))
+    filtered_lean_files = list(lean_files)
+    for lean_file in filtered_lean_files:
+        rel = lean_file.relative_to(PROJECT_ROOT)
+        total_sorry += count_sorrys(rel)
 
     error_lines = [
         line.strip()
