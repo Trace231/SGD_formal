@@ -2,7 +2,6 @@ import Main
 import Lib.Glue.Algebra
 import Lib.Glue.Probability
 import Lib.Layer0.IndepExpect
-import Lib.Glue.Staging.SubgradientMethod
 
 /-!
 # Stochastic Subgradient Method — Convex Non-Smooth Optimization (Primitive Form)

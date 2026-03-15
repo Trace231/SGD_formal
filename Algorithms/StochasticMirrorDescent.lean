@@ -3,7 +3,6 @@ import Mathlib.Analysis.Convex.Strong
 import Mathlib.MeasureTheory.Integral.Bochner.Basic
 import Mathlib.Probability.ConditionalExpectation
 import Mathlib.Topology.MetricSpace.Basic
-import Lib.Glue.Staging.StochasticMirrorDescent
 
 open MeasureTheory ProbabilityTheory
 open scoped InnerProductSpace
@@ -22,6 +21,62 @@ variable {E : Type*} [NormedAddCommGroup E] [InnerProductSpace ℝ E] [CompleteS
   [MeasurableSpace E] [BorelSpace E] [SecondCountableTopology E]
 variable {S : Type*} [MeasurableSpace S]
 variable {Ω : Type*} [MeasurableSpace Ω]
+
+-- ============================================================================
+-- BREGMAN DIVERGENCE INFRASTRUCTURE
+-- (formerly Lib/Glue/Staging/StochasticMirrorDescent.lean)
+-- ============================================================================
+
+/-- Bregman divergence induced by function `v` with gradient `grad_v`.
+`V v grad_v x z = v z - v x - ⟪grad_v x, z - x⟫_ℝ`
+Used in: `stochasticMirrorDescent_convergence` (this file) -/
+noncomputable def V (v : E → ℝ) (grad_v : E → E) (x z : E) : ℝ :=
+  v z - v x - ⟪grad_v x, z - x⟫_ℝ
+
+/-- Non-negativity under 1-strong convexity.
+Used in: `stochasticMirrorDescent_convergence` (this file) -/
+theorem V_nonneg {v : E → ℝ} {grad_v : E → E} {X : Set E} (hv : StrongConvexOn ℝ X 1 v)
+    (hx : x ∈ X) (hz : z ∈ X) (hdiff : DifferentiableAt ℝ v x) :
+    0 ≤ V v grad_v x z := by sorry
+
+/-- Bregman three-point identity.
+Used in: `lemma_3_4` (this file) -/
+theorem bregman_three_point_identity (v : E → ℝ) (grad_v : E → E) (x_t x_next x : E)
+    (hdiff_t : DifferentiableAt ℝ v x_t) (hdiff_next : DifferentiableAt ℝ v x_next) :
+    V v grad_v x_t x = V v grad_v x_t x_next + ⟪grad_v x_t - grad_v x_next, x - x_next⟫_ℝ + V v grad_v x_next x := by sorry
+
+/-- Three-point lemma (Lemma 3.4 from Lan).
+Used in: `stochasticMirrorDescent_convergence` (this file) -/
+theorem lemma_3_4 {v : E → ℝ} {grad_v : E → E} {X : Set E} {g : E} {x_t x_next x : E} {γ : ℝ}
+    (hv : StrongConvexOn ℝ X 1 v)
+    (hx_t : x_t ∈ X) (hx_next : x_next ∈ X) (hx : x ∈ X)
+    (hdiff_t : DifferentiableAt ℝ v x_t) (hdiff_next : DifferentiableAt ℝ v x_next)
+    (h_prox_opt : ∀ y ∈ X, ⟪γ • g + grad_v x_next - grad_v x_t, y - x_next⟫_ℝ ≥ 0) :
+    γ * ⟪g, x_next - x⟫_ℝ + V v grad_v x_t x_next ≤ V v grad_v x_t x - V v grad_v x_next x := by sorry
+
+/-- Noise cancellation via martingale difference property.
+Used in: `stochasticMirrorDescent_convergence` (this file) -/
+theorem noise_cancellation_lemma
+    {P : Measure Ω} [IsProbabilityMeasure P]
+    {ξ : ℕ → Ω → S} {G : ℕ → Ω → E} {x : ℕ → Ω → E} {x_star : E}
+    {t : ℕ}
+    (h_adapted : Measurable[⨆ i < t, MeasurableSpace.comap (ξ i) ‹MeasurableSpace S›] (x t))
+    (h_noise_zero_mean : ∀ ω, (condexp P (⨆ i < t, MeasurableSpace.comap (ξ i) ‹MeasurableSpace S›) (G t)) ω = 0) :
+    ∫ ω, ⟪G t ω, x t ω - x_star⟫_ℝ ∂P = 0 := by sorry
+
+/-- Oracle magnitude bound via Young's inequality.
+Used in: `stochasticMirrorDescent_convergence` (this file) -/
+theorem oracle_magnitude_bound (G_t g_t δ_t : E) (M : ℝ)
+    (h_decomp : G_t = g_t + δ_t)
+    (h_g_bound : ‖g_t‖ ≤ M) :
+    ‖G_t‖ ^ 2 ≤ 2 * (M ^ 2 + ‖δ_t‖ ^ 2) := by sorry
+
+/-- Telescoping sum for Bregman divergences.
+Used in: `stochasticMirrorDescent_convergence` (this file) -/
+theorem telescoping_bregman_sum (v : E → ℝ) (grad_v : E → E) (x : ℕ → Ω → E) (x_star : E) (s k : ℕ)
+    (hsk : s ≤ k) :
+    ∑ t in Finset.Icc s k, (V v grad_v (x t) x_star - V v grad_v (x (t + 1)) x_star) =
+      V v grad_v (x s) x_star - V v grad_v (x (k + 1)) x_star := by sorry
 
 -- ============================================================================
 -- LOCAL SUBDIFFERENTIAL DEFINITION (Mathlib 4.28+ workaround)

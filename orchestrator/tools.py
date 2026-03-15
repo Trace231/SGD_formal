@@ -9,9 +9,7 @@ from __future__ import annotations
 import difflib
 import os
 import re
-import shutil
 import tempfile
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -32,158 +30,8 @@ _DOC_ALLOWLIST = tuple(p for p in _READ_WRITE_ALLOWLIST if p == "docs")
 _READ_ONLY_ALLOWLIST = tuple(p.rstrip("/") for p in READ_ONLY_PATHS)
 
 
-_STAGING_STATE: dict[str, Any] = {
-    "enabled": False,
-    "root": None,  # Path | None
-    "written_relpaths": set(),  # set[str]
-}
-
-# File-level staging barrier is deprecated. Keep API surface for compatibility,
-# but do not remap workspace files through staging roots.
-_STAGING_PREFIXES: tuple[str, ...] = ()
-
-
 def _to_rel(path: Path) -> str:
     return str(path.resolve().relative_to(PROJECT_ROOT.resolve()))
-
-
-def _staging_root() -> Path | None:
-    root = _STAGING_STATE.get("root")
-    return root if isinstance(root, Path) else None
-
-
-def _staging_enabled() -> bool:
-    return bool(_STAGING_STATE.get("enabled", False)) and _staging_root() is not None
-
-
-def _is_staging_scoped_rel(rel: str) -> bool:
-    rel_norm = rel.replace("\\", "/")
-    return any(rel_norm == p.rstrip("/") or rel_norm.startswith(p) for p in _STAGING_PREFIXES)
-
-
-def _resolve_stage_path_from_rel(rel: str) -> Path:
-    root = _staging_root()
-    if root is None:
-        raise RuntimeError("Staging root is not set")
-    return (root / rel).resolve()
-
-
-def configure_staging_barrier(staging_root: str | Path | None, enabled: bool = True) -> dict[str, Any]:
-    """Enable/disable write barrier that redirects writes to a staging root."""
-    if not enabled or staging_root is None:
-        _STAGING_STATE["enabled"] = False
-        _STAGING_STATE["root"] = None
-        _STAGING_STATE["written_relpaths"] = set()
-        return {"enabled": False}
-    root = Path(staging_root)
-    if not root.is_absolute():
-        root = (PROJECT_ROOT / root).resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    _STAGING_STATE["enabled"] = True
-    _STAGING_STATE["root"] = root
-    _STAGING_STATE["written_relpaths"] = set()
-    return {"enabled": True, "staging_root": str(root)}
-
-
-def get_staging_barrier_status() -> dict[str, Any]:
-    root = _staging_root()
-    return {
-        "enabled": _staging_enabled(),
-        "staging_root": str(root) if root else None,
-        "written_relpaths": sorted(_STAGING_STATE.get("written_relpaths", set())),
-    }
-
-
-def _map_for_read(resolved_workspace_path: Path) -> Path:
-    """Read from staged file when present, else workspace path."""
-    if not _staging_enabled():
-        return resolved_workspace_path
-    rel = _to_rel(resolved_workspace_path)
-    if not _is_staging_scoped_rel(rel):
-        return resolved_workspace_path
-    staged = _resolve_stage_path_from_rel(rel)
-    return staged if staged.exists() else resolved_workspace_path
-
-
-def _map_for_write(resolved_workspace_path: Path) -> Path:
-    """Redirect writes into staging root when barrier is enabled."""
-    if not _staging_enabled():
-        return resolved_workspace_path
-    rel = _to_rel(resolved_workspace_path)
-    if not _is_staging_scoped_rel(rel):
-        return resolved_workspace_path
-    staged = _resolve_stage_path_from_rel(rel)
-    _STAGING_STATE["written_relpaths"].add(rel)
-    return staged
-
-
-def list_staging_changes() -> list[str]:
-    """List staged relative paths currently present in the staging root."""
-    root = _staging_root()
-    if root is None or not root.exists():
-        return []
-    changes: list[str] = []
-    for p in root.rglob("*"):
-        if p.is_file():
-            changes.append(str(p.relative_to(root)).replace("\\", "/"))
-    return sorted(changes)
-
-
-def commit_staging_to_workspace() -> dict[str, Any]:
-    """Apply staged files atomically to workspace paths."""
-    root = _staging_root()
-    if root is None or not root.exists():
-        return {"applied": False, "changed_files": []}
-    changed: list[str] = []
-    for rel in list_staging_changes():
-        staged = (root / rel).resolve()
-        dst = (PROJECT_ROOT / rel).resolve()
-        before = dst.read_text(encoding="utf-8") if dst.exists() else None
-        after = staged.read_text(encoding="utf-8")
-        if before != after:
-            _atomic_write(dst, after)
-            changed.append(rel)
-    return {"applied": True, "changed_files": sorted(changed)}
-
-
-def discard_staging_changes() -> dict[str, Any]:
-    """Delete the staging root and disable barrier state."""
-    root = _staging_root()
-    removed = 0
-    if root and root.exists():
-        removed = len([p for p in root.rglob("*") if p.is_file()])
-        shutil.rmtree(root, ignore_errors=True)
-    _STAGING_STATE["enabled"] = False
-    _STAGING_STATE["root"] = None
-    _STAGING_STATE["written_relpaths"] = set()
-    return {"discarded": True, "removed_files": removed}
-
-
-@contextmanager
-def _workspace_overlay_from_staging() -> Any:
-    """Temporarily overlay staged files into workspace for verification tools."""
-    root = _staging_root()
-    if not _staging_enabled() or root is None or not root.exists():
-        yield
-        return
-    backups: dict[Path, str] = {}
-    created: list[Path] = []
-    try:
-        for rel in list_staging_changes():
-            staged = (root / rel).resolve()
-            dst = (PROJECT_ROOT / rel).resolve()
-            if dst.exists():
-                backups[dst] = dst.read_text(encoding="utf-8")
-            else:
-                created.append(dst)
-            _atomic_write(dst, staged.read_text(encoding="utf-8"))
-        yield
-    finally:
-        for dst, content in backups.items():
-            _atomic_write(dst, content)
-        for p in created:
-            if p.exists():
-                p.unlink(missing_ok=True)
 
 
 def _is_under(path: Path, root: Path) -> bool:
@@ -1089,59 +937,6 @@ def search_codebase(
             "Use a more specific pattern or set max_matches higher."
         )
     return result
-
-
-def write_staging_lemma(
-    staging_path: str,
-    lean_code: str,
-    target_algo: str = "",
-) -> dict[str, Any]:
-    """Append a new Lean declaration (may contain sorry) to a staging file.
-
-    Only files under ``Lib/Glue/Staging/`` are permitted.  The staging file
-    serves as the extension point for Level-2 missing glue lemmas discovered
-    during a proof attempt.
-
-    Args:
-        staging_path: Path to the staging file (e.g.
-                      ``Lib/Glue/Staging/SVRGOuterLoop.lean``).
-        lean_code:    Complete Lean declaration(s) to append.  May contain
-                      ``sorry`` proof bodies; that is intentional.
-        target_algo:  Algorithm name (e.g. ``SVRGOuterLoop``) used to detect
-                      circular import attempts.  Leave empty to skip the check.
-
-    Returns:
-        ``{"success": True, "path": ..., "appended_chars": N}`` on success, or
-        ``{"success": False, "error": "..."}`` when a circular dependency is
-        detected.
-    """
-    _STAGING_ALLOWLIST = ("Lib/Glue/Staging",)
-
-    # --- Circular dependency guard (6a) ---
-    if target_algo:
-        import_pattern = rf"import\s+Algorithms\.{re.escape(target_algo)}"
-        if re.search(import_pattern, lean_code):
-            return {
-                "success": False,
-                "error": (
-                    f"Circular dependency rejected: lean_code contains "
-                    f"`import Algorithms.{target_algo}`. "
-                    "Staging lemmas must only import from Lib/ and Main, "
-                    "never from the target algorithm file."
-                ),
-            }
-
-    resolved = _resolve_allowed_path(staging_path, _STAGING_ALLOWLIST)
-    write_path = _map_for_write(resolved)
-    current = write_path.read_text(encoding="utf-8") if write_path.exists() else ""
-    separator = "\n" if current.endswith("\n") else "\n\n"
-    _atomic_write(write_path, current + separator + lean_code.strip() + "\n")
-
-    return {
-        "success": True,
-        "path": str(resolved.relative_to(PROJECT_ROOT)),
-        "appended_chars": len(lean_code),
-    }
 
 
 def apply_doc_patch(path: str | Path, anchor: str, new_content: str) -> dict[str, Any]:

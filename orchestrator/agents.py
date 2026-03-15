@@ -97,51 +97,23 @@ class ToolRegistry:
         self.register_readonly_tools()
         self.register("run_lean_verify", run_lean_verify)
 
-    def register_staging_tools(self, target_algo: str = "") -> None:
-        """Read-only tools + write_staging_lemma.  Used by Agent2 during mid-proof escalation."""
-        import functools
-
-        from orchestrator.tools import edit_file_patch, get_lean_goal, run_lean_verify, write_staging_lemma
-
-        self.register_readonly_tools()
-        self.register("run_lean_verify", run_lean_verify)
-        self.register("edit_file_patch", edit_file_patch)
-        self.register("get_lean_goal", get_lean_goal)
-        if target_algo:
-            self.register(
-                "write_staging_lemma",
-                functools.partial(write_staging_lemma, target_algo=target_algo),
-            )
-        else:
-            self.register("write_staging_lemma", write_staging_lemma)
-
-    def register_scaffold_tools(self, target_algo: str = "") -> None:
+    def register_scaffold_tools(self) -> None:
         """Full write access for Agent2 Phase 3a scaffold writing.
 
-        Includes write_new_file, edit_file_patch, run_lean_verify, write_staging_lemma,
+        Includes write_new_file, edit_file_patch, run_lean_verify,
         plus all read-only tools.  Agent2 uses this to create the complete Lean file
         (all theorem statements + sorry placeholders) and verify it compiles.
         """
-        import functools
-
         from orchestrator.tools import (
             edit_file_patch,
             run_lean_verify,
             write_new_file,
-            write_staging_lemma,
         )
 
         self.register_readonly_tools()
         self.register("write_new_file", write_new_file)
         self.register("edit_file_patch", edit_file_patch)
         self.register("run_lean_verify", run_lean_verify)
-        if target_algo:
-            self.register(
-                "write_staging_lemma",
-                functools.partial(write_staging_lemma, target_algo=target_algo),
-            )
-        else:
-            self.register("write_staging_lemma", write_staging_lemma)
 
     def call(self, name: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke a registered tool by name."""
@@ -308,7 +280,6 @@ def escalate(
 def auto_repair_loop(
     agent5: Agent,
     target_file: str,
-    staging_file: str | None,
     build_errors: str,
     plan_text: str,
     sorry_context: str,
@@ -321,29 +292,15 @@ def auto_repair_loop(
       1. Agent5 produces a structured diagnosis.
       2. If ``auto_repairable`` and classification is ASSUMPTIONS_WRONG →
          patch the target file signatures and re-verify.
-      3. If classification is STAGING_FIX → apply rule-based staging fixes
-         and re-verify.
-      4. If verification passes → return ``"fixed"``.
-      5. Otherwise loop with updated errors up to *max_repair_rounds* times.
-      6. If still failing → fall back to the human ``escalate()`` prompt.
+      3. If verification passes → return ``"fixed"``.
+      4. Otherwise loop with updated errors up to *max_repair_rounds* times.
+      5. If still failing → fall back to the human ``escalate()`` prompt.
 
     Returns one of: ``"fixed"``, ``"replan"``, ``"fix_assumptions"``,
     ``"abort"``.
     """
-    from pathlib import Path
-    from orchestrator.assumption_repair import (
-        apply_assumption_patches,
-        apply_lm_staging_patches,
-        apply_staging_rules,
-    )
+    from orchestrator.assumption_repair import apply_assumption_patches
     from orchestrator.tools import run_lean_verify
-    from orchestrator.config import PROJECT_ROOT
-
-    _staging_path = Path(staging_file) if staging_file else None
-    _target_path = (
-        Path(target_file) if Path(target_file).is_absolute()
-        else PROJECT_ROOT / target_file
-    )
 
     current_errors = build_errors
 
@@ -369,26 +326,6 @@ def auto_repair_loop(
                 console.print(
                     f"[green][Agent5] Patched {patched} assumption(s) into {target_file}"
                 )
-
-        elif classification == "STAGING_FIX" and _staging_path:
-            patched = apply_staging_rules(_staging_path, current_errors)
-            if patched > 0:
-                console.print(
-                    f"[green][Agent5] Applied {patched} rule-based staging fix(es) to {_staging_path.name}"
-                )
-            else:
-                # Rule engine found nothing to fix — try LM-generated patches from JSON
-                lm_patches = structured.get("staging_patches", [])
-                if lm_patches:
-                    patched = apply_lm_staging_patches(_staging_path, lm_patches)
-                    console.print(
-                        f"[green][Agent5] Applied {patched} LM staging patch(es) to {_staging_path.name}"
-                    )
-                else:
-                    console.print(
-                        f"[yellow][Agent5] Rule engine returned 0 fixes and no LM patches provided."
-                    )
-
         else:
             console.print(
                 f"[yellow][Agent5] Classification '{classification}' — "

@@ -66,7 +66,7 @@ def _execute_single_tool_and_format(
         return (
             f"## Tool error\ntool `{tool_name}` is not registered. "
             f"Available: read_file, search_in_file, edit_file_patch, write_new_file, "
-            f"write_staging_lemma, get_lean_goal, check_lean_have, run_lean_verify, "
+            f"get_lean_goal, check_lean_have, run_lean_verify, "
             f"request_agent6_glue, request_agent2_help, request_agent7_interface_audit.\nError: {exc}\n"
             "Choose a valid tool.",
             None,
@@ -158,46 +158,6 @@ def _execute_single_tool_and_format(
             f"SUCCESS. File updated.\n"
             "Call run_lean_verify to check the build."
         )
-    elif tool_name == "write_staging_lemma":
-        edited = True
-        # Auto-verify staging after append (mirrors _call_agent2_with_tools logic)
-        if result.get("success") and result.get("path"):
-            _stg_verify = registry.call("run_lean_verify", result["path"])
-            if _stg_verify.get("exit_code", 0) != 0:
-                result["staging_compile_ok"] = False
-                result["staging_compile_errors"] = _stg_verify.get("errors", [])
-                result["note"] = (
-                    "STAGING COMPILE ERROR: type errors found (sorry is OK, "
-                    "type errors are NOT). Fix the signature with edit_file_patch "
-                    "on the staging file. If you cannot fix locally, escalate via request_agent2_help."
-                )
-            else:
-                result["staging_compile_ok"] = True
-                result["staging_sorry_count"] = _stg_verify.get("sorry_count", 0)
-        if result.get("staging_compile_ok") is True:
-            result_msg = (
-                f"## write_staging_lemma result\n"
-                f"SUCCESS. Lemma appended. staging_compile_ok=true.\n"
-                f"Call run_lean_verify on the target file to check the full build."
-            )
-        elif result.get("staging_compile_ok") is False:
-            err_list = result.get("staging_compile_errors", [])
-            err_text = "\n".join(err_list) if isinstance(err_list, list) else str(err_list)
-            result_msg = (
-                f"## write_staging_lemma result\n"
-                f"Lemma appended but staging_compile_ok=false — type errors in staging file.\n\n"
-                f"### Staging compile errors\n```\n{err_text[:2000]}\n```\n\n"
-                f"Fix the type errors with edit_file_patch on the staging file. "
-                f"If you cannot fix after trying, call request_agent2_help."
-            )
-        elif not result.get("success"):
-            result_msg = f"## write_staging_lemma result\nFAILED: {result.get('error', 'unknown error')}"
-        else:
-            result_msg = (
-                f"## write_staging_lemma result\n"
-                f"SUCCESS. Lemma appended (path={result.get('path', '')}). "
-                f"Call run_lean_verify on the target file."
-            )
     else:
         # read_file, search_in_file, overwrite_file, etc.
         if isinstance(result, dict):
