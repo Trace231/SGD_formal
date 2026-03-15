@@ -56,7 +56,7 @@ PROVIDER_URLS: dict[str, str] = {
 #   Agent3  = sorry_closer     — Phase 5/7: Proof Fill (tactical sorry-closing)
 #   Agent4  = persister       — Phase 6/7: Persist Documentation (Glue + Layer1)
 #   Agent5  = diagnostician   — Escalation auditor (diagnose build/plan failures)
-#   Agent6  = glue_filler      — Staging/glue proof (invoked by Agent8 when needed)
+#   Agent6  = glue_filler      — Glue/bridge lemma proof (invoked by Agent8 when needed)
 #   Agent7  = interface_auditor — Signature/API auditor (preemptive or on route)
 #   Agent8  = decision_hub    — Phase 5/7: Proof Fill orchestration (dispatch 3/6/7)
 #   Agent9  = strategy_planner — Phase 4/7: Strategy Plan (JSON proof plan for Agent8)
@@ -175,7 +175,7 @@ ALGORITHM_REFERENCES: dict[str, list[str]] = {
 
 
 # Universal references: all algorithms can look these up.
-# Format: (path, one-line description). Excludes Lib/Glue/Staging/* (attempt-specific).
+# Format: (path, one-line description).
 REFERENCE_FILES_WITH_DESCRIPTIONS: list[tuple[str, str]] = [
     (
         "Lib/Glue/Probability.lean",

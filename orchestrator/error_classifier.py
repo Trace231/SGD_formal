@@ -141,9 +141,7 @@ def _classify_lean_error_structured(
             return "SIGNATURE_HALLUCINATION", errors
         return "LOCAL_PROOF_ERROR", errors
 
-    # Normalise target path for comparison.  We use the full path to handle the
-    # case where staging file and target share the same basename
-    # (e.g. Lib/Glue/Staging/SVRGOuterLoop.lean vs Algorithms/SVRGOuterLoop.lean).
+    # Normalise target path for comparison.
     def _is_target_file(error_file: str) -> bool:
         """True iff the error file refers to the target algorithm file."""
         ep = Path(error_file)
@@ -160,17 +158,17 @@ def _classify_lean_error_structured(
             tp_rel = tp.relative_to(PROJECT_ROOT) if tp.is_absolute() else tp
             return ep_rel == tp_rel
         except ValueError:
-            return ep.name == tp.name and "Staging" not in str(ep)
+            return ep.name == tp.name
 
     target_errors = [e for e in errors if _is_target_file(e["file"])]
     dep_errors = [e for e in errors if not _is_target_file(e["file"])]
 
-    # Primary errors come from a dependency/staging file — route to dep-fix branch.
+    # Primary errors come from a dependency file — route to dep-fix branch.
     if dep_errors and not target_errors:
         return "DEPENDENCY_COMPILE_ERROR", errors
 
     # Even if some target errors exist, if the primary (first) error is in a dep, treat
-    # as dependency compile error to avoid misrouting staging mistakes.
+    # as dependency compile error.
     if dep_errors and errors[0]["file"] and not _is_target_file(errors[0]["file"]):
         return "DEPENDENCY_COMPILE_ERROR", errors
 
@@ -366,7 +364,7 @@ def _is_target_file_error(error_file: str, target_file: str) -> bool:
         tp_rel = tp.relative_to(PROJECT_ROOT) if tp.is_absolute() else tp
         return ep_rel == tp_rel
     except ValueError:
-        return ep.name == tp.name and "Staging" not in str(ep)
+        return ep.name == tp.name
 
 
 def _extract_first_error_line(verify_text: str) -> int | None:

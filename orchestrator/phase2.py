@@ -368,41 +368,5 @@ def _build_escalation_file_context(target_file: str, stuck_line: int | None = No
     return f"-- SKELETON (proof bodies omitted; file exceeds {_ESCALATION_CHAR_LIMIT} chars)\n{skeleton}"
 
 
-def _audit_staging_usage(
-    target_file: str,
-    staging_path: "Path",
-    console_print: "Any",
-) -> dict[str, bool]:
-    """Return ``{lemma_name: used}`` for all declarations in the staging file.
-
-    Scans the final algorithm file for each declaration name found in the
-    staging file and reports whether it is referenced at least once.
-    """
-    staging_content = ""
-    if staging_path.exists():
-        staging_content = staging_path.read_text(encoding="utf-8")
-    else:
-        try:
-            _rel = str(staging_path.relative_to(PROJECT_ROOT))
-            staging_content = snapshot_file(_rel)
-        except Exception:  # noqa: BLE001
-            staging_content = ""
-    if not staging_content:
-        return {}
-    try:
-        target_content = load_file(target_file)
-    except Exception:  # noqa: BLE001
-        target_content = ""
-
-    decl_names = re.findall(r"(?:theorem|lemma|def)\s+(\w+)", staging_content)
-
-    usage: dict[str, bool] = {}
-    for name in decl_names:
-        used = bool(re.search(rf"\b{re.escape(name)}\b", target_content))
-        usage[name] = used
-        status = "USED" if used else "UNUSED (candidate for cleanup)"
-        console_print(f"  [Staging] {name} — {status}")
-
-    return usage
 
 
