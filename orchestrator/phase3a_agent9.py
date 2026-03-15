@@ -29,8 +29,8 @@ def _validate_agent9_plan(obj: Any) -> bool:
     """Return True if *obj* is a well-formed Agent9 plan dict.
 
     Also emits console warnings for missing_glue_lemmas entries that lack the
-    new required fields (proposed_lean_type, target_staging_file) so that
-    operators can detect degraded plans before dispatch begins.
+    required proposed_lean_type field so that operators can detect degraded
+    plans before dispatch begins.
     """
     if not isinstance(obj, dict):
         return False
@@ -46,8 +46,8 @@ def _validate_agent9_plan(obj: Any) -> bool:
             if isinstance(mgl, str):
                 console.print(
                     f"  [Agent9] WARNING: missing_glue_lemma entry is a plain "
-                    f"string '{mgl}' — expected a dict with 'name', "
-                    "'proposed_lean_type', and 'target_staging_file'. "
+                    f"string '{mgl}' — expected a dict with 'name' and "
+                    "'proposed_lean_type'. "
                     "Agent6/7 will receive weaker guidance."
                 )
             elif isinstance(mgl, dict):
@@ -57,12 +57,6 @@ def _validate_agent9_plan(obj: Any) -> bool:
                         f"  [Agent9] WARNING: missing_glue_lemma '{name}' "
                         "has no proposed_lean_type — Agent6 will receive "
                         "weaker guidance."
-                    )
-                if not mgl.get("target_staging_file"):
-                    console.print(
-                        f"  [Agent9] WARNING: missing_glue_lemma '{name}' "
-                        "has no target_staging_file — Agent7 may write to "
-                        "the wrong file."
                     )
     return True
 

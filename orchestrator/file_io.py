@@ -6,7 +6,6 @@ import re
 from pathlib import Path
 
 from orchestrator.config import PROJECT_ROOT
-from orchestrator.tools import _map_for_read
 
 _LEAN_DECL_RE = re.compile(
     r"^(?:theorem|lemma|noncomputable\s+def|def|structure|class|abbrev)\s+\w+",
@@ -22,7 +21,6 @@ def load_file(path: str | Path) -> str:
     p = Path(path)
     if not p.is_absolute():
         p = PROJECT_ROOT / p
-    p = _map_for_read(p)
     return p.read_text(encoding="utf-8")
 
 
