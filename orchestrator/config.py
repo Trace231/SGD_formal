@@ -49,20 +49,33 @@ PROVIDER_URLS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # Per-agent provider + model configuration
 # Edit this dict to reassign any agent to any provider/model.
+#
+# Role → Agent number mapping (for CLI / Phase N/7 labels):
+#   Agent1  = orchestrator     — Phase 1/7: Generate Prover Prompt
+#   Agent2  = planner          — Phase 2/7: Plan & Approve; Phase 3/7: Scaffold writing
+#   Agent3  = sorry_closer     — Phase 5/7: Proof Fill (tactical sorry-closing)
+#   Agent4  = persister       — Phase 6/7: Persist Documentation (Glue + Layer1)
+#   Agent5  = diagnostician   — Escalation auditor (diagnose build/plan failures)
+#   Agent6  = glue_filler      — Staging/glue proof (invoked by Agent8 when needed)
+#   Agent7  = interface_auditor — Signature/API auditor (preemptive or on route)
+#   Agent8  = decision_hub    — Phase 5/7: Proof Fill orchestration (dispatch 3/6/7)
+#   Agent9  = strategy_planner — Phase 4/7: Strategy Plan (JSON proof plan for Agent8)
+#   Agent10 = scaffold_verifier — Phase 3/7: Scaffold verify/correct after Agent2
 # ---------------------------------------------------------------------------
 
 AGENT_CONFIGS: dict[str, dict] = {
-    "orchestrator":  {"provider": "qwen",     "model": "qwen3.5-plus"  ,  "max_tokens": 32768},
-    "planner":       {"provider": "qwen",     "model": "qwen3.5-plus",  "max_tokens": 32768},
-    #"sorry_closer":  {"provider": "deepseek", "model": "deepseek-reasoner", "temperature": 0.0,   "max_tokens": 8192, "use_manifest": True},
-    "sorry_closer":  {"provider": "qwen",     "model": "qwen3.5-plus", "max_tokens": 32768, "use_manifest": True},
-    "strategy_planner": {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 16384},
-    "persister":     {"provider": "qwen",     "model": "qwen3.5-plus", "max_tokens": 32768},
-    "diagnostician": {"provider": "qwen",     "model": "qwen3.5-plus",  "max_tokens": 16384},
-    "glue_filler":   {"provider": "qwen",     "model": "qwen3.5-plus", "max_tokens": 32768, "use_manifest": True},
-    "interface_auditor": {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768},
-    "decision_hub":      {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768},
-    "scaffold_verifier": {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768, "use_manifest": False},
+    "orchestrator":       {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768},  # Agent1
+    "orchestrator_spec":  {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768},  # Agent1B (JSON spec mode)
+    "planner":            {"provider": "qwen", "model": "qwen3-max-2026-01-23", "max_tokens": 32768},  # Agent2
+    # "sorry_closer":     {"provider": "deepseek", "model": "deepseek-reasoner", "temperature": 0.0, "max_tokens": 8192, "use_manifest": True},
+    "sorry_closer":       {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768, "use_manifest": True},  # Agent3
+    "strategy_planner":   {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 16384},  # Agent9
+    "persister":          {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768},  # Agent4
+    "diagnostician":      {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 16384},   # Agent5
+    "glue_filler":        {"provider": "qwen", "model": "qwen3-max-2026-01-23", "max_tokens": 32768, "use_manifest": True},  # Agent6
+    "interface_auditor":  {"provider": "qwen", "model": "qwen3-max-2026-01-23", "max_tokens": 32768},  # Agent7
+    "decision_hub":       {"provider": "qwen", "model": "qwen3-max-2026-01-23", "max_tokens": 32768},  # Agent8
+    "scaffold_verifier":  {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768, "use_manifest": False},  # Agent10
 }
 
 # ---------------------------------------------------------------------------
@@ -399,6 +412,27 @@ AGENT8_DEBUG_LEVEL: int = int(os.getenv("AGENT8_DEBUG_LEVEL", "1"))
 # Hard trigger: if the same error_signature appears >= this many consecutive
 # ticks with different actions, force human_missing_assumption.
 AGENT8_HUMAN_GATE_CONSECUTIVE_THRESHOLD: int = 3
+
+# ---------------------------------------------------------------------------
+# Agent8 mid-proof check (soft gate): periodic routing inspection inside the
+# Agent3 per-sorry tool loop.  Every AGENT8_MIDCHECK_INTERVAL_TURNS Agent3
+# tool turns, Agent8 makes a single routing decision.  If it returns
+# agent3_tactical the loop continues with the remaining budget unchanged
+# (soft gate — does NOT reset max_tool_turns).  Non-tactical routes
+# (agent7_*, agent2_replan, human_missing_assumption) are executed immediately.
+# ---------------------------------------------------------------------------
+
+# Master switch.  Set env AGENT8_MIDCHECK_ENABLED=0 to disable entirely.
+AGENT8_MIDCHECK_ENABLED: bool = os.getenv("AGENT8_MIDCHECK_ENABLED", "1") != "0"
+
+# Number of Agent3 tool turns between successive mid-check gate evaluations.
+AGENT8_MIDCHECK_INTERVAL_TURNS: int = int(
+    os.getenv("AGENT8_MIDCHECK_INTERVAL_TURNS", "10")
+)
+
+# Minimum total turns elapsed before the first mid-check fires.
+# Prevents interrupting Agent3 before it has had time to start.
+AGENT8_MIDCHECK_MIN_TURN: int = int(os.getenv("AGENT8_MIDCHECK_MIN_TURN", "8"))
 
 # Backward-compatible aliases (to be removed after full migration).
 MAX_APPROVAL_ROUNDS = RETRY_LIMITS["MAX_PHASE2_APPROVAL_ROUNDS"]

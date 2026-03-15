@@ -33,7 +33,7 @@ def phase4_persist(
 
     Returns new_tricks_added.
     """
-    console.rule("[bold cyan]Phase 4/5 — Persist Documentation")
+    console.rule("[bold cyan]Phase 6/7 — Persist Documentation  [Agent4]")
     registry = ToolRegistry()
     registry.register_default_tools()
 

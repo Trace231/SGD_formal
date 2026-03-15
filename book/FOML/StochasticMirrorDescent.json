@@ -1,0 +1,194 @@
+{
+  "algorithm": "StochasticMirrorDescent",
+  "full_name": "Stochastic Mirror Descent (Convex, Variable Step Size)",
+  "source_reference": "Lan, First-order and Stochastic Optimization Methods for Machine Learning, Chapter 3-4 (Theorem 4.1)",
+  "lean_theorem": "TBD",
+  "archetype": "B",
+  "archetype_note": "Novel proof structure. Requires Bregman divergence infrastructure not present in Mathlib. No Layer 1 meta-theorem available. Must build V(x,z), prox-mapping, and three-point lemma from scratch.",
+  "formalization_status": "not_started",
+  "formalization_difficulty": "high",
+  "prerequisite_lib_work": [
+    "Define distance generating function v : X -> R (strongly convex, differentiable)",
+    "Define Bregman divergence V(x, z) = v(z) - [v(x) + <∇v(x), z - x>]",
+    "Prove V(x,z) ≥ 0 (from strong convexity of v)",
+    "Define prox-mapping: argmin_{x ∈ X} γ⟨g, x⟩ + V(z, x)",
+    "Prove three-point lemma (Lemma 3.4)"
+  ],
+
+  "sections": {
+
+    "1_assumptions": {
+      "title": "Assumptions and Context",
+      "constraint_set": {
+        "description": "Closed convex set X ⊆ E (finite-dimensional or Banach space)",
+        "note": "The algorithm requires a prox-friendly set X — one for which the argmin in the update rule is tractable."
+      },
+      "distance_generating_function": {
+        "description": "v : X° → R is a distance generating function (prox-function), 1-strongly convex with respect to ‖·‖",
+        "example": "Simplest example: v(x) = ‖x‖₂²/2, which gives V(x,z) = ‖x - z‖₂²/2 (reduces to SGD/subgradient)",
+        "note": "X° is the domain of v (may be larger than X)"
+      },
+      "bregman_divergence": {
+        "description": "Bregman divergence (prox-function) V : X° × X → ℝ₊",
+        "definition_math": "V(x, z) = v(z) - [v(x) + \\langle \\nabla v(x),\\, z - x \\rangle]",
+        "definition_ref": "(3.2.2)",
+        "key_property": "V(x, z) ≥ 0 for all x ∈ X°, z ∈ X (from 1-strong convexity of v)",
+        "note": "V is not symmetric in general. V(x, z) measures how much z deviates from the first-order approximation of v at x."
+      },
+      "objective": {
+        "description": "f : X → R, convex",
+        "subgradient_condition": "g_t ∈ ∂f(x_t): a subgradient of f at x_t",
+        "note": "f need not be smooth. The algorithm only requires access to a subgradient oracle."
+      },
+      "stochastic_oracle": {
+        "description": "At each step t, the algorithm observes a stochastic gradient G_t = g_t + δ_t",
+        "lean_hypotheses": [
+          "E[G_t | ξ_{[t-1]}] = g_t ∈ ∂f(x_t)  (unbiased)",
+          "E[‖δ_t‖_*²] ≤ σ²  (bounded variance in dual norm)"
+        ],
+        "note": "δ_t = G_t - g_t is the noise term. The dual norm ‖·‖_* is required because G_t lives in the dual space."
+      },
+      "oracle_magnitude": {
+        "description": "Stochastic gradient magnitude bound",
+        "hypothesis": "‖G_t‖_* ≤ M  (almost surely, or: E[‖G_t‖_*²] ≤ M² + σ²)",
+        "ref": "(4.1.7)",
+        "implies": "‖G_t‖_*² ≤ 2(‖g_t‖_*² + ‖δ_t‖_*²) ≤ 2(M² + ‖δ_t‖_*²)"
+      },
+      "step_sizes": {
+        "description": "Variable (non-increasing) step sizes γ_t > 0",
+        "note": "Theorem 4.1 holds for general γ_t. Optimal choice is γ_t = D / (M√T) for constant M and T steps."
+      },
+      "initial_point": {
+        "description": "x_1 ∈ X (arbitrary starting point in X)"
+      }
+    },
+
+    "2_algorithm": {
+      "title": "Algorithm Specification",
+      "initialization": "x_1 ∈ X",
+      "update_rule": {
+        "math": "x_{t+1} = \\operatorname{argmin}_{x \\in X}\\; \\gamma_t \\langle G_t(x_t),\\, x \\rangle + V(x_t,\\, x),\\quad t = 1, 2, \\ldots",
+        "ref": "(3.2.5)",
+        "interpretation": "Move to the point in X that minimizes the linearization of f (via stochastic gradient G_t) plus a Bregman proximity penalty to x_t.",
+        "note": "When v(x) = ‖x‖₂²/2, this reduces to projected gradient descent: x_{t+1} = Proj_X(x_t - γ_t G_t)."
+      },
+      "output": {
+        "math": "\\bar{x}_s^k = \\left(\\sum_{t=s}^{k} \\gamma_t\\right)^{-1} \\sum_{t=s}^{k} \\gamma_t x_t",
+        "ref": "(3.1.9)",
+        "description": "Step-size weighted Cesaro average of iterates from step s to k",
+        "note": "Convergence is measured at this average point, not the last iterate."
+      }
+    },
+
+    "3_key_lemma_chain": {
+      "title": "Key Lemma Chain",
+      "overview": "The proof proceeds in three stages: (1) single-step bound via Lemma 3.4, (2) aggregate via Young's inequality + oracle bound, (3) sum and rearrange.",
+
+      "lemma_3_4": {
+        "id": "Lemma3.4",
+        "title": "Three-Point Lemma (Descent Lemma for Mirror Descent)",
+        "statement_math": "\\gamma_t \\langle g(x_t),\\, x_{t+1} - x \\rangle + V(x_t, x_{t+1}) \\leq V(x_t, x) - V(x_{t+1}, x),\\quad \\forall x \\in X",
+        "proof_sketch": [
+          "Step 1: By the optimality condition of (3.2.5), the minimizer x_{t+1} satisfies the first-order KKT condition: <γ_t g(x_t) + ∇v(x_{t+1}) - ∇v(x_t), x - x_{t+1}> ≥ 0 for all x ∈ X.",
+          "Step 2: Rearrange to: γ_t <g(x_t), x_{t+1} - x> ≤ <∇v(x_t) - ∇v(x_{t+1}), x - x_{t+1}>",
+          "Step 3: Apply the Bregman identity (3.2.6): V(x_t, x) = V(x_t, x_{t+1}) + <∇V(x_t, x_{t+1}), x - x_{t+1}> + V(x_{t+1}, x). This gives <∇v(x_t) - ∇v(x_{t+1}), x - x_{t+1}> = V(x_t, x) - V(x_t, x_{t+1}) - V(x_{t+1}, x).",
+          "Step 4: Combine steps 2 and 3 to get the result."
+        ],
+        "bregman_identity_used": "V(x_t, x) = V(x_t, x_{t+1}) + <∇V(x_t, x_{t+1}), x - x_{t+1}> + V(x_{t+1}, x)   [ref: (3.2.6)]",
+        "key_technique": "Optimality condition of prox-mapping + Bregman three-point identity",
+        "proof_technique": "novel_construction"
+      },
+
+      "step_1": {
+        "id": "Step1",
+        "title": "Single-step suboptimality bound",
+        "derivation": [
+          "Apply Lemma 3.4 with g = G_t (stochastic gradient) and x = x* (optimal point):",
+          "γ_t <G_t, x_{t+1} - x*> + V(x_t, x_{t+1}) ≤ V(x_t, x*) - V(x_{t+1}, x*)",
+          "Rewrite: γ_t <G_t, x_t - x*> = γ_t <G_t, x_t - x_{t+1}> + γ_t <G_t, x_{t+1} - x*>",
+          "Bound γ_t <G_t, x_t - x_{t+1}> using Cauchy-Schwarz and Young's inequality:",
+          "γ_t <G_t, x_t - x_{t+1}> ≤ γ_t ‖G_t‖_* · ‖x_t - x_{t+1}‖ ≤ γ_t²‖G_t‖_*²/2 + V(x_t, x_{t+1})",
+          "(Here we use: ‖x_t - x_{t+1}‖² / 2 ≤ V(x_t, x_{t+1}) from 1-strong convexity of v, and bt - at²/2 ≤ b²/(2a) for a > 0.)"
+        ],
+        "result_math": "\\gamma_t [f(x_t) - f(x)] \\leq V(x_t, x) - V(x_{t+1}, x) + \\gamma_t^2 \\|G_t\\|_*^2 / 2 - \\gamma_t \\langle \\delta_t, x_t - x \\rangle",
+        "note": "The convexity of f gives f(x_t) - f(x) ≤ <g_t, x_t - x> = <G_t - δ_t, x_t - x>. The noise term -γ_t <δ_t, x_t - x> appears and is handled in Step 3."
+      },
+
+      "step_2": {
+        "id": "Step2",
+        "title": "Oracle variance bound",
+        "math": "\\|G_t\\|_*^2 \\leq 2(\\|g_t\\|_*^2 + \\|\\delta_t\\|_*^2) \\leq 2(M^2 + \\|\\delta_t\\|_*^2)",
+        "ref": "(4.1.9)",
+        "justification": "Young's inequality: ‖a + b‖² ≤ 2‖a‖² + 2‖b‖²",
+        "substitution": "Substitute into Step 1: γ_t²‖G_t‖_*²/2 ≤ γ_t²(M² + ‖δ_t‖_*²)",
+        "result_math": "\\gamma_t [f(x_t) - f(x)] \\leq V(x_t, x) - V(x_{t+1}, x) + 2\\gamma_t^2(M^2 + \\|\\delta_t\\|_*^2) - \\gamma_t \\langle \\delta_t, x_t - x \\rangle"
+      },
+
+      "step_3": {
+        "id": "Step3",
+        "title": "Summation and noise cancellation",
+        "derivation": [
+          "Sum over t = s, ..., k:",
+          "Σ γ_t [f(x_t) - f(x)] ≤ V(x_s, x) - V(x_{k+1}, x) + 2Σ γ_t²(M² + ‖δ_t‖_*²) - Σ γ_t <δ_t, x_t - x>",
+          "The V-terms telescope: Σ [V(x_t, x) - V(x_{t+1}, x)] = V(x_s, x) - V(x_{k+1}, x) ≤ V(x_s, x)  (since V ≥ 0).",
+          "Take expectation over ξ_1,...,ξ_k:",
+          "E[Σ γ_t <δ_t, x_t - x>] = 0  (noise is zero-mean conditional on ξ_{[t-1]}, and x_t is ξ_{[t-1]}-measurable)",
+          "E[‖δ_t‖_*²] ≤ σ²  (variance bound)"
+        ],
+        "result_math": "\\sum_{t=s}^{k} \\gamma_t \\cdot \\mathbb{E}[f(x_t) - f(x)] \\leq \\mathbb{E}[V(x_s, x)] + 2(M^2 + \\sigma^2) \\sum_{t=s}^{k} \\gamma_t^2",
+        "key_technique": "Telescoping of V-terms + martingale property of noise (E[<δ_t, x_t - x>] = 0)"
+      },
+
+      "step_4": {
+        "id": "Step4",
+        "title": "Extract Cesaro average",
+        "derivation": [
+          "By convexity of f: f(\\bar{x}_s^k) ≤ (Σ γ_t)^{-1} Σ γ_t f(x_t)  [Jensen's inequality]",
+          "Divide Step 3 by Σ γ_t"
+        ],
+        "result_math": "\\mathbb{E}[f(\\bar{x}_s^k)] - f^* \\leq \\left(\\sum_{t=s}^{k} \\gamma_t\\right)^{-1} \\left[\\mathbb{E}[V(x_s, x^*)] + (M^2 + \\sigma^2) \\sum_{t=s}^{k} \\gamma_t^2 \\right]"
+      }
+    },
+
+    "4_final_theorem": {
+      "title": "Final Convergence Theorem",
+      "lean_identifier": "TBD",
+      "ref": "Theorem 4.1",
+      "statement_math": "\\mathbb{E}[f(\\bar{x}_s^k)] - f^* \\leq \\left(\\sum_{t=s}^{k} \\gamma_t\\right)^{-1} \\left[ \\mathbb{E}[V(x_s, x^*)] + (M^2 + \\sigma^2) \\sum_{t=s}^{k} \\gamma_t^2 \\right]",
+      "interpretation": {
+        "first_term": "E[V(x_s, x*)] — initial Bregman distance to optimum, vanishes with distance-to-solution",
+        "second_term": "(M² + σ²) Σγ_t² / Σγ_t — variance floor from stochastic noise and gradient magnitude",
+        "optimal_constant_step": "Set γ_t = γ = D / (M√T) where D² = V(x_1, x*), gives O(1/√T) rate",
+        "comparison_to_subgradient": "When v(x) = ‖x‖₂²/2, V(x,z) = ‖x-z‖²/2, this reduces to the standard stochastic subgradient bound"
+      },
+      "proof_dependency_summary": {
+        "new_lib_required": [
+          "Bregman divergence V(x,z) definition and basic properties",
+          "1-strong convexity of prox-function → V(x,z) ≥ 0",
+          "Bregman three-point identity (3.2.6)",
+          "Prox-mapping definition and optimality condition (3.2.5)",
+          "Lemma 3.4 (three-point lemma)"
+        ],
+        "mathlib_lemmas": [
+          "inner_mul_le_norm_mul_norm (Cauchy-Schwarz)",
+          "sq_nonneg",
+          "Finset.sum_le_sum",
+          "integral_nonneg",
+          "MartingaleDifference or conditional expectation zero"
+        ],
+        "patterns_used": [
+          "Telescoping sum (Pattern — telescoping_sum)",
+          "Young's inequality: ‖a+b‖² ≤ 2‖a‖² + 2‖b‖² (Pattern F variant)",
+          "bt - at²/2 ≤ b²/(2a) (AM-GM / completing the square)"
+        ],
+        "critical_difference_from_subgradient": "The three-point lemma replaces the norm expansion step. There is no inner_neg flip needed because the prox-mapping optimality condition directly gives the right sign."
+      },
+      "formalization_roadmap": {
+        "phase_1": "Build Lib/Layer0/BregmanDivergence.lean: define V, prove V ≥ 0, prove three-point identity (3.2.6), prove Lemma 3.4.",
+        "phase_2": "Build Lib/Glue/MirrorDescentGlue.lean: noise cancellation lemma (E[<δ_t, x_t - x>] = 0), variance bound glue.",
+        "phase_3": "Write Algorithms/MirrorDescent.lean: define MirrorDescentSetup structure, define process via prox-mapping, state and prove Theorem 4.1.",
+        "note": "Phase 1 is the blocker. Without a Bregman divergence library, the proof cannot be written."
+      }
+    }
+  }
+}

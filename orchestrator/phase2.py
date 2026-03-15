@@ -11,6 +11,7 @@ from orchestrator.agents import Agent
 from orchestrator.audit_logger import AuditLogger
 from orchestrator.context_builders import _extract_symbol_manifest
 from orchestrator.error_classifier import _json_candidates
+from orchestrator.file_io import load_file
 from orchestrator.prompts import build_algorithm_card, load_meta_prompt_a
 from orchestrator.verify import check_leverage_gate
 
@@ -44,7 +45,7 @@ def phase1_generate_prompt(
     archetype: str,
 ) -> str:
     """Phase 1: Agent1 generates the Prover prompt via Meta-Prompt A."""
-    console.rule("[bold cyan]Phase 1/5 — Generate Prover Prompt")
+    console.rule("[bold cyan]Phase 1/7 — Generate Prover Prompt  [Agent1]")
 
     agent1 = Agent("orchestrator")
     meta_a = load_meta_prompt_a()
@@ -65,21 +66,90 @@ def phase1_generate_prompt(
     return prompt_text
 
 
+def phase1_generate_prompt_from_spec(spec_path: str) -> tuple[str, str, str]:
+    """Phase 1B: Agent1B reads a JSON spec file and generates the prover_prompt.
+
+    The full JSON text is passed verbatim to Agent1B (orchestrator_spec), which
+    expands it into a complete Prover prompt — no information is compressed.
+
+    Returns:
+        (prover_prompt, algorithm_name, archetype)
+        algorithm_name and archetype are read directly from the spec's top-level
+        "algorithm" and "archetype" fields.
+    """
+    from pathlib import Path as _Path
+
+    console.rule("[bold cyan]Phase 1/7 — Generate Prover Prompt  [Agent1B / spec mode]")
+
+    spec_text = load_file(spec_path)
+    try:
+        spec = json.loads(spec_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"[phase1B] Cannot parse spec file '{spec_path}' as JSON: {exc}"
+        ) from exc
+
+    algorithm: str = spec.get("algorithm", _Path(spec_path).stem)
+    archetype: str = str(spec.get("archetype", "B")).upper()
+
+    meta_a = load_meta_prompt_a()
+
+    phase1_prompt = (
+        "Generate a complete Prover prompt by instantiating the Meta-Prompt A "
+        "template below with the structured algorithm specification.\n\n"
+        "## Meta-Prompt A Template\n"
+        f"{meta_a}\n\n"
+        "## Structured Algorithm Specification (JSON)\n"
+        "The specification below contains four sections that map directly to the\n"
+        "Lean 4 proof scaffold:\n"
+        "  1_assumptions    → Lean hypotheses (structure fields + theorem params)\n"
+        "  2_algorithm      → noncomputable `process` definition + output\n"
+        "  3_key_lemma_chain → named `have` steps in the main proof body\n"
+        "  4_final_theorem  → top-level `theorem` declaration\n\n"
+        "You MUST reproduce every lemma in '3_key_lemma_chain' by name, with its\n"
+        "mathematical statement and proof strategy, in the generated prover_prompt.\n"
+        "Do NOT compress, omit, or paraphrase any field.\n\n"
+        f"```json\n{spec_text}\n```\n\n"
+        "IMPORTANT: If the spec contains a 'prerequisite_lib_work' field, list each\n"
+        "item as a 'New infrastructure needed' bullet in the prover_prompt's\n"
+        "Section 2 (MANDATORY reading order / infrastructure)."
+    )
+
+    agent1b = Agent("orchestrator_spec")
+    prover_prompt = agent1b.call(phase1_prompt)
+    AuditLogger.get().log_phase1_detail(phase1_prompt, prover_prompt)
+    console.print(
+        f"[green]\\[Agent1B] Prover prompt generated ({len(prover_prompt)} chars)."
+    )
+    return prover_prompt, algorithm, archetype
+
+
 def phase2_plan_and_approve(
     prover_prompt: str,
     force_low_leverage: bool = False,
+    archetype: str = "A",
 ) -> tuple[str, Agent, Agent]:
     """Phase 2: Agent1 ↔ Agent2 approval loop + leverage gate.
 
     Returns (approved_plan, agent1, agent2) so they can be reused.
     """
-    console.rule("[bold cyan]Phase 2/5 — Plan & Approve")
+    console.rule("[bold cyan]Phase 2/7 — Plan & Approve  [Agent1 ↔ Agent2]")
 
     agent1 = Agent("orchestrator")
     agent2 = Agent("planner")
 
     if "subgradient" in prover_prompt.lower() or "subdifferential" in prover_prompt.lower():
         prover_prompt = prover_prompt + _SUBGRADIENT_CONTEXT
+
+    if archetype.upper() == "B":
+        prover_prompt += (
+            "\n\n## MANDATORY: Archetype B ENFORCEMENT\n"
+            "This algorithm is EXPLICITLY classified as Archetype B by the operator. "
+            "You MUST NOT import or reference Lib.Layer1.* in your plan. "
+            "You MUST NOT plan any proof that uses StochasticDescentHyps or Layer 1 meta-theorems. "
+            "All proofs MUST be built directly from Mathlib primitives. "
+            "Do NOT override this classification — it is an operator-level constraint."
+        )
 
     plan = agent2.call(prover_prompt)
     console.print(Panel(

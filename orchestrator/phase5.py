@@ -15,7 +15,7 @@ def phase5_finalize(
     total_attempts: int,
 ) -> None:
     """Phase 5: Persist physical metrics and print audit report."""
-    console.rule("[bold cyan]Phase 5/5 — Finalize Metrics")
+    console.rule("[bold cyan]Phase 7/7 — Finalize Metrics")
 
     store = MetricsStore()
     record = capture_physical_metrics(

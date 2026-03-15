@@ -698,6 +698,16 @@ def _prequery_dependency_signatures(
         if p.exists():
             lean_files.append(p)
 
+    # Also search all Lib/ subdirectories so glue/layer lemmas are found before
+    # Agent8 concludes they are absent and routes to agent7_then_agent6.
+    _lib_dirs = ["Lib/Glue", "Lib/Layer0", "Lib/Layer1", "Lib/Glue/Staging"]
+    for _d in _lib_dirs:
+        for _p in sorted((PROJECT_ROOT / _d).glob("*.lean")):
+            _rel = str(_p.relative_to(PROJECT_ROOT))
+            if _rel not in seen_files:
+                seen_files.add(_rel)
+                lean_files.append(_p)
+
     snippets: list[str] = []
     seen_syms: set[str] = set()
     for ident in identifiers:

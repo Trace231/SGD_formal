@@ -85,6 +85,8 @@ def _build_agent8_tick_context(
     staging_rel: str,
     agent9_plan: dict | None = None,
     plan_updated_tick: int = 0,
+    midcheck_mode: bool = False,
+    midcheck_turns_elapsed: int = 0,
 ) -> str:
     """Build a minimal, non-truncated diagnostic prompt for Agent8.
 
@@ -207,6 +209,22 @@ def _build_agent8_tick_context(
             "Do NOT repeat the action that triggered the replan.\n\n"
         )
 
+    # Mid-check mode banner: reminds Agent8 it is a soft-gate check.
+    _midcheck_banner = ""
+    if midcheck_mode:
+        _midcheck_banner = (
+            f"## [MID-CHECK MODE — soft gate at Agent3 turn {midcheck_turns_elapsed}]\n"
+            "You are performing a **periodic mid-proof check** inside the Agent3 per-sorry loop.\n"
+            "Agent3 has been running for the last few turns.  Your job is to decide:\n"
+            "  • If the errors are **tactical** (missing tactic, wrong lemma name, "
+            "rewrite direction), return action=agent3_tactical so Agent3 continues with "
+            "its remaining budget unchanged.\n"
+            "  • If the errors indicate a **structural** problem (unknown identifier / "
+            "interface mismatch / missing glue lemma / wrong strategy), escalate to the "
+            "appropriate agent (agent7_signature, agent7_then_agent6, or agent2_replan).\n"
+            "Avoid agent2_replan unless truly necessary — prefer agent7 or agent3_tactical.\n\n"
+        )
+
     # Agent9 structured plan block (omitted when no plan is available).
     _a9_block = ""
     if agent9_plan:
@@ -221,6 +239,7 @@ def _build_agent8_tick_context(
         )
 
     return (
+        f"{_midcheck_banner}"
         f"{_new_plan_banner}"
         "## Current Algorithm File (smart-truncated around error lines)\n"
         f"File: {target_file}\n"
@@ -288,13 +307,17 @@ def _build_agent9_theorem_context(
         return ""
     for thm in agent9_plan.get("theorems", []):
         if thm.get("name") == target_theorem:
-            return (
-                f"\n\n## Agent9 Strategy for `{target_theorem}`\n"
-                f"- proof_strategy: {thm.get('proof_strategy', 'N/A')}\n"
-                f"- key_lib_lemmas: {thm.get('key_lib_lemmas', [])}\n"
-                f"- depends_on: {thm.get('depends_on', [])}\n"
-                f"- difficulty: {thm.get('difficulty', 'unknown')}\n"
-            )
+            lines = [
+                f"\n\n## Agent9 Strategy for `{target_theorem}`",
+                f"- proof_strategy: {thm.get('proof_strategy', 'N/A')}",
+                f"- proof_technique: {thm.get('proof_technique', 'unknown')}",
+                f"- key_lib_lemmas: {thm.get('key_lib_lemmas', [])}",
+                f"- missing_glue_lemmas: {thm.get('missing_glue_lemmas', [])}",
+                f"- dependency_map: {thm.get('dependency_map', {})}",
+                f"- depends_on: {thm.get('dependencies', thm.get('depends_on', []))}",
+                f"- difficulty: {thm.get('estimated_difficulty', thm.get('difficulty', 'unknown'))}",
+            ]
+            return "\n".join(lines) + "\n"
     return ""
 
 
@@ -764,6 +787,22 @@ def run_agent8_loop(
     for tick in range(1, max_steps + 1):
         console.print(f"\n[magenta]--- Agent8 Tick {tick}/{max_steps} ---")
 
+        # 0. Fresh verify — always rebuild errors from the current file state
+        # so that smart-truncation line numbers match the actual file content.
+        from orchestrator.tools import run_lean_verify as _tick_verify
+        _fresh = _tick_verify(target_file)
+        _fresh_errors = str(_fresh.get("errors", ""))
+        _fresh_sorry = int(_fresh.get("sorry_count", _current_sorry_count))
+        # Override stale errors only when the fresh build produced hard errors,
+        # or when current_errors is empty (nothing meaningful to preserve).
+        if _fresh_errors.strip() or not current_errors.strip():
+            current_errors = _fresh_errors
+        _current_sorry_count = _fresh_sorry
+        console.print(
+            f"  [Agent8] Fresh verify: exit={_fresh.get('exit_code', '?')}, "
+            f"sorry={_fresh_sorry}"
+        )
+
         # 1. Build context
         ctx = _build_agent8_tick_context(
             target_file, current_errors, current_plan, decision_history, staging_rel,
@@ -1078,3 +1117,130 @@ def run_agent8_loop(
         f"[yellow][Agent8] Exhausted {max_steps} steps without success."
     )
     return False, current_plan, current_errors
+
+
+# ---------------------------------------------------------------------------
+# Mid-check entry point (soft gate)
+# ---------------------------------------------------------------------------
+
+def run_agent8_midcheck(
+    target_file: str,
+    staging_rel: str,
+    current_plan: str,
+    current_errors: str,
+    *,
+    agent2: "Agent | None" = None,
+    agent9_plan: dict | None = None,
+    decision_history: list[dict] | None = None,
+    turns_elapsed: int = 0,
+) -> dict:
+    """Make a single Agent8 routing decision during the Agent3 per-sorry loop.
+
+    This is the "soft gate" mid-check: it does NOT dispatch any agents itself.
+    It returns a decision dict so the caller (main.py) can choose whether to
+    let Agent3 continue or hand off to the appropriate specialized agent.
+
+    Returns a dict with at least:
+        {
+            "action":          str,   # agent3_tactical | agent7_signature |
+                                      # agent7_then_agent6 | agent2_replan |
+                                      # human_missing_assumption
+            "reason":          str,
+            "targeted_prompt": str,
+            "error_signature": str,
+            "priority_level":  str,
+        }
+    On any failure (parse errors, exceptions) falls back to action=agent3_tactical
+    so the caller can safely continue.
+    """
+    algo_name = Path(target_file).stem
+    _decision_history: list[dict] = decision_history or []
+
+    console.print(
+        f"\n[bold magenta][Agent8 MidCheck] Soft-gate at turn {turns_elapsed} "
+        f"for {algo_name}"
+    )
+
+    # Build context — reuse existing helper, no plan-update banner needed here.
+    ctx = _build_agent8_tick_context(
+        target_file,
+        current_errors,
+        current_plan,
+        _decision_history,
+        staging_rel,
+        agent9_plan=agent9_plan,
+        plan_updated_tick=0,
+        midcheck_mode=True,
+        midcheck_turns_elapsed=turns_elapsed,
+    )
+
+    # Call Agent8 (single round, reduced investigation budget for speed).
+    agent8 = Agent("decision_hub")
+    _inv_registry = ToolRegistry()
+    _inv_registry.register_investigation_tools()
+    _max_inv = min(RETRY_LIMITS.get("AGENT8_INVESTIGATION_TURNS", 3), 2)
+    raw_reply = agent8.call(ctx)
+
+    for _inv_round in range(_max_inv):
+        try:
+            _inv_payload = json.loads(raw_reply)
+        except (json.JSONDecodeError, ValueError):
+            break
+        if not (
+            isinstance(_inv_payload, dict)
+            and _inv_payload.get("type") == "lookup"
+            and isinstance(_inv_payload.get("tool_calls"), list)
+            and len(_inv_payload["tool_calls"]) > 0
+        ):
+            break
+        _inv_results: list[dict] = []
+        for _tc in _inv_payload["tool_calls"]:
+            _tn = _tc.get("tool", "")
+            _ta = _tc.get("arguments", {}) or {}
+            try:
+                _tr = _inv_registry.call(_tn, **_ta)
+            except Exception as _exc:
+                _tr = {"error": str(_exc)}
+            _inv_results.append({"tool": _tn, "result": _tr})
+        raw_reply = agent8.call(
+            "Investigation results:\n"
+            + json.dumps(_inv_results, indent=2, ensure_ascii=False)
+            + "\n\nNow output your final JSON decision."
+        )
+
+    # Parse with one retry attempt before falling back.
+    decision = _parse_agent8_decision(raw_reply)
+    if decision is None:
+        # One explicit retry.
+        raw_reply = agent8.call(
+            "Your response was not valid JSON. Return ONLY a single JSON "
+            "object with the required fields: action, priority_level, reason, "
+            "targeted_prompt, error_signature. No markdown fences."
+        )
+        decision = _parse_agent8_decision(raw_reply)
+
+    if decision is None:
+        console.print(
+            "[yellow][Agent8 MidCheck] Parse failed — defaulting to agent3_tactical"
+        )
+        return {
+            "action": "agent3_tactical",
+            "reason": "Mid-check parse failure — letting Agent3 continue",
+            "targeted_prompt": "",
+            "error_signature": _extract_error_signature(current_errors),
+            "priority_level": "P3",
+        }
+
+    # Anti-loop check using the shared history.
+    action, _antiloop_reason = _check_anti_loop(decision, _decision_history)
+    if _antiloop_reason:
+        console.print(f"  [AntiLoop/MidCheck] {action} ← {_antiloop_reason}")
+        decision["action"] = action
+
+    console.print(
+        f"  [Agent8 MidCheck] Decision: {decision.get('action')} "
+        f"(P={decision.get('priority_level', '?')}) "
+        f"| reason=\"{decision.get('reason', '')[:80]}\""
+    )
+
+    return decision

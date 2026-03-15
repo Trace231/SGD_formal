@@ -49,6 +49,9 @@ from orchestrator.assumption_repair import (
 )
 from orchestrator.config import (
     AGENT6_AUTO_ROUTE_ENABLED,
+    AGENT8_MIDCHECK_ENABLED,
+    AGENT8_MIDCHECK_INTERVAL_TURNS,
+    AGENT8_MIDCHECK_MIN_TURN,
     AGENT_CONFIGS,
     AUDIT_FLUSH_INTERVAL_SECONDS,
     ALGORITHM_REFERENCES,
@@ -143,6 +146,7 @@ from orchestrator.agent3_executor import (
 )
 from orchestrator.phase2 import (
     phase1_generate_prompt,
+    phase1_generate_prompt_from_spec,
     phase2_plan_and_approve,
     _SUBGRADIENT_CONTEXT,
     _SYMBOL_WHITELIST,
@@ -300,6 +304,9 @@ def phase3_prove(
     archetype: str = "A",
     max_tool_turns: int | None = None,
     progress_detail: str = "normal",
+    skip_to_agent9: bool = False,
+    _rich_progress=None,
+    _rich_task=None,
 ) -> tuple[bool, int, str, dict]:
     """Phase 3: Agent2 ↔ Agent3 proving loop + Agent5 escalation.
 
@@ -308,16 +315,25 @@ def phase3_prove(
       normal  — per-sorry start/close/skip + round summaries (default)
       debug   — also prints every tool call and full error text
 
+    _rich_progress / _rich_task: optional Rich Progress + task ID so that
+    sub-phase advances (scaffold→3/7, agent9→4/7) can be reflected in the
+    top-level spinner without the caller needing to know internal transitions.
+
     Returns (success, attempts, errors_or_empty, audit).
     """
+    def _prog_update(desc: str) -> None:
+        if _rich_progress is not None and _rich_task is not None:
+            _rich_progress.update(_rich_task, description=desc)
+
+    def _prog_advance() -> None:
+        if _rich_progress is not None and _rich_task is not None:
+            _rich_progress.advance(_rich_task)
     # Compute per-attempt tool-turn budget.  Archetype B proofs are structurally
     # more complex and get a 1.5× multiplier.  Callers may override via max_tool_turns.
     if max_tool_turns is None:
         max_tool_turns = MAX_AGENT3_TOOL_TURNS
     if archetype.upper() == "B":
         max_tool_turns = int(max_tool_turns * 1.5)
-    console.rule("[bold cyan]Phase 3/5 — Prove (fill sorry)")
-
     agent3 = Agent("sorry_closer", extra_files=[target_file])
     registry = ToolRegistry()
     registry.register_default_tools()
@@ -564,11 +580,31 @@ def phase3_prove(
     }
 
     # ------------------------------------------------------------------
-    # Phase 3a — Scaffold: Agent2 writes ALL theorem statements + sorry
-    # placeholders, and verifies exit_code=0 before Agent3 begins.
+    # ------------------------------------------------------------------
+    # Phase 3/7 — Scaffold: Agent2 writes ALL theorem statements + sorry
+    # placeholders, then Agent10 verifies/corrects the scaffold.
     # Only runs when the target file does not yet exist.
     # ------------------------------------------------------------------
-    if not _target_exists_overlay():
+    if skip_to_agent9:
+        # Skip Phase 2 (already handled by caller) and Phase 3a (scaffold + Agent10).
+        # Jump directly to Agent9 strategy planning.
+        console.print("[dim][Phase 3/7] Skipped via --skip-to-agent9.")
+        _prog_advance()  # Phase 3/7
+
+        console.rule("[bold cyan]Phase 4/7 — Strategy Plan  [Agent9]")
+        _prog_update("Phase 4/7: Strategy planning  [Agent9]...")
+        from orchestrator.phase3a_agent9 import run_agent9_plan as _run_agent9_plan
+        _agent9_plan: dict = _run_agent9_plan(target_file, plan, _algo_name)
+        if not _agent9_plan:
+            console.print(
+                "[yellow][Agent9] Strategy plan unavailable — "
+                "Agent8 will operate without structured plan."
+            )
+        _prog_advance()  # Phase 4/7
+
+    elif not _target_exists_overlay():
+        console.rule("[bold cyan]Phase 3/7 — Scaffold  [Agent2 → Agent10]")
+        _prog_update("Phase 3/7: Scaffold writing  [Agent2]...")
         _scaffold_registry = ToolRegistry()
         _scaffold_registry.register_scaffold_tools(target_algo=_algo_name)
         _algo_name_for_staging = _algo_name
@@ -587,10 +623,11 @@ def phase3_prove(
         else:
             _a2_build_errors = ""
 
-        # Phase 3a-verify — Agent10 (Scaffold Verifier): systematic API-trace
-        # and typeclass completeness check after Agent2's scaffold attempt.
+        # Agent10 (Scaffold Verifier): systematic API-trace and typeclass
+        # completeness check after Agent2's scaffold attempt.
         #   • scaffold_succeeded=True  → Semantic-Verify mode (Phase D + E)
         #   • scaffold_succeeded=False → Full-Correction mode (Phase A-E)
+        _prog_update("Phase 3/7: Scaffold verification  [Agent10]...")
         from orchestrator.phase3a_agent10 import run_agent10_verify as _run_agent10_verify
         _a10_ok = _run_agent10_verify(
             target_file,
@@ -602,8 +639,8 @@ def phase3_prove(
 
         if not _a10_ok:
             console.print(
-                "[red bold][Phase 3a] Scaffold failed — Agent2 and Agent10 "
-                "could not produce a compiling scaffold. Aborting Phase 3."
+                "[red bold][Phase 3/7] Scaffold FAILED — Agent2 and Agent10 "
+                "could not produce a compiling scaffold.  Aborting."
             )
             return False, 0, "Phase 3a scaffold failed", {
                 "attempts": 0,
@@ -620,6 +657,9 @@ def phase3_prove(
                 "agent7_force_gate_reason_samples": [],
             }
 
+        # Scaffold verified — advance progress bar to 3/7.
+        _prog_advance()
+
         # Refresh checkpoint with verified scaffold content.
         _initial_sorry_for_ckpt = int(
             registry.call("run_lean_verify", target_file).get("sorry_count", 999)
@@ -630,9 +670,13 @@ def phase3_prove(
         initial_hash = _file_hash(target_file)
         initial_exists = True
 
-        # Agent9 — Strategy Planner: convert compiled scaffold into a structured
-        # JSON proof plan.  This plan is passed to Agent8's Decision Hub as
-        # additional context.  Failure is non-fatal: Phase 3 continues with {}.
+        # ------------------------------------------------------------------
+        # Phase 4/7 — Strategy Plan: Agent9 converts the compiled scaffold
+        # into a structured JSON proof plan for Agent8's Decision Hub.
+        # Failure is non-fatal: Phase 5 continues with an empty plan.
+        # ------------------------------------------------------------------
+        console.rule("[bold cyan]Phase 4/7 — Strategy Plan  [Agent9]")
+        _prog_update("Phase 4/7: Strategy planning  [Agent9]...")
         from orchestrator.phase3a_agent9 import run_agent9_plan as _run_agent9_plan
         _agent9_plan: dict = _run_agent9_plan(target_file, guidance, _algo_name)
         if not _agent9_plan:
@@ -654,13 +698,47 @@ def phase3_prove(
             # than Agent2's initial text guidance.
             guidance = json.dumps(_agent9_plan, indent=2, ensure_ascii=False)
             console.print(
-                f"[cyan bold][Agent9] Plan ready — bypassing Agent3 loop, "
-                f"handing control directly to Agent8 (sorry={last_sorry_count})"
+                f"[cyan bold][Agent9] Plan ready — handing control to Agent8 "
+                f"(sorry={last_sorry_count})"
             )
+
+        # Strategy plan done — advance progress bar to 4/7.
+        _prog_advance()
+
     else:
-        # Target file already exists (re-run or partial proof) — skip scaffold
-        # and Agent9 since we don't have a freshly compiled scaffold to plan from.
-        _agent9_plan = {}
+        # File already exists — skip Agent2 scaffold writing only.
+        # Still run Agent10 (semantic verification) and Agent9 (strategy plan)
+        # because the file may be hand-written or a failed prior run.
+        console.print(
+            "[dim][Phase 3/7] Scaffold writing skipped — file already exists "
+            f"({target_file})"
+        )
+        _a2_build_errors = ""
+        _prog_update("Phase 3/7: Scaffold verification  [Agent10]...")
+        from orchestrator.phase3a_agent10 import run_agent10_verify as _run_agent10_verify
+        _run_agent10_verify(
+            target_file, guidance, _algo_name,
+            scaffold_succeeded=True,
+            build_errors="",
+        )
+        _prog_advance()
+
+        console.rule("[bold cyan]Phase 4/7 — Strategy Plan  [Agent9]")
+        _prog_update("Phase 4/7: Strategy planning  [Agent9]...")
+        from orchestrator.phase3a_agent9 import run_agent9_plan as _run_agent9_plan
+        _agent9_plan: dict = _run_agent9_plan(target_file, guidance, _algo_name)
+        if not _agent9_plan:
+            console.print(
+                "[yellow][Agent9] Strategy plan unavailable — "
+                "Agent8 will operate without structured plan."
+            )
+        _prog_advance()
+
+    # ------------------------------------------------------------------
+    # Phase 5/7 — Proof Fill: Agent3 / Agent8 close all sorry placeholders.
+    # ------------------------------------------------------------------
+    console.rule("[bold cyan]Phase 5/7 — Proof Fill  [Agent3 / Agent8]")
+    _prog_update("Phase 5/7: Proof filling  [Agent3 / Agent8]...")
 
     for attempt in range(1, max_retries + 1):
         attempts = attempt
@@ -1038,6 +1116,8 @@ def phase3_prove(
             # JSON retry counter — retry up to 2 times before breaking attempt
             _json_retry_count: int = 0
             _MAX_JSON_RETRIES: int = 2
+            # Mid-check gate counter: tracks turns since last Agent8 soft-gate evaluation.
+            _midcheck_turns_since_gate: int = 0
 
             # -------------------------------------------------------------------
             # Single-step interactive tool loop (per sorry)
@@ -1046,7 +1126,127 @@ def phase3_prove(
             for tool_turn in range(_per_sorry_remaining):
                 _total_turns_this_attempt += 1
                 _turns_this_sorry += 1
-                # Parse Agent3's single action
+                _midcheck_turns_since_gate += 1
+
+                # ---------------------------------------------------------------
+                # Agent8 mid-check soft gate: every AGENT8_MIDCHECK_INTERVAL_TURNS
+                # Agent3 tool turns, ask Agent8 for a single routing decision.
+                # If Agent8 says agent3_tactical → continue; otherwise dispatch
+                # the chosen agent immediately and then let Agent3 continue.
+                # ---------------------------------------------------------------
+                if (
+                    AGENT8_MIDCHECK_ENABLED
+                    and _total_turns_this_attempt >= AGENT8_MIDCHECK_MIN_TURN
+                    and _midcheck_turns_since_gate >= AGENT8_MIDCHECK_INTERVAL_TURNS
+                ):
+                    _midcheck_turns_since_gate = 0  # reset counter regardless of outcome
+                    _midcheck_errors = last_verify_text if last_verify_text else last_errors
+                    if _midcheck_errors.strip():
+                        from orchestrator.phase3_agent8 import run_agent8_midcheck
+                        _mc_decision = run_agent8_midcheck(
+                            target_file,
+                            _staging_rel,
+                            guidance,
+                            _midcheck_errors,
+                            agent2=agent2,
+                            agent9_plan=locals().get("_agent9_plan"),
+                            decision_history=None,  # fresh per mid-check; no shared history
+                            turns_elapsed=_total_turns_this_attempt,
+                        )
+                        _mc_action = _mc_decision.get("action", "agent3_tactical")
+                        _mc_prompt = _mc_decision.get("targeted_prompt", "")
+                        console.print(
+                            f"  [Agent8 MidCheck] a{attempt} turn={_total_turns_this_attempt} "
+                            f"→ {_mc_action}"
+                        )
+                        if _mc_action != "agent3_tactical":
+                            # Execute the escalation action, then resume Agent3.
+                            from orchestrator.phase3_agent8 import (
+                                _agent8_run_agent7,
+                                _agent8_run_agent7_then_agent6,
+                                _agent8_run_agent2_replan,
+                            )
+                            from orchestrator.tools import run_lean_verify as _rlv_mc
+                            try:
+                                if _mc_action == "agent7_signature":
+                                    _a7p = _mc_decision.get("agent7_targeted_prompt", _mc_prompt)
+                                    _a7plan, _ = _agent8_run_agent7(
+                                        target_file, _midcheck_errors, _a7p
+                                    )
+                                    if _a7plan:
+                                        from orchestrator.agents import ToolRegistry as _TR
+                                        _exec_reg = _TR()
+                                        _exec_reg.register_default_tools()
+                                        for _step in _a7plan.get("ordered_steps", []):
+                                            if _step.get("direct_apply") and _step.get("tool") == "edit_file_patch":
+                                                _req = _step.get("required_args", {})
+                                                if _req.get("old_str") and _req.get("new_str"):
+                                                    try:
+                                                        _exec_reg.call(
+                                                            "edit_file_patch",
+                                                            path=_req.get("path", target_file),
+                                                            old_str=_req["old_str"],
+                                                            new_str=_req["new_str"],
+                                                        )
+                                                    except Exception:
+                                                        pass
+                                    _attempt_esc_a7 += 1
+
+                                elif _mc_action == "agent7_then_agent6":
+                                    _a7p = _mc_decision.get("agent7_targeted_prompt", _mc_prompt)
+                                    _a6p = _mc_decision.get("agent6_targeted_prompt", _mc_prompt)
+                                    _agent8_run_agent7_then_agent6(
+                                        target_file, _staging_rel, _midcheck_errors, _a7p, _a6p
+                                    )
+                                    _attempt_esc_a7 += 1
+                                    _attempt_esc_a6 += 1
+
+                                elif _mc_action == "agent2_replan":
+                                    _a2p = _mc_prompt or "Revise the proof plan to fix current errors."
+                                    guidance = _agent8_run_agent2_replan(
+                                        agent2, target_file, _midcheck_errors, guidance
+                                    )
+                                    _attempt_esc_a2 += 1
+
+                                elif _mc_action == "human_missing_assumption":
+                                    console.print(
+                                        "[red bold][Agent8 MidCheck] human_missing_assumption "
+                                        "— escalating to human gate."
+                                    )
+                                    # Treat same as turn-limit exhaustion; break out.
+                                    _inner_break_reason = "midcheck_human_gate"
+                                    _break_attempt = True
+                                    break
+
+                            except Exception as _mc_exc:
+                                console.print(
+                                    f"  [Agent8 MidCheck] Dispatch error: {_mc_exc} "
+                                    "— continuing Agent3."
+                                )
+
+                            # After escalation: re-verify and refresh Agent3 with new state.
+                            if not _break_attempt:
+                                _mc_verify = _rlv_mc(target_file)
+                                last_exit_code = int(_mc_verify.get("exit_code", 1))
+                                last_sorry_in_attempt = int(_mc_verify.get("sorry_count", 0))
+                                _mc_errors_raw = _mc_verify.get("errors", [])
+                                last_verify_text = (
+                                    "\n".join(_mc_errors_raw)
+                                    if isinstance(_mc_errors_raw, list)
+                                    else str(_mc_errors_raw)
+                                )
+                                last_errors = last_verify_text
+                                # Re-prime Agent3 with the updated state so it doesn't
+                                # act on stale context.
+                                _mc_feedback = (
+                                    f"[Agent8 mid-check: dispatched {_mc_action}]\n"
+                                    f"Current build state: exit={last_exit_code}, "
+                                    f"sorry={last_sorry_in_attempt}\n"
+                                    f"Errors:\n```\n{last_verify_text[:1500]}\n```\n"
+                                    "Continue from this updated state."
+                                )
+                                raw_reply = agent3.call(_mc_feedback)
+                                continue  # skip remainder of this turn; start fresh next turn
                 try:
                     payload = json.loads(raw_reply)
                 except json.JSONDecodeError as exc:
@@ -2705,7 +2905,15 @@ def phase3_prove(
             # Exit=1 invariant guard: if the file is broken at the end of this
             # sorry iteration, restore the best checkpoint immediately so the
             # next turn never starts from a non-compiling state.
-            if last_exit_code == 1 and best_checkpoint["content"] is not None:
+            # Exception: if the active sorry was just closed this iteration,
+            # the proof structure is complete but may have residual syntax/type
+            # errors. Do NOT restore — let Agent3 fix those in the next
+            # per-sorry iteration rather than discarding the nearly-done proof.
+            if (
+                last_exit_code == 1
+                and best_checkpoint["content"] is not None
+                and not _active_sorry_closed
+            ):
                 registry.call(
                     "overwrite_file", path=target_file,
                     content=best_checkpoint["content"],
@@ -3437,7 +3645,7 @@ def phase3_prove(
             and int(_target_recheck.get("exit_code", 1)) == 0
             and int(_target_recheck.get("sorry_count", -1)) == 0
         ):
-            console.print("[green bold][Agent8] Decision Hub succeeded — Phase 3 complete.")
+            console.print("[green bold][Agent8] Decision Hub succeeded — Phase 5/7 complete.")
             return True, attempts, "", {
                 "execution_history": [r.__dict__ for r in execution_history],
                 "attempt_failures": attempt_failures,
@@ -3505,7 +3713,7 @@ def phase3_prove(
         _strict_exit = int(_strict_verify.get("exit_code", 1))
         _strict_sorry = int(_strict_verify.get("sorry_count", -1))
         if _strict_exit == 0 and _strict_sorry == 0:
-            console.print("[green bold][Agent5] Auto-repair fixed the build — Phase 3 complete.")
+            console.print("[green bold][Agent5] Auto-repair fixed the build — Phase 5/7 complete.")
             return True, attempts, "", {
                 "execution_history": [r.__dict__ for r in execution_history],
                 "attempt_failures": attempt_failures,
@@ -3681,6 +3889,8 @@ def run(
     max_tool_turns: int | None = None,
     force_low_leverage: bool = False,
     progress_detail: str = "normal",
+    skip_to_agent9: bool = False,
+    spec_file: str | None = None,
 ) -> None:
     """Execute the full 5-phase pipeline."""
 
@@ -3728,14 +3938,18 @@ def run(
             BarColumn(),
             transient=True,
         ) as progress:
-            task = progress.add_task("Orchestrating...", total=5)
+            task = progress.add_task("Orchestrating...", total=7)
 
             # Phase 1
             audit.set_phase(1)
-            progress.update(task, description="Phase 1/5: Generating prover prompt...")
-            prover_prompt = phase1_generate_prompt(
-                algorithm, update_rule, proof_sketch, archetype
-            )
+            if spec_file:
+                progress.update(task, description="Phase 1/7: Generating prover prompt  [Agent1B / spec]...")
+                prover_prompt, algorithm, archetype = phase1_generate_prompt_from_spec(spec_file)
+            else:
+                progress.update(task, description="Phase 1/7: Generating prover prompt  [Agent1]...")
+                prover_prompt = phase1_generate_prompt(
+                    algorithm, update_rule, proof_sketch, archetype
+                )
             progress.advance(task)
 
             # Register the algorithm module in lakefile.lean before Phase 3 so
@@ -3750,21 +3964,35 @@ def run(
             total_attempts = 0
             while not success:
                 audit.set_phase(2)
-                progress.update(task, description="Phase 2/5: Planning & approval...")
-                plan, agent1, agent2 = phase2_plan_and_approve(
-                    prover_prompt, force_low_leverage
-                )
-                progress.advance(task)
+                if skip_to_agent9:
+                    # Skip Phase 1/2 — no Agent2 planning needed.
+                    # Use raw proof-sketch as lightweight guidance for Agent9.
+                    from orchestrator.agents import Agent as _Agent
+                    agent1 = _Agent("orchestrator")
+                    agent2 = _Agent("planner")
+                    plan = proof_sketch
+                    progress.update(task, description="Phase 2/7: Planning  [Skipped — skip-to-agent9]...")
+                    progress.advance(task)
+                else:
+                    progress.update(task, description="Phase 2/7: Planning & approval  [Agent1 ↔ Agent2]...")
+                    plan, agent1, agent2 = phase2_plan_and_approve(
+                        prover_prompt, force_low_leverage, archetype=archetype
+                    )
+                    progress.advance(task)
 
-                # Phase 3
+                # Phases 3-5 (scaffold → strategy → proof fill) all run inside
+                # phase3_prove; it advances the progress bar for 3/7 and 4/7 itself.
                 audit.set_phase(3)
-                progress.update(task, description="Phase 3/5: Proving (fill sorry)...")
+                progress.update(task, description="Phase 3/7: Scaffold writing  [Agent2]...")
                 success, attempts, _, phase3_audit = phase3_prove(
                     agent2, target_file, plan,
                     max_retries=max_retries,
                     archetype=archetype,
                     max_tool_turns=max_tool_turns,
                     progress_detail=progress_detail,
+                    skip_to_agent9=skip_to_agent9,
+                    _rich_progress=progress,
+                    _rich_task=task,
                 )
                 total_attempts += attempts
                 merged_phase3_audit["execution_history"].extend(
@@ -3805,13 +4033,15 @@ def run(
                 )
                 if not success:
                     progress.reset(task)
-                    progress.advance(task)  # re-enter at phase 2
+                    progress.advance(task)  # re-enter at phase 2 (→1/7)
 
+            # phase3_prove internally advances for phases 3/7 and 4/7;
+            # this advance covers the proof-fill completion → 5/7.
             progress.advance(task)
 
-            # Phase 4
+            # Phase 6
             audit.set_phase(4)
-            progress.update(task, description="Phase 4/5: Persisting docs...")
+            progress.update(task, description="Phase 6/7: Persisting docs  [Agent4]...")
             try:
                 new_tricks = phase4_persist(
                     algorithm,
@@ -3837,9 +4067,9 @@ def run(
                 )
             progress.advance(task)
 
-            # Phase 5
+            # Phase 7
             audit.set_phase(5)
-            progress.update(task, description="Phase 5/5: Finalizing metrics...")
+            progress.update(task, description="Phase 7/7: Finalizing metrics...")
             phase5_finalize(
                 algorithm,
                 new_tricks=new_tricks,
@@ -3944,16 +4174,48 @@ def main() -> None:
                         ))
     parser.add_argument("--interactive", action="store_true",
                         help="Prompt for algorithm card interactively")
+    parser.add_argument("--skip-to-agent9", action="store_true",
+                        help=(
+                            "Skip Phase 1/2 (Agent2 planning) and Phase 3a (scaffold + Agent10). "
+                            "Jump directly to Agent9 strategy planning. "
+                            "Requires target file to already exist."
+                        ))
+    parser.add_argument("--spec-file", type=str, default=None,
+                        help=(
+                            "Path to a structured JSON algorithm specification file "
+                            "(e.g. book/FOML/StochasticMirrorDescent.json). "
+                            "When provided, replaces --algorithm / --update-rule / "
+                            "--proof-sketch / --archetype: all four fields are read "
+                            "from the spec. Agent1B (orchestrator_spec) is used instead "
+                            "of the standard Agent1, preserving all JSON content verbatim."
+                        ))
 
     args = parser.parse_args()
 
     if args.interactive:
         fields = _interactive_input()
+    elif args.spec_file:
+        # spec-file mode: algorithm/update_rule/proof_sketch/archetype are read
+        # from the JSON file by phase1_generate_prompt_from_spec(); supply
+        # placeholder values here so run() can accept them (they are overwritten
+        # inside run() when spec_file is set).
+        import json as _json
+        try:
+            _spec = _json.loads(open(args.spec_file).read())
+        except Exception as _e:
+            parser.error(f"Cannot read --spec-file '{args.spec_file}': {_e}")
+        fields = {
+            "algorithm": _spec.get("algorithm", args.spec_file),
+            "update_rule": _spec.get("sections", {}).get("2_algorithm", {}).get(
+                "update_rule", {}).get("math", "see spec"),
+            "proof_sketch": f"See structured spec: {args.spec_file}",
+            "archetype": str(_spec.get("archetype", "B")).upper(),
+        }
     else:
         if not all([args.algorithm, args.update_rule, args.proof_sketch, args.archetype]):
             parser.error(
                 "Provide --algorithm, --update-rule, --proof-sketch, and "
-                "--archetype, or use --interactive."
+                "--archetype, or use --interactive, or use --spec-file."
             )
         fields = {
             "algorithm": args.algorithm,
@@ -3972,6 +4234,8 @@ def main() -> None:
         max_tool_turns=args.max_tool_turns,
         force_low_leverage=args.force_low_leverage,
         progress_detail=args.progress_detail,
+        skip_to_agent9=args.skip_to_agent9,
+        spec_file=args.spec_file,
     )
 
 

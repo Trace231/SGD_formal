@@ -1,0 +1,192 @@
+{
+  "algorithm": "StochasticSubgradientMethod",
+  "full_name": "Stochastic Subgradient Method (Convex, Constant Step Size)",
+  "source": "SGD_coldstart/Algorithms/SubgradientMethod.lean",
+  "lean_theorem": "subgradient_convergence_convex",
+  "lean_theorem_line": 86,
+  "archetype": "B",
+  "archetype_note": "Novel proof structure bypassing Layer 1 meta-theorems. No gradF field (non-smooth objective). Variance bound derived internally from uniform oracle bound (Pattern I).",
+  "reference": "Lan, First-order and Stochastic Optimization Methods for Machine Learning, Chapter 4 (Theorem 4.1 variant)",
+
+  "sections": {
+
+    "1_assumptions": {
+      "title": "Assumptions and Context",
+      "space": {
+        "description": "Hilbert space E over the reals",
+        "lean_typeclasses": [
+          "NormedAddCommGroup E",
+          "InnerProductSpace ℝ E",
+          "CompleteSpace E",
+          "MeasurableSpace E",
+          "BorelSpace E",
+          "SecondCountableTopology E"
+        ]
+      },
+      "sample_space": {
+        "description": "Sample space S (for the stochastic oracle) and probability space Ω",
+        "lean_typeclasses": ["MeasurableSpace S", "MeasurableSpace Ω"],
+        "measure": "P : Measure Ω, IsProbabilityMeasure P"
+      },
+      "objective": {
+        "description": "f : E → ℝ, convex. Convexity is expressed in primitive subgradient form — no abstract subdifferential symbol.",
+        "lean_hypothesis": "hsubgrad : ∀ w s y, f y ≥ f w + ⟪gradL w s, y - w⟫_ℝ",
+        "note": "This replaces the standard condition g ∈ ∂f(w) because Mathlib has no subdifferential type. The inequality directly encodes subgradient membership."
+      },
+      "oracle": {
+        "description": "Stochastic first-order oracle gradL : E → S → E",
+        "lean_hypotheses": [
+          "hgL : Measurable (Function.uncurry gradL)",
+          "hbounded : ∀ w s, ‖gradL w s‖ ≤ G"
+        ],
+        "note": "G is the uniform bound on oracle outputs. There is no unbiasedness hypothesis — the subgradient condition subsumes it."
+      },
+      "noise": {
+        "description": "i.i.d. random samples ξ t : Ω → S",
+        "lean_hypotheses": [
+          "hξ_meas : ∀ t, Measurable (ξ t)",
+          "hξ_indep : iIndepFun (β := fun _ => S) ξ P",
+          "hξ_ident : ∀ t, IdentDistrib (ξ t) (ξ 0) P P"
+        ]
+      },
+      "step_size": {
+        "description": "Constant step size η > 0",
+        "lean_hypotheses": [
+          "hη_pos : 0 < η",
+          "hη : ∀ t, setup.η t = η"
+        ]
+      },
+      "integrability": {
+        "description": "Required integrability conditions (passed as hypotheses, not derived)",
+        "lean_hypotheses": [
+          "h_int_f : ∀ t, Integrable (fun ω => f (setup.process t ω)) setup.P",
+          "h_int_norm_sq : ∀ t, Integrable (fun ω => ‖setup.process t ω - wStar‖ ^ 2) setup.P",
+          "h_int_sq : ∀ t, Integrable (fun ω => ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2) setup.P"
+        ]
+      }
+    },
+
+    "2_algorithm": {
+      "title": "Algorithm Specification",
+      "structure": "SubgradientSetup E S Ω",
+      "initialization": "w₀ : E  (deterministic starting point)",
+      "update_rule": {
+        "math": "w_{t+1}(\\omega) = w_t(\\omega) - \\eta \\cdot \\text{gradL}(w_t(\\omega),\\, \\xi_t(\\omega))",
+        "lean": "setup.process (t+1) ω = setup.process t ω - setup.η t • setup.gradL (setup.process t ω) (setup.ξ t ω)",
+        "lean_definition": "SubgradientSetup.process := sgdProcess setup.w₀ setup.η setup.gradL setup.ξ",
+        "note": "process reuses sgdProcess from SGD verbatim (Archetype B pattern — reuse recursion, change proof structure)."
+      },
+      "output": {
+        "math": "\\bar{w}_T = \\frac{1}{T} \\sum_{t=0}^{T-1} w_t",
+        "convergence_measure": "Cesaro average of E[f(w_t)]: (1/T) ∑_{t=0}^{T-1} (E[f(w_t)] - f(w*))"
+      }
+    },
+
+    "3_key_lemma_chain": {
+      "title": "Key Lemma Chain",
+      "overview": "Three proof steps: (A) per-step integrated bound, (B) telescoping sum, (C) algebraic rearrangement.",
+
+      "step_A": {
+        "title": "STEP A — Per-step integrated bound",
+        "lean_have": "hstep : ∀ t < T, ∫ ω, ‖w_{t+1}(ω) - w*‖² ∂P ≤ ∫ ω, ‖w_t(ω) - w*‖² ∂P - 2η(E[f(w_t)] - f(w*)) + η²G²",
+        "sub_lemmas": [
+          {
+            "id": "A1",
+            "title": "Norm expansion (pointwise)",
+            "math": "\\|w_{t+1}(\\omega) - w^*\\|^2 = \\|w_t(\\omega) - w^*\\|^2 - 2\\eta \\langle g_t(\\omega), w_t(\\omega) - w^* \\rangle + \\eta^2 \\|g_t(\\omega)\\|^2",
+            "key_lemmas": ["norm_sq_sgd_step (Lib/Glue/Algebra.lean)"],
+            "proof_technique": "norm_expansion",
+            "lean_tactic": "rw [h_rec]; exact norm_sq_sgd_step ..."
+          },
+          {
+            "id": "A2",
+            "title": "Inner product lower bound (Pattern H)",
+            "math": "\\langle \\text{gradL}(w_t, \\xi_t), w_t - w^* \\rangle \\geq f(w_t) - f(w^*)",
+            "direction_note": "hsubgrad gives ⟨g, w* - w_t⟩; must flip to ⟨g, w_t - w*⟩. Use inner_neg_right after rewriting w* - w_t = -(w_t - w*).",
+            "key_lemmas": ["inner_neg_right (Mathlib)"],
+            "proof_technique": "expectation_chain",
+            "lean_tactic": "rw [show wStar - setup.process t ω = -(setup.process t ω - wStar) by abel, inner_neg_right] at h_sub; linarith"
+          },
+          {
+            "id": "A3",
+            "title": "Pointwise per-step bound",
+            "math": "\\|w_{t+1}(\\omega) - w^*\\|^2 \\leq \\|w_t(\\omega) - w^*\\|^2 - 2\\eta(f(w_t(\\omega)) - f(w^*)) + \\eta^2 G^2",
+            "key_lemmas": ["A1", "A2", "pow_le_pow_left₀"],
+            "proof_technique": "simp_ring",
+            "lean_tactic": "nlinarith [h_inner_lb ω, hηt_pos]"
+          },
+          {
+            "id": "A4",
+            "title": "Integrate per-step bound",
+            "math": "\\mathbb{E}[\\|w_{t+1} - w^*\\|^2] \\leq \\mathbb{E}[\\|w_t - w^*\\|^2] - 2\\eta(\\mathbb{E}[f(w_t)] - f(w^*)) + \\eta^2 G^2",
+            "key_lemmas": ["integral_mono", "integral_add", "integral_sub", "integral_const_mul"],
+            "proof_technique": "bochner_bound",
+            "lean_tactic": "calc ... integral_mono ... integral_add ... integral_sub ..."
+          },
+          {
+            "id": "A5",
+            "title": "Variance bound (Pattern I)",
+            "math": "\\mathbb{E}[\\|\\text{gradL}(w_t, \\xi_t)\\|^2] \\leq G^2",
+            "key_lemmas": ["hasBoundedVariance_of_pointwise_bound (Lib/Glue/Probability.lean)"],
+            "proof_technique": "mathlib_direct",
+            "lean_tactic": "have h_var_bound := hasBoundedVariance_of_pointwise_bound hbounded h_wt_meas (setup.hξ_meas t) setup.hgL h_int_sq_t"
+          }
+        ]
+      },
+
+      "step_B": {
+        "title": "STEP B — Telescoping sum",
+        "lean_have": "hsum : 2η ∑_{t=0}^{T-1} (E[f(w_t)] - f(w*)) ≤ ‖w₀ - w*‖² + T·η²G²",
+        "math": "\\sum_{t=0}^{T-1} \\left( \\mathbb{E}[\\|w_{t+1} - w^*\\|^2] - \\mathbb{E}[\\|w_t - w^*\\|^2] \\right) = \\mathbb{E}[\\|w_T - w^*\\|^2] - \\|w_0 - w^*\\|^2",
+        "key_lemmas": ["Finset.sum_range_sub", "sgdProcess_zero"],
+        "proof_technique": "telescoping_sum",
+        "auxiliary": [
+          "E[‖w_T - w*‖²] ≥ 0  (drop non-negative final term)",
+          "E[‖w_0 - w*‖²] = ‖w₀ - w*‖²  (deterministic start, sgdProcess_zero)"
+        ],
+        "lean_tactic": "rw [Finset.sum_range_sub, SubgradientSetup.process, sgdProcess_zero]"
+      },
+
+      "step_C": {
+        "title": "STEP C — Final algebraic rearrangement",
+        "goal": "Divide both sides of STEP B by 2ηT, then simplify to the standard bound form.",
+        "key_lemmas": ["field_simp", "ring", "gcongr"],
+        "proof_technique": "simp_ring",
+        "lean_tactic": "field_simp [hη_pos.ne', hT_pos.ne']; ring"
+      }
+    },
+
+    "4_final_theorem": {
+      "title": "Final Convergence Theorem",
+      "lean_identifier": "subgradient_convergence_convex",
+      "lean_file": "SGD_coldstart/Algorithms/SubgradientMethod.lean",
+      "lean_line": 86,
+      "statement_math": "\\frac{1}{T} \\sum_{t=0}^{T-1} \\left( \\mathbb{E}[f(w_t)] - f(w^*) \\right) \\leq \\frac{\\|w_0 - w^*\\|^2}{2\\eta T} + \\frac{\\eta G^2}{2}",
+      "lean_statement": "(1 / (T : ℝ)) * ∑ t ∈ Finset.range T, (∫ ω, f (setup.process t ω) ∂setup.P - f wStar) ≤ ‖setup.w₀ - wStar‖ ^ 2 / (2 * η * T) + η * G ^ 2 / 2",
+      "interpretation": {
+        "first_term": "‖w₀ - w*‖² / (2ηT) — initial distance term, vanishes as T → ∞",
+        "second_term": "ηG²/2 — variance floor from oracle noise, minimized by small η",
+        "optimal_T": "Set η = ‖w₀ - w*‖ / (G√T) to balance the two terms, giving O(1/√T) rate"
+      },
+      "proof_dependency_summary": {
+        "external_glue_lemmas": [
+          "norm_sq_sgd_step  (Lib/Glue/Algebra.lean)",
+          "hasBoundedVariance_of_pointwise_bound  (Lib/Glue/Probability.lean)",
+          "sgdProcess_measurable  (Main.lean)",
+          "sgdProcess_zero  (Main.lean)"
+        ],
+        "mathlib_lemmas": [
+          "inner_neg_right",
+          "integral_mono",
+          "integral_add",
+          "integral_sub",
+          "integral_const_mul",
+          "Finset.sum_range_sub",
+          "pow_le_pow_left₀",
+          "Nat.cast_pos"
+        ],
+        "patterns_used": ["Pattern H (inner product direction flip)", "Pattern I (pointwise bound to variance)"]
+      }
+    }
+  }
+}
