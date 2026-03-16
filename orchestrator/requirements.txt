@@ -2,3 +2,4 @@ openai
 anthropic
 rich
 python-dotenv
+pytest

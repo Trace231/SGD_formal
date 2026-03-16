@@ -262,10 +262,26 @@ def escalate(
     """Agent5 diagnoses the failure; human decides the next action.
 
     Returns one of: ``"replan"``, ``"fix_assumptions"``, ``"abort"``.
+    When AGENT5_DEFAULT_ACTION is set (default "a"), skips prompt and returns that action.
     """
+    from orchestrator.config import AGENT5_DEFAULT_ACTION
+
     raw, _ = diagnose(agent5, sorry_context, build_errors, plan_text)
     console.print(Panel(raw, title="[red bold]Agent5 — Diagnosis"))
     console.print()
+
+    default_action = AGENT5_DEFAULT_ACTION
+    if default_action:
+        action = str(default_action).strip().lower()
+        if action in ("a", "abort"):
+            console.print("[yellow][Agent5] Default action: abort (AGENT5_DEFAULT_ACTION=a)[/yellow]")
+            return "abort"
+        if action in ("r", "replan", "re-plan"):
+            console.print("[yellow][Agent5] Default action: replan (AGENT5_DEFAULT_ACTION=r)[/yellow]")
+            return "replan"
+        if action in ("f", "fix", "fix_assumptions"):
+            console.print("[yellow][Agent5] Default action: fix_assumptions (AGENT5_DEFAULT_ACTION=f)[/yellow]")
+            return "fix_assumptions"
 
     while True:
         action = console.input(

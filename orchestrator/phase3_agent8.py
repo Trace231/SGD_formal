@@ -6,7 +6,7 @@ tick-based decision loop.  Each tick:
   2. Builds a minimal diagnostic context (truncated file, errors, decision history).
   3. Calls Agent8 to produce a single JSON decision.
   4. Dispatches the chosen action (Agent3 tactical, Agent7 signature, Agent7→Agent6
-     bridge lemma, Agent2 replan, or human gate).
+     bridge lemma, Agent9 replan, or human gate).
   5. Verifies the result; appends to decision_history.
   6. Exits early on success (exit=0, sorry=0) or human gate.
 """
@@ -24,9 +24,13 @@ from rich.panel import Panel
 
 from orchestrator.agents import Agent, ToolRegistry
 from orchestrator.agent_callers import (
-    _call_agent2_with_tools,
     _call_agent7_with_tools,
     _run_agent6_glue_loop,
+)
+from orchestrator.contracts import (
+    AGENT8_REQUIRED_DECISION_FIELDS,
+    AGENT8_VALID_ACTIONS,
+    AGENT8_VALID_ERROR_SUBTYPES,
 )
 from orchestrator.config import (
     AGENT8_DEBUG,
@@ -72,6 +76,373 @@ def _extract_error_signature(errors_text: str) -> str:
     return errors_text.strip()[:60]
 
 
+def _is_structural_error(error_signature: str, errors_text: str) -> bool:
+    """Heuristic: structural errors require at least one investigation lookup."""
+    hay = f"{error_signature}\n{errors_text}".lower()
+    structural_markers = (
+        "unknown identifier",
+        "unknown constant",
+        "failed to synthesize",
+        "typeclass",
+        "application type mismatch",
+        "declaration zone",
+        "invalid field",
+    )
+    return any(m in hay for m in structural_markers)
+
+
+# ---------------------------------------------------------------------------
+# Error Subtype Classifier
+# ---------------------------------------------------------------------------
+
+# Stable string constant for the four canonical subtypes.
+_SUBTYPE_DECLARATION_API_MISMATCH = "declaration_api_mismatch"
+_SUBTYPE_PROOF_API_MISMATCH       = "proof_api_mismatch"
+_SUBTYPE_PROOF_TACTIC_FAILURE     = "proof_tactic_failure"
+_SUBTYPE_STRATEGY_MISMATCH        = "strategy_mismatch"
+
+# Markers that strongly suggest the error is inside a proof body (:= by ...)
+_PROOF_ZONE_MARKERS = (
+    "tactic",
+    "rewrite",
+    "linarith",
+    "simp",
+    "ring",
+    "have ",
+    "calc ",
+    "exact ",
+    "apply ",
+    "unsolved goals",
+    "motive is not type correct",
+    "function expected",
+)
+
+# Markers that strongly suggest API shape mismatch inside a proof body
+_PROOF_API_SHAPE_MARKERS = (
+    "integral_",
+    "sum_range",
+    "finset.sum",
+    "integral_add",
+    "integral_sub",
+    "integral_const_mul",
+    "integral_const",
+    "integral_nonneg",
+    "integral_mono",
+    "measure_theory",
+    "too many arguments",
+    "wrong number of arguments",
+    "argument has wrong type",
+    "type mismatch",
+    "application type mismatch",
+)
+
+# Markers that point to the declaration zone (before := by)
+_DECLARATION_ZONE_MARKERS = (
+    "unknown identifier",
+    "unknown constant",
+    "invalid field",
+    "declaration zone",
+    "cannot find",
+    "failed to synthesize",
+    "typeclass",
+)
+
+
+def _classify_error_subtype(
+    errors_text: str,
+    target_file: str = "",
+    *,
+    decision_history: "list[dict] | None" = None,
+) -> str:
+    """Classify the dominant error category for routing decisions.
+
+    Returns one of four canonical subtype strings:
+    - ``declaration_api_mismatch``  — error before ``:= by`` (declaration zone)
+    - ``proof_api_mismatch``        — API shape/arg error inside proof body
+    - ``proof_tactic_failure``      — pure tactic logic failure inside proof body
+    - ``strategy_mismatch``         — repeated failures suggest wrong math approach
+
+    The classifier is purely text-heuristic; it never calls LLM or tools.
+    It uses a three-stage waterfall:
+      1. Zone feature  — detect declaration-zone keywords
+      2. Semantic feature — detect proof-zone API shape markers
+      3. History feature — repeated zero-progress signals strategy mismatch
+    """
+    if not errors_text:
+        return _SUBTYPE_PROOF_TACTIC_FAILURE  # default
+
+    hay = errors_text.lower()
+    error_sig = _extract_error_signature(errors_text).lower()
+
+    # Stage 1 — Declaration zone: strong structural markers
+    if any(m in hay for m in _DECLARATION_ZONE_MARKERS):
+        # Narrow to declaration zone if there is NO proof-zone context in the
+        # same error block (some errors appear at both locations).
+        has_proof_zone_context = any(m in hay for m in _PROOF_ZONE_MARKERS)
+        # declaration zone markers without conflicting proof zone → P0-class
+        if not has_proof_zone_context:
+            return _SUBTYPE_DECLARATION_API_MISMATCH
+        # Both markers → prefer declaration since structural takes priority.
+        return _SUBTYPE_DECLARATION_API_MISMATCH
+
+    # Stage 2 — Proof API shape mismatch inside proof body
+    if any(m in hay for m in _PROOF_API_SHAPE_MARKERS):
+        # Confirm error is inside proof body (proof zone markers present)
+        if any(m in hay for m in _PROOF_ZONE_MARKERS):
+            return _SUBTYPE_PROOF_API_MISMATCH
+        # API marker but no clear proof-zone context: still classify as
+        # proof_api_mismatch (conservative — avoids routing to agent7).
+        return _SUBTYPE_PROOF_API_MISMATCH
+
+    # Stage 3 — Strategy mismatch signal from decision history
+    if decision_history and len(decision_history) >= 3:
+        _recent = decision_history[-3:]
+        _all_zero_progress = all(
+            e.get("top_error_count_after", 0) >= e.get("top_error_count_before", 0)
+            and e.get("outcome") in ("failed", "dispatch_error")
+            for e in _recent
+        )
+        if _all_zero_progress:
+            return _SUBTYPE_STRATEGY_MISMATCH
+
+    # Default: proof tactic failure
+    return _SUBTYPE_PROOF_TACTIC_FAILURE
+
+
+def _count_error_lines(errors_text: str) -> int:
+    """Count Lean-style error lines to measure per-tick error delta."""
+    if not errors_text:
+        return 0
+    count = 0
+    for ln in errors_text.splitlines():
+        if re.search(r":\d+:\d+:", ln):
+            count += 1
+    return count
+
+
+def _normalize_error_signature(sig: str) -> str:
+    """Normalize an error signature for stable cross-tick comparison."""
+    if not sig:
+        return ""
+    # Remove obvious volatile fragments (line numbers, backticks, extra spaces).
+    s = sig.lower()
+    s = re.sub(r":\d+:\d+:", ":", s)
+    s = s.replace("`", "").replace('"', "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _signature_changed(errors_before: str, errors_after: str) -> bool:
+    """Whether main error signature changed after dispatch."""
+    _before = _normalize_error_signature(_extract_error_signature(errors_before))
+    _after = _normalize_error_signature(_extract_error_signature(errors_after))
+    if not _before and not _after:
+        return False
+    return _before != _after
+
+
+_NETWORK_ERROR_MARKERS = (
+    "remoteprotocolerror",
+    "connectionerror",
+    "connecttimeout",
+    "readtimeout",
+    "timeout",
+    "temporarily unavailable",
+    "connection reset",
+)
+
+
+def _is_network_error(text: str) -> bool:
+    t = str(text).lower()
+    return any(m in t for m in _NETWORK_ERROR_MARKERS)
+
+
+def _safe_llm_call(
+    agent: "Agent",
+    message: str,
+    *,
+    idempotent: bool = True,
+    max_attempts: int = 3,
+    base_sleep_s: float = 1.0,
+) -> str:
+    """Call agent with light retry for idempotent network failures only."""
+    attempts = max(1, int(max_attempts))
+    for i in range(1, attempts + 1):
+        try:
+            return agent.call(message)
+        except Exception as exc:
+            if not idempotent or not _is_network_error(str(exc)) or i >= attempts:
+                raise
+            _wait = base_sleep_s * (2 ** (i - 1))
+            console.print(
+                f"[yellow][Agent8] transient network error on call "
+                f"({i}/{attempts}): {exc}. retrying in {_wait:.1f}s..."
+            )
+            time.sleep(_wait)
+    # unreachable; keeps mypy happy
+    return agent.call(message)
+
+
+def _normalize_evidence(evidence: Any) -> list[dict]:
+    """Normalize decision evidence to [{source, snippet}, ...]."""
+    if not isinstance(evidence, list):
+        return []
+    out: list[dict] = []
+    for item in evidence:
+        if isinstance(item, dict):
+            src = str(item.get("source", "")).strip()
+            snip = str(item.get("snippet", "")).strip()
+            if src and snip:
+                out.append({"source": src, "snippet": snip})
+        elif isinstance(item, str):
+            txt = item.strip()
+            if txt:
+                out.append({"source": "unspecified", "snippet": txt})
+    return out
+
+
+def _evidence_hash(evidence: list[dict]) -> str:
+    """Stable mini-hash for anti-loop grouping."""
+    parts = [
+        f"{e.get('source', '')}:{e.get('snippet', '')[:120]}"
+        for e in evidence
+    ]
+    return "|".join(parts)[:500]
+
+
+def _build_api_shape_contract(error_subtype: str, errors_text: str) -> str:
+    """Build an API-shape repair contract to inject into Agent3's dispatch prompt.
+
+    When the classified subtype indicates a proof-body API shape mismatch,
+    this returns an explicit protocol block that forces Agent3 to:
+    1. Look up the current signature of each failing lemma before patching.
+    2. Construct a minimal diff matching the actual argument shape.
+    3. Verify immediately after each edit.
+
+    Returns empty string when not applicable.
+    """
+    if error_subtype != _SUBTYPE_PROOF_API_MISMATCH:
+        return ""
+
+    # Extract which API names appear in the error text for targeted lookup hints.
+    hay = errors_text.lower()
+    api_hints: list[str] = []
+    for candidate in (
+        "integral_nonneg", "integral_mono", "integral_add",
+        "integral_sub", "integral_const_mul", "integral_const",
+        "sum_range_succ", "sum_range_succ'", "finset.sum",
+        "measure_theory",
+    ):
+        if candidate in hay:
+            api_hints.append(f"`{candidate}`")
+
+    hint_line = ""
+    if api_hints:
+        hint_line = (
+            f"Failing APIs detected: {', '.join(api_hints[:5])}. "
+            "Look up their current signatures first.\n"
+        )
+
+    return (
+        "\n\n[API-SHAPE REPAIR CONTRACT — proof_api_mismatch]\n"
+        f"{hint_line}"
+        "Protocol (follow in order):\n"
+        "  1. For EACH failing call site: issue search_in_file / search_codebase "
+        "to retrieve the CURRENT signature (parameter count, implicit/explicit, binder order).\n"
+        "  2. Compare actual vs expected: note exact arg count and which args are implicit {…} "
+        "vs explicit (…).\n"
+        "  3. Apply the MINIMAL patch — change only argument structure, not proof logic.\n"
+        "  4. Run run_lean_verify immediately after each edit.\n"
+        "  5. Fix at most 2 call sites per round; do not rewrite unrelated code.\n"
+        "  6. Before signaling done, include a transaction_report with:\n"
+        "     observed_signature, target_callsite, minimal_patch, verify_result.\n"
+        "FORBIDDEN in this mode: guessing signatures from memory, introducing new theorems, "
+        "large rewrites of proof bodies.\n"
+    )
+
+
+def _check_route_downweight(
+    proposed_action: str,
+    error_subtype: str,
+    decision_history: "list[dict]",
+    window: int = 3,
+) -> tuple[str, str]:
+    """Downweight a stale route if it produced no error-count improvement.
+
+    Returns (action, override_reason).  When downweighting is not triggered,
+    action equals proposed_action and override_reason is empty.
+
+    Condition: same subtype + same action + all top_error_count_after >= before
+    for the last *window* entries.
+    """
+    if len(decision_history) < window:
+        return proposed_action, ""
+
+    _recent = [
+        e for e in decision_history[-window:]
+        if e.get("outcome") != "network_failure"
+    ]
+    if len(_recent) < window:
+        return proposed_action, ""
+    _matching = [
+        e for e in _recent
+        if e.get("action") == proposed_action
+        and e.get("error_subtype", "") == error_subtype
+        and e.get("route_effective") is False
+    ]
+    if len(_matching) >= window:
+        _reason = (
+            f"action='{proposed_action}' with subtype='{error_subtype}' made zero "
+            f"error-count progress across last {window} ticks — downweighting."
+        )
+        # Select next best action based on subtype
+        _fallback = {
+            _SUBTYPE_PROOF_API_MISMATCH: "agent7_signature",
+            _SUBTYPE_DECLARATION_API_MISMATCH: "agent3_tactical",
+            _SUBTYPE_PROOF_TACTIC_FAILURE: "agent9_replan",
+            _SUBTYPE_STRATEGY_MISMATCH: "human_missing_assumption",
+        }.get(error_subtype, "agent9_replan")
+        if _fallback == proposed_action:
+            _fallback = "agent9_replan"
+        return _fallback, _reason
+
+    return proposed_action, ""
+
+
+def _apply_hard_route_gate(
+    proposed_action: str,
+    error_subtype: str,
+    decision_history: "list[dict]",
+    action_cooldowns: dict[str, int],
+    *,
+    window: int = 3,
+    cooldown_ticks: int = 2,
+) -> tuple[str, str]:
+    """Hard gate: force route switch on repeated no-delta, with cooldown."""
+    # 1) Cooldown block (prevents immediate oscillation).
+    if action_cooldowns.get(proposed_action, 0) > 0:
+        fallback, _ = _check_route_downweight(
+            proposed_action, error_subtype, decision_history, window=max(2, window)
+        )
+        if fallback == proposed_action:
+            fallback = "agent9_replan"
+        return (
+            fallback,
+            f"hard_gate cooldown blocks action='{proposed_action}' "
+            f"for {action_cooldowns.get(proposed_action, 0)} more tick(s).",
+        )
+
+    # 2) Repeated no-delta condition.
+    fallback, reason = _check_route_downweight(
+        proposed_action, error_subtype, decision_history, window=window
+    )
+    if reason:
+        action_cooldowns[proposed_action] = max(1, int(cooldown_ticks))
+        return fallback, "hard_gate " + reason
+
+    return proposed_action, ""
+
+
 # ---------------------------------------------------------------------------
 # Context builder for each Agent8 tick
 # ---------------------------------------------------------------------------
@@ -87,6 +458,7 @@ def _build_agent8_tick_context(
     midcheck_turns_elapsed: int = 0,
     pending_lemma_status: dict | None = None,
     baseline_errors: str = "",
+    error_subtype: str = "",
 ) -> str:
     """Build a minimal, non-truncated diagnostic prompt for Agent8.
 
@@ -214,8 +586,8 @@ def _build_agent8_tick_context(
             "its remaining budget unchanged.\n"
             "  • If the errors indicate a **structural** problem (unknown identifier / "
             "interface mismatch / missing glue lemma / wrong strategy), escalate to the "
-            "appropriate agent (agent7_signature, agent7_then_agent6, or agent2_replan).\n"
-            "Avoid agent2_replan unless truly necessary — prefer agent7 or agent3_tactical.\n\n"
+            "appropriate agent (agent7_signature, agent7_then_agent6, or agent9_replan).\n"
+            "Avoid agent9_replan unless truly necessary — prefer agent7 or agent3_tactical.\n\n"
         )
 
     # Agent9 structured plan block (omitted when no plan is available).
@@ -228,6 +600,7 @@ def _build_agent8_tick_context(
             _a9_text = str(agent9_plan)
         _a9_block = (
             f"## Agent9 Structured Plan\n"
+            "NOTE: Agent9 is a non-binding prior. Prefer current compile evidence on conflicts.\n"
             f"```json\n{_a9_text[:_a9_chars]}\n```\n\n"
         )
 
@@ -263,6 +636,40 @@ def _build_agent8_tick_context(
     else:
         _baseline_block = "## Build Errors\n"
 
+    _api_shape_hints = []
+    _hay = errors_text.lower()
+    if "integral_" in _hay:
+        _api_shape_hints.append(
+            "- For integral lemmas, verify current signature shape (implicit/explicit args, binder order) via search_in_file before editing."
+        )
+    if "sum_range" in _hay or "finset.sum" in _hay:
+        _api_shape_hints.append(
+            "- For Finset sums, verify exact rewrite lemma variant (`sum_range_succ`, `sum_range_succ'`, subtraction forms) in current Mathlib."
+        )
+    if "type mismatch" in _hay or "failed to synthesize" in _hay:
+        _api_shape_hints.append(
+            "- For mismatches, include API-shape evidence: expected type vs actual type and argument position."
+        )
+    _api_shape_block = ""
+    if _api_shape_hints:
+        _api_shape_block = "## API Shape Checklist\n" + "\n".join(_api_shape_hints) + "\n\n"
+
+    # Subtype classification block (computed by caller and passed in)
+    _subtype_block = ""
+    if error_subtype:
+        _subtype_routing = {
+            _SUBTYPE_DECLARATION_API_MISMATCH: "→ Preferred action: agent7_signature (declaration zone fix)",
+            _SUBTYPE_PROOF_API_MISMATCH:       "→ Preferred action: agent3_tactical (proof-body API shape patch; lookup signature first)",
+            _SUBTYPE_PROOF_TACTIC_FAILURE:     "→ Preferred action: agent3_tactical (tactic / lemma name fix)",
+            _SUBTYPE_STRATEGY_MISMATCH:        "→ Preferred action: agent9_replan (mathematical approach needs revision)",
+        }.get(error_subtype, "")
+        _subtype_block = (
+            f"## Error Subtype (pre-classified)\n"
+            f"Subtype: `{error_subtype}`\n"
+            f"{_subtype_routing}\n"
+            "This is a heuristic signal — override with compile evidence if conflicting.\n\n"
+        )
+
     return (
         f"{_midcheck_banner}"
         f"{_new_plan_banner}"
@@ -274,6 +681,8 @@ def _build_agent8_tick_context(
         f"## Proof Plan (current)\n{agent2_plan[:_plan_chars]}\n\n"
         f"## Library Files Available\n{lib_desc}\n\n"
         f"{_a9_block}"
+        f"{_subtype_block}"
+        f"{_api_shape_block}"
         f"{_pending_lemma_block}"
         f"## Decision History (recent)\n{history_block}\n\n"
         f"{dep_sigs}"
@@ -287,32 +696,64 @@ def _build_agent8_tick_context(
 # JSON decision parser with retry logic
 # ---------------------------------------------------------------------------
 
-_VALID_ACTIONS = {
-    "agent3_tactical",
-    "agent7_signature",
-    "agent7_then_agent6",
-    "agent2_replan",
-    "human_missing_assumption",
-}
+_VALID_ACTIONS = AGENT8_VALID_ACTIONS
+
+_REQUIRED_DECISION_FIELDS = AGENT8_REQUIRED_DECISION_FIELDS
+
+_VALID_ERROR_SUBTYPES = AGENT8_VALID_ERROR_SUBTYPES
 
 
-def _parse_agent8_decision(raw_reply: str) -> dict | None:
-    """Parse Agent8's JSON decision.  Returns the dict or None on failure."""
+def _validate_agent8_decision_schema(obj: dict) -> tuple[bool, str]:
+    """Strict schema gate for evidence-driven Agent8 decisions."""
+    missing = sorted(_REQUIRED_DECISION_FIELDS - set(obj.keys()))
+    if missing:
+        return False, f"missing required fields: {missing}"
+    if obj.get("action") not in _VALID_ACTIONS:
+        return False, f"invalid action: {obj.get('action')}"
+    # error_subtype is optional but must be a valid value when present
+    if "error_subtype" in obj and obj["error_subtype"] not in _VALID_ERROR_SUBTYPES:
+        return False, f"invalid error_subtype: {obj.get('error_subtype')!r}"
+    if not str(obj.get("hypothesis", "")).strip():
+        return False, "hypothesis must be non-empty"
+    evidence = _normalize_evidence(obj.get("evidence"))
+    if len(evidence) < 2:
+        return False, "evidence must contain at least 2 entries with source+snippet"
+    obj["evidence"] = evidence
+    try:
+        conf = float(obj.get("confidence"))
+    except Exception:
+        return False, "confidence must be a number in [0,1]"
+    if conf < 0.0 or conf > 1.0:
+        return False, "confidence must be in [0,1]"
+    obj["confidence"] = conf
+    if not str(obj.get("counterfactual", "")).strip():
+        return False, "counterfactual must be non-empty"
+    return True, ""
+
+
+def _parse_agent8_decision(raw_reply: str) -> tuple[dict | None, str]:
+    """Parse and validate Agent8 JSON decision."""
     for candidate in _json_candidates(raw_reply.strip()):
         try:
             obj = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if isinstance(obj, dict) and obj.get("action") in _VALID_ACTIONS:
-            return obj
+        if isinstance(obj, dict):
+            ok, reason = _validate_agent8_decision_schema(obj)
+            if ok:
+                return obj, ""
+            return None, reason
     # Fallback: try the whole reply as JSON
     try:
         obj = json.loads(raw_reply.strip())
-        if isinstance(obj, dict) and obj.get("action") in _VALID_ACTIONS:
-            return obj
+        if isinstance(obj, dict):
+            ok, reason = _validate_agent8_decision_schema(obj)
+            if ok:
+                return obj, ""
+            return None, reason
     except json.JSONDecodeError:
         pass
-    return None
+    return None, "response is not valid JSON"
 
 
 # ---------------------------------------------------------------------------
@@ -328,21 +769,57 @@ def _build_agent9_theorem_context(
     Used to enrich Agent3's dispatch prompt so it has theorem-specific guidance
     (proof strategy, key lemmas, dependencies) from Agent9's structured plan.
     Returns empty string when the plan is absent or the theorem is not found.
+
+    Field access is normalised: lean_statement_line falls back to line_number,
+    estimated_difficulty falls back to difficulty, dependencies falls back to
+    depends_on — to stay compatible across plan schema versions.
     """
     if not agent9_plan or not target_theorem:
         return ""
     for thm in agent9_plan.get("theorems", []):
         if thm.get("name") == target_theorem:
+            # Normalise line-number field (prefer lean_statement_line, fall back
+            # to legacy line_number used by some older plan versions).
+            _line = thm.get("lean_statement_line", thm.get("line_number", "?"))
+            _deps = thm.get("dependencies", thm.get("depends_on", []))
+            _diff = thm.get("estimated_difficulty", thm.get("difficulty", "unknown"))
+            _mgl = thm.get("missing_glue_lemmas", [])
+            _dep_map = thm.get("dependency_map", {})
+            _first_hint = thm.get("first_action_patch_hint", "")
+            _expected_shape = thm.get("expected_lean_shape", "")
+
+            # Format missing_glue_lemmas compactly for Agent3 readability.
+            if isinstance(_mgl, list) and _mgl:
+                _mgl_lines = []
+                for entry in _mgl:
+                    if isinstance(entry, dict):
+                        _mgl_lines.append(
+                            f"    • {entry.get('name', '?')}: "
+                            f"{entry.get('proposed_lean_type', '(no type)')}"
+                        )
+                    else:
+                        _mgl_lines.append(f"    • {entry}")
+                _mgl_block = "[\n" + "\n".join(_mgl_lines) + "\n  ]"
+            else:
+                _mgl_block = "[]"
+
             lines = [
                 f"\n\n## Agent9 Strategy for `{target_theorem}`",
-                f"- proof_strategy: {thm.get('proof_strategy', 'N/A')}",
+                f"- lean_statement_line: {_line}",
                 f"- proof_technique: {thm.get('proof_technique', 'unknown')}",
+                f"- estimated_difficulty: {_diff}",
+                f"- depends_on: {_deps}",
                 f"- key_lib_lemmas: {thm.get('key_lib_lemmas', [])}",
-                f"- missing_glue_lemmas: {thm.get('missing_glue_lemmas', [])}",
-                f"- dependency_map: {thm.get('dependency_map', {})}",
-                f"- depends_on: {thm.get('dependencies', thm.get('depends_on', []))}",
-                f"- difficulty: {thm.get('estimated_difficulty', thm.get('difficulty', 'unknown'))}",
+                f"- missing_glue_lemmas: {_mgl_block}",
+                f"- dependency_map: {_dep_map}",
+                "- NOTE: Agent9 guidance is NON-BINDING; compile evidence takes precedence.",
+                "- proof_strategy (EXECUTABLE REFERENCE):",
+                f"  {thm.get('proof_strategy', 'N/A')}",
             ]
+            if _first_hint:
+                lines.append(f"- first_action_patch_hint: {_first_hint}")
+            if _expected_shape:
+                lines.append(f"- expected_lean_shape: {_expected_shape}")
             return "\n".join(lines) + "\n"
     return ""
 
@@ -358,6 +835,8 @@ def _agent8_run_agent3(
     allowed_edit_lines: str | None,
     *,
     max_turns: int | None = None,
+    compile_first_mode: bool = False,
+    transactional_mode: bool = False,
 ) -> dict:
     """Run a fresh Agent3 with a targeted prompt and simplified tool loop.
 
@@ -381,6 +860,23 @@ def _agent8_run_agent3(
             "of the target file. Do not modify code outside this range."
         )
 
+    transactional_instruction = ""
+    if transactional_mode:
+        transactional_instruction = (
+            "\n\nTRANSACTIONAL EXECUTION CONTRACT (STRICT):\n"
+            "1) Before patching API-lemma calls, lookup and confirm current signature.\n"
+            "2) Keep edits minimal (1-2 callsites only).\n"
+            "3) Run run_lean_verify after edits.\n"
+            "4) When signaling done, arguments MUST include:\n"
+            "   {\"transaction_report\": {\n"
+            "      \"observed_signature\": \"...\",\n"
+            "      \"target_callsite\": \"file:line expr\",\n"
+            "      \"minimal_patch\": \"what exactly changed\",\n"
+            "      \"verify_result\": \"exit/sorry/errors summary\"\n"
+            "   }}\n"
+            "If any field is missing, done will be rejected."
+        )
+
     initial_msg = (
         f"[AGENT8 DISPATCH — Tactical Fix]\n\n"
         f"{targeted_prompt}\n\n"
@@ -388,11 +884,16 @@ def _agent8_run_agent3(
         f"(Read it with read_file if you need the complete mathematical strategy.)\n"
         f"Target file: {target_file}\n"
         f"{scope_instruction}\n\n"
+        f"{transactional_instruction}\n\n"
         "Fix the specified error. When done, signal tool=done. "
         "Output ONE JSON action per response: {{thought, tool, arguments}}."
     )
 
     raw_reply = agent3.call(initial_msg)
+    _edit_calls = 0
+    _verify_snapshots: list[dict] = []
+    _last_observed_signature = ""
+    _last_callsite = ""
 
     for turn in range(max_turns):
         try:
@@ -410,14 +911,44 @@ def _agent8_run_agent3(
         arguments = payload.get("arguments", {}) or {}
 
         if tool_name == "done":
+            if transactional_mode:
+                _tx = {}
+                if isinstance(arguments, dict):
+                    _tx = arguments.get("transaction_report", {}) or {}
+                _required = (
+                    "observed_signature",
+                    "target_callsite",
+                    "minimal_patch",
+                    "verify_result",
+                )
+                _missing = [k for k in _required if not str(_tx.get(k, "")).strip()]
+                if _missing:
+                    raw_reply = agent3.call(
+                        "done rejected — transactional report missing fields: "
+                        f"{_missing}. Please return tool=done with "
+                        "arguments.transaction_report including all required fields."
+                    )
+                    continue
             verify = registry.call("run_lean_verify", target_file)
             exit_code = int(verify.get("exit_code", 1))
             sorry_count = int(verify.get("sorry_count", -1))
+            _verify_snapshots.append(
+                {
+                    "exit_code": exit_code,
+                    "sorry_count": sorry_count,
+                    "error_sig": _extract_error_signature(str(verify.get("errors", ""))),
+                }
+            )
             if exit_code == 0 and sorry_count == 0:
                 return {
                     "exit_code": exit_code,
                     "sorry_count": sorry_count,
                     "errors": "",
+                    "transaction_valid": bool(transactional_mode),
+                    "observed_signature": _last_observed_signature,
+                    "target_callsite": _last_callsite,
+                    "minimal_patch": f"edit_calls={_edit_calls}",
+                    "verify_result": _verify_snapshots[-1],
                 }
             # Reject done if not clean
             raw_reply = agent3.call(
@@ -440,8 +971,32 @@ def _agent8_run_agent3(
             )
             continue
 
+        # Compile-first mode: constrain tool usage to minimal repair loop.
+        if compile_first_mode:
+            _compile_first_allowed = {
+                "read_file",
+                "search_in_file",
+                "edit_file_patch",
+                "run_lean_verify",
+                "done",
+            }
+            if tool_name not in _compile_first_allowed:
+                raw_reply = agent3.call(
+                    f"Compile-first mode active. Tool `{tool_name}` is not allowed. "
+                    "Use only: read_file, search_in_file, edit_file_patch, run_lean_verify, done."
+                )
+                continue
+
         # Execute tool
         args = dict(arguments)
+        if transactional_mode and tool_name == "edit_file_patch":
+            _edit_calls += 1
+            if _edit_calls > 2:
+                raw_reply = agent3.call(
+                    "Transactional mode: too many edits in one round (>2). "
+                    "Revert to minimal patching and verify before further edits."
+                )
+                continue
         # Normalize path/file_path
         if "path" in args and "file_path" not in args:
             for k in ("get_lean_goal", "check_lean_have", "run_lean_verify"):
@@ -466,6 +1021,22 @@ def _agent8_run_agent3(
             result_text = json.dumps(result, indent=2, ensure_ascii=False)
         else:
             result_text = str(result)
+        if transactional_mode and tool_name in ("search_in_file", "search_codebase", "read_file"):
+            _last_observed_signature = result_text[:500]
+        if transactional_mode and tool_name == "edit_file_patch":
+            _last_callsite = str(args.get("path", target_file))
+        if transactional_mode and tool_name == "run_lean_verify":
+            _verify_snapshots.append(
+                {
+                    "exit_code": int(getattr(result, "get", lambda *_: 1)("exit_code", 1))
+                    if isinstance(result, dict) else 1,
+                    "sorry_count": int(getattr(result, "get", lambda *_: -1)("sorry_count", -1))
+                    if isinstance(result, dict) else -1,
+                    "error_sig": _extract_error_signature(
+                        str(getattr(result, "get", lambda *_: "")("errors", ""))
+                    ) if isinstance(result, dict) else "",
+                }
+            )
         raw_reply = agent3.call(f"## {tool_name} result\n```\n{result_text}\n```\n")
 
     # Turns exhausted — verify final state
@@ -474,6 +1045,11 @@ def _agent8_run_agent3(
         "exit_code": int(final.get("exit_code", 1)),
         "sorry_count": int(final.get("sorry_count", -1)),
         "errors": str(final.get("errors", "")),
+        "transaction_valid": False if transactional_mode else True,
+        "observed_signature": _last_observed_signature,
+        "target_callsite": _last_callsite,
+        "minimal_patch": f"edit_calls={_edit_calls}",
+        "verify_result": _verify_snapshots[-1] if _verify_snapshots else {},
     }
 
 
@@ -636,50 +1212,6 @@ def _agent8_run_agent7_then_agent6(
 
 
 # ---------------------------------------------------------------------------
-# Dispatch: Agent2 replan
-# ---------------------------------------------------------------------------
-
-def _agent8_run_agent2_replan(
-    agent2: Agent,
-    target_file: str,
-    errors_text: str,
-    current_plan: str,
-) -> str:
-    """Clear Agent2 context and request a revised proof strategy.
-
-    Returns the new plan text.
-    """
-    agent2.messages.clear()
-
-    try:
-        current_file = load_file(target_file)
-    except FileNotFoundError:
-        current_file = "(file does not exist)"
-
-    replan_prompt = (
-        "[AGENT8 — STRATEGY REVISION REQUEST]\n\n"
-        "The current proof strategy has failed after all retry attempts. "
-        "Please revise the proof plan based on the errors below.\n\n"
-        f"## Current Plan\n{current_plan[:RETRY_LIMITS.get('AGENT8_A2_PLAN_CHARS', 4000)]}\n\n"
-        f"## Current Errors\n```\n{errors_text[:RETRY_LIMITS.get('AGENT8_A2_ERROR_CHARS', 2000)]}\n```\n\n"
-        f"## Current File Content\n```lean\n{current_file[:RETRY_LIMITS.get('AGENT8_A2_FILE_CHARS', 6000)]}\n```\n\n"
-        "Revise the proof strategy. You may:\n"
-        "- Decompose sub-goals differently\n"
-        "- Add new intermediate lemmas\n"
-        "- Change the proof approach (different Mathlib lemmas, different tactic family)\n"
-        "- Adjust the proof order\n\n"
-        "CONSTRAINT: Do NOT modify parts of the proof that are already correct "
-        "(lines that compile without errors). Focus on the failing sections.\n\n"
-        "Provide revised guidance with PATCH blocks as usual."
-    )
-
-    replan_registry = ToolRegistry()
-    replan_registry.register_default_tools()
-    new_plan, _ = _call_agent2_with_tools(agent2, replan_registry, replan_prompt)
-    return new_plan
-
-
-# ---------------------------------------------------------------------------
 # Debug logger
 # ---------------------------------------------------------------------------
 
@@ -703,6 +1235,64 @@ def _debug_log(
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _print_diagnostic_card(
+    *,
+    tick: int,
+    error_sig: str,
+    hypothesis: str,
+    evidence: list[dict],
+    chosen_action: str,
+    counterfactual: str,
+    outcome: str = "",
+    error_subtype: str = "",
+    api_shape_verified: bool = False,
+    top_error_count_before: int | None = None,
+    top_error_count_after: int | None = None,
+    error_count_delta: int | None = None,
+    main_error_signature_changed: bool | None = None,
+) -> None:
+    """Emit a structured per-tick diagnostic card."""
+    ev_lines = [
+        f"{idx + 1}. [{e.get('source', 'unknown')}] {e.get('snippet', '')[:140]}"
+        for idx, e in enumerate(evidence)
+    ]
+    subtype_line = f"ErrorSubtype: {error_subtype}  (api_shape_verified={api_shape_verified})\n" if error_subtype else ""
+    delta_line = ""
+    if top_error_count_before is not None and top_error_count_after is not None:
+        _delta = (
+            error_count_delta
+            if error_count_delta is not None
+            else (top_error_count_after - top_error_count_before)
+        )
+        _sigchg = (
+            main_error_signature_changed
+            if main_error_signature_changed is not None
+            else False
+        )
+        delta_line = (
+            f"ErrorCount: {top_error_count_before} -> {top_error_count_after} "
+            f"(delta={_delta:+d}) | main_signature_changed={_sigchg}\n"
+        )
+    body = (
+        f"{subtype_line}"
+        f"{delta_line}"
+        f"ErrorSig: {error_sig[:120]}\n"
+        f"Hypothesis: {hypothesis[:220]}\n"
+        f"Evidence:\n" + ("\n".join(ev_lines) if ev_lines else "  (none)") + "\n"
+        f"ChosenAction: {chosen_action}\n"
+        f"WhyNotOtherAction: {counterfactual[:220]}"
+    )
+    if outcome:
+        body += f"\nOutcome: {outcome}"
+    console.print(
+        Panel(
+            body,
+            title=f"[cyan]Agent8 Diagnostic Card — Tick {tick}",
+            border_style="cyan",
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Behavior-driven anti-loop check
 # ---------------------------------------------------------------------------
@@ -722,8 +1312,8 @@ def _check_anti_loop(
     1. **Zero-progress repeat** — the same action was used in the last N
        history entries, all of which had ``sorry_delta == 0`` AND
        ``errors_after[:120] == errors_before[:120]``.  Escalate to
-       ``agent2_replan`` (or ``human_missing_assumption`` if the proposed
-       action is already ``agent2_replan``).
+       ``agent9_replan`` (or ``human_missing_assumption`` if the proposed
+       action is already ``agent9_replan``).
     2. **Error frozen across all recent actions** — the last 3 history entries
        (regardless of action) all share the same ``errors_after[:120]``.
        Escalate to ``human_missing_assumption`` UNLESS there are known pending
@@ -737,7 +1327,8 @@ def _check_anti_loop(
     _sig_len = RETRY_LIMITS.get("AGENT8_ERROR_SIG_FULL_LEN", 120)
     proposed_action = decision.get("action", "agent3_tactical")
     error_sig = decision.get("error_signature", "")
-    _escapable = proposed_action not in ("agent2_replan", "human_missing_assumption")
+    _escapable = proposed_action not in ("agent9_replan", "human_missing_assumption")
+    proposed_hypothesis = str(decision.get("hypothesis", "")).strip()
 
     if not decision_history:
         return proposed_action, ""
@@ -758,9 +1349,9 @@ def _check_anti_loop(
                 f"action '{proposed_action}' made zero progress in last "
                 f"{_no_progress_n} attempts (errors unchanged, sorry_delta=0)"
             )
-            if proposed_action == "agent2_replan":
+            if proposed_action == "agent9_replan":
                 return "human_missing_assumption", _reason
-            return "agent2_replan", _reason
+            return "agent9_replan", _reason
 
     # --- Condition 2: error frozen across all recent actions ---
     if len(decision_history) >= 3:
@@ -804,7 +1395,25 @@ def _check_anti_loop(
                 f"(action='{proposed_action}', error_sig='{_sig_key[:60]}') "
                 f"repeated {_pair_repeats + 1}× in history"
             )
-            return "agent2_replan", _reason
+            return "agent9_replan", _reason
+
+    # --- Condition 4: same error_signature + same hypothesis repeated failures ---
+    if proposed_hypothesis and len(decision_history) >= 2:
+        _same_hyp_recent = [
+            e for e in decision_history[-3:]
+            if str(e.get("hypothesis", "")).strip() == proposed_hypothesis
+            and e.get("error_signature", "")[:120] == error_sig[:120]
+            and e.get("outcome") in ("failed", "dispatch_error")
+            and int(e.get("top_error_count_after", 0)) >= int(e.get("top_error_count_before", 0))
+        ]
+        if len(_same_hyp_recent) >= 2:
+            _reason = (
+                "same error_signature + same hypothesis failed repeatedly "
+                "(no error-count improvement)"
+            )
+            if proposed_action in ("agent9_replan", "human_missing_assumption"):
+                return "agent7_signature", _reason
+            return "agent9_replan", _reason
 
     return proposed_action, ""
 
@@ -836,6 +1445,8 @@ def run_agent8_loop(
     _consecutive_parse_failures = 0
     _consecutive_same_error: int = 0
     _last_error_sig: str = ""
+    _force_lookup_next_tick: bool = False
+    _action_cooldowns: dict[str, int] = {}
 
     # Per-lemma attempt tracking for sorry-only scenarios.
     # Populated from agent9_plan's missing_glue_lemmas at startup and after replans.
@@ -877,22 +1488,42 @@ def run_agent8_loop(
 
     for tick in range(1, max_steps + 1):
         console.print(f"\n[magenta]--- Agent8 Tick {tick}/{max_steps} ---")
+        # Decrement action cooldowns at the start of each tick.
+        for _a in list(_action_cooldowns.keys()):
+            _action_cooldowns[_a] = max(0, int(_action_cooldowns.get(_a, 0)) - 1)
+            if _action_cooldowns[_a] <= 0:
+                _action_cooldowns.pop(_a, None)
 
         # 0. Fresh verify — always rebuild errors from the current file state
         # so that smart-truncation line numbers match the actual file content.
         from orchestrator.tools import run_lean_verify as _tick_verify
         _fresh = _tick_verify(target_file)
+        _fresh_exit = int(_fresh.get("exit_code", 1))
         _fresh_errors = str(_fresh.get("errors", ""))
         _fresh_sorry = int(_fresh.get("sorry_count", _current_sorry_count))
+        _compile_first_mode = (_fresh_exit != 0 and _fresh_sorry == 0)
         # Override stale errors only when the fresh build produced hard errors,
         # or when current_errors is empty (nothing meaningful to preserve).
         if _fresh_errors.strip() or not current_errors.strip():
             current_errors = _fresh_errors
         _current_sorry_count = _fresh_sorry
-        console.print(
-            f"  [Agent8] Fresh verify: exit={_fresh.get('exit_code', '?')}, "
-            f"sorry={_fresh_sorry}"
+
+        # Classify error subtype before building context so it can be injected.
+        _error_subtype = _classify_error_subtype(
+            current_errors, target_file,
+            decision_history=decision_history,
         )
+
+        console.print(
+            f"  [Agent8] Fresh verify: exit={_fresh_exit}, "
+            f"sorry={_fresh_sorry} | subtype={_error_subtype}"
+        )
+        if _compile_first_mode:
+            console.print(
+                f"  [Agent8] Compile-First mode active (exit=1, sorry=0): "
+                f"subtype={_error_subtype} — "
+                "prioritizing API/signature/type alignment over strategy debate."
+            )
 
         # 1. Build context
         ctx = _build_agent8_tick_context(
@@ -900,7 +1531,14 @@ def run_agent8_loop(
             agent9_plan=agent9_plan,
             plan_updated_tick=_plan_updated_tick,
             pending_lemma_status=_pending_lemma_status,
+            error_subtype=_error_subtype,
         )
+        if _force_lookup_next_tick:
+            ctx += (
+                "\n\n## Mandatory Investigation This Tick\n"
+                "Last tick had replan failure / zero-progress. "
+                "You MUST perform at least one lookup before final decision."
+            )
 
         # 2. Call Agent8 with optional investigation rounds
         agent8 = Agent("decision_hub")
@@ -908,7 +1546,7 @@ def run_agent8_loop(
         _inv_registry.register_investigation_tools()
         _max_inv = RETRY_LIMITS.get("AGENT8_INVESTIGATION_TURNS", 3)
         _investigation_rounds_this_tick = 0
-        raw_reply = agent8.call(ctx)
+        raw_reply = _safe_llm_call(agent8, ctx, idempotent=True, max_attempts=3)
 
         for _inv_round in range(_max_inv):
             try:
@@ -932,58 +1570,141 @@ def run_agent8_loop(
                     _tr = {"error": str(_exc)}
                 _inv_results.append({"tool": _tn, "result": _tr})
             _investigation_rounds_this_tick += 1
-            raw_reply = agent8.call(
+            raw_reply = _safe_llm_call(
+                agent8,
                 "Investigation results:\n"
                 + json.dumps(_inv_results, indent=2, ensure_ascii=False)
-                + "\n\nNow output your final JSON decision."
+                + "\n\nNow output your final JSON decision.",
+                idempotent=True,
+                max_attempts=3,
             )
 
         # 3. Parse decision (with retry)
-        decision = _parse_agent8_decision(raw_reply)
+        decision, _parse_error = _parse_agent8_decision(raw_reply)
         if decision is None:
             _consecutive_parse_failures += 1
             console.print(
                 f"  [Agent8] JSON parse failed ({_consecutive_parse_failures}/3). "
-                "Retrying..."
+                f"Retrying... reason: {_parse_error}"
             )
             if _consecutive_parse_failures >= 3:
                 console.print(
                     "[yellow][Agent8] 3 consecutive parse failures — "
-                    "defaulting to agent2_replan"
+                    "defaulting to agent9_replan"
                 )
                 decision = {
-                    "action": "agent2_replan",
+                    "action": "agent9_replan",
                     "priority_level": "P2",
                     "reason": "Agent8 JSON parse failures — falling back to replan",
                     "targeted_prompt": "Revise the proof strategy.",
                     "error_signature": _extract_error_signature(current_errors),
+                    "hypothesis": "Current decision protocol output is malformed; regenerate a fresh structured plan.",
+                    "evidence": [
+                        {"source": "agent8_parse", "snippet": _parse_error},
+                        {"source": "lean_verify", "snippet": _extract_error_signature(current_errors)},
+                    ],
+                    "confidence": 0.4,
+                    "counterfactual": "Do not keep local tactical loop when decision JSON is repeatedly invalid.",
                 }
             else:
                 # Retry with explicit instruction
-                raw_reply = agent8.call(
+                raw_reply = _safe_llm_call(
+                    agent8,
                     "Your response was not valid JSON. Return ONLY a single JSON "
                     "object with the required fields: action, priority_level, reason, "
-                    "targeted_prompt, error_signature. No markdown fences."
+                    "targeted_prompt, error_signature, hypothesis, evidence, confidence, "
+                    "counterfactual. No markdown fences.",
+                    idempotent=True,
+                    max_attempts=2,
                 )
-                decision = _parse_agent8_decision(raw_reply)
+                decision, _parse_error = _parse_agent8_decision(raw_reply)
                 if decision is None:
                     continue
         _consecutive_parse_failures = 0
+
+        if _is_structural_error(
+            decision.get("error_signature", ""),
+            current_errors,
+        ) and _investigation_rounds_this_tick == 0:
+            console.print(
+                "  [Agent8] Mandatory lookup gate: structural error requires at least "
+                "one investigation lookup before routing."
+            )
+            raw_reply = _safe_llm_call(
+                agent8,
+                "Structural error detected. Before final decision, you MUST output at least "
+                "one lookup request using supported read-only tools.",
+                idempotent=True,
+                max_attempts=2,
+            )
+            for _ in range(min(_max_inv, 2)):
+                try:
+                    _inv_payload = json.loads(raw_reply)
+                except (json.JSONDecodeError, ValueError):
+                    break
+                if not (
+                    isinstance(_inv_payload, dict)
+                    and _inv_payload.get("type") == "lookup"
+                    and isinstance(_inv_payload.get("tool_calls"), list)
+                    and len(_inv_payload["tool_calls"]) > 0
+                ):
+                    break
+                _inv_results = []
+                for _tc in _inv_payload["tool_calls"]:
+                    _tn = _tc.get("tool", "")
+                    _ta = _tc.get("arguments", {}) or {}
+                    try:
+                        _tr = _inv_registry.call(_tn, **_ta)
+                    except Exception as _exc:
+                        _tr = {"error": str(_exc)}
+                    _inv_results.append({"tool": _tn, "result": _tr})
+                _investigation_rounds_this_tick += 1
+                raw_reply = _safe_llm_call(
+                    agent8,
+                    "Investigation results:\n"
+                    + json.dumps(_inv_results, indent=2, ensure_ascii=False)
+                    + "\n\nNow output your final JSON decision.",
+                    idempotent=True,
+                    max_attempts=2,
+                )
+            decision2, parse_err2 = _parse_agent8_decision(raw_reply)
+            if decision2 is not None:
+                decision = decision2
+            else:
+                console.print(f"  [Agent8] Mandatory lookup re-parse failed: {parse_err2}")
+        if _investigation_rounds_this_tick > 0:
+            _force_lookup_next_tick = False
 
         action = decision.get("action", "agent3_tactical")
         error_sig = decision.get(
             "error_signature", _extract_error_signature(current_errors)
         )
         targeted_prompt = decision.get("targeted_prompt", "")
+        hypothesis = str(decision.get("hypothesis", "")).strip()
+        evidence = _normalize_evidence(decision.get("evidence"))
+        counterfactual = str(decision.get("counterfactual", "")).strip()
+        if _force_lookup_next_tick and not evidence:
+            evidence = [{"source": "system_gate", "snippet": "lookup was required due to prior zero-progress"}]
+
+        _print_diagnostic_card(
+            tick=tick,
+            error_sig=error_sig,
+            hypothesis=hypothesis,
+            evidence=evidence,
+            chosen_action=action,
+            counterfactual=counterfactual,
+            error_subtype=_error_subtype,
+        )
 
         console.print(
             f"  [Agent8] Decision: {action} "
             f"(P={decision.get('priority_level', '?')}) "
+            f"| subtype={_error_subtype} "
             f"| error_sig=\"{error_sig[:60]}\""
         )
         console.print(f"  [Agent8] Reason: {decision.get('reason', '?')}")
 
-        # 4. Anti-loop check (behavior-driven, replaces old heuristic pair counters).
+        # 4a. Anti-loop check (behavior-driven)
         action, _antiloop_reason = _check_anti_loop(
             decision, decision_history,
             pending_lemma_status=_pending_lemma_status,
@@ -993,6 +1714,33 @@ def run_agent8_loop(
             decision["action"] = action
             targeted_prompt = (
                 f"[FORCED by anti-loop: {_antiloop_reason}] " + targeted_prompt
+            )
+
+        # 4b. Route downweight: subtype + action with zero error-count progress
+        action, _downweight_reason = _check_route_downweight(
+            action, _error_subtype, decision_history,
+        )
+        if _downweight_reason:
+            console.print(f"  [RouteDownweight] {action} ← {_downweight_reason}")
+            decision["action"] = action
+            targeted_prompt = (
+                f"[ROUTE DOWNWEIGHTED: {_downweight_reason}] " + targeted_prompt
+            )
+
+        # 4c. Hard route gate with cooldown (falsifiable routing).
+        action, _hard_reason = _apply_hard_route_gate(
+            action,
+            _error_subtype,
+            decision_history,
+            _action_cooldowns,
+            window=RETRY_LIMITS.get("AGENT8_ROUTE_NO_DELTA_WINDOW", 3),
+            cooldown_ticks=RETRY_LIMITS.get("AGENT8_ROUTE_COOLDOWN_TICKS", 2),
+        )
+        if _hard_reason:
+            console.print(f"  [HardRouteGate] {action} ← {_hard_reason}")
+            decision["action"] = action
+            targeted_prompt = (
+                f"[HARD ROUTE GATE: {_hard_reason}] " + targeted_prompt
             )
 
         # Hard trigger: same error_signature too many consecutive ticks → human gate.
@@ -1012,10 +1760,58 @@ def run_agent8_loop(
                 action = "human_missing_assumption"
                 decision["action"] = action
 
+        # Compile-first subtype routing:
+        # When exit=1 && sorry=0, route based on classified error subtype
+        # rather than forcing everything to agent7_signature.
+        if _compile_first_mode:
+            if _error_subtype == _SUBTYPE_PROOF_API_MISMATCH and action not in (
+                "agent3_tactical", "human_missing_assumption"
+            ):
+                console.print(
+                    "  [Agent8] Compile-First subtype gate: proof_api_mismatch → "
+                    "overriding to agent3_tactical (proof-body API shape fix)."
+                )
+                action = "agent3_tactical"
+                decision["action"] = action
+                targeted_prompt = (
+                    "[compile-first/proof_api_mismatch] Fix proof-body API shape "
+                    "error: look up the target lemma's current signature first, "
+                    "then apply a minimal patch matching actual arg count/order. "
+                    "Verify after each edit.\n\n"
+                    + targeted_prompt
+                )
+            elif _error_subtype == _SUBTYPE_DECLARATION_API_MISMATCH and action == "agent9_replan":
+                console.print(
+                    "  [Agent8] Compile-First subtype gate: declaration_api_mismatch → "
+                    "overriding agent9_replan to agent7_signature."
+                )
+                action = "agent7_signature"
+                decision["action"] = action
+                targeted_prompt = (
+                    "[compile-first/declaration_api_mismatch] Fix declaration-zone "
+                    "API/signature mismatch before replanning strategy.\n\n"
+                    + targeted_prompt
+                )
+            elif action == "agent9_replan" and _error_subtype not in (
+                _SUBTYPE_STRATEGY_MISMATCH,
+            ):
+                console.print(
+                    "  [Agent8] Compile-First guard: suppressing replan for "
+                    f"subtype={_error_subtype}, forcing signature-level repair first."
+                )
+                action = "agent7_signature"
+                decision["action"] = action
+                targeted_prompt = (
+                    "[compile-first guard] Focus on declaration/API/type alignment. "
+                    "Do not replan mathematical strategy in this tick.\n\n"
+                    + targeted_prompt
+                )
+
         # 5. Dispatch — capture state BEFORE action for delta computation.
         _errors_before: str = current_errors[:300]
         _sorry_before: int = _current_sorry_count
         outcome: dict = {"outcome": "unknown"}
+        result: dict = {}
 
         try:
             if action == "agent3_tactical":
@@ -1023,11 +1819,24 @@ def run_agent8_loop(
                 _a9_thm_ctx = _build_agent9_theorem_context(
                     agent9_plan, decision.get("target_theorem", "")
                 )
+                _compile_first_note = ""
+                if _compile_first_mode:
+                    _compile_first_note = (
+                        "\n\n[COMPILE-FIRST REPAIR MODE]\n"
+                        "- Fix only the top 1-2 compiler/type/API errors in declaration/proof body.\n"
+                        "- Verify immediately after edits.\n"
+                        "- Do NOT introduce new theorems or large rewrites.\n"
+                    )
+                _api_shape_contract = _build_api_shape_contract(
+                    _error_subtype, current_errors
+                )
                 result = _agent8_run_agent3(
                     target_file,
                     current_plan,
-                    targeted_prompt + _a9_thm_ctx,
+                    targeted_prompt + _a9_thm_ctx + _compile_first_note + _api_shape_contract,
                     decision.get("allowed_edit_lines"),
+                    compile_first_mode=_compile_first_mode,
+                    transactional_mode=(_error_subtype == _SUBTYPE_PROOF_API_MISMATCH),
                 )
                 outcome = {
                     "outcome": "success" if result["exit_code"] == 0 and result["sorry_count"] == 0 else "failed",
@@ -1107,7 +1916,7 @@ def run_agent8_loop(
                                     f"{_max_lemma_att} attempt(s) — marking failed."
                                 )
 
-            elif action == "agent2_replan":
+            elif action == "agent9_replan":
                 console.print("  [Agent8→Agent9] Dispatching strategy re-planning via Agent9...")
                 from orchestrator.phase3a_agent9 import run_agent9_replan as _run_a9_replan
                 _new_plan = _run_a9_replan(
@@ -1128,11 +1937,9 @@ def run_agent8_loop(
                     )
                 else:
                     console.print(
-                        "  [Agent8→Agent9] Re-plan failed — falling back to Agent2."
+                        "  [Agent8→Agent9] Re-plan failed — keeping current plan and forcing investigation next tick."
                     )
-                    current_plan = _agent8_run_agent2_replan(
-                        agent2, target_file, current_errors, current_plan
-                    )
+                    _force_lookup_next_tick = True
                 # Run a fresh verify to capture current state.
                 # No Agent3 dispatch — Agent8 decides the next action on the next tick.
                 from orchestrator.tools import run_lean_verify as _rlv
@@ -1162,8 +1969,18 @@ def run_agent8_loop(
                     "action": action,
                     "target_theorem": decision.get("target_theorem"),
                     "error_signature": error_sig,
+                    "hypothesis": hypothesis,
+                    "evidence_hash": _evidence_hash(evidence),
+                    "error_subtype": _error_subtype,
+                    "route_effective": False,
+                    "api_shape_verified": False,
+                    "main_error_signature_changed": False,
                     "errors_before": _errors_before,
                     "errors_after": _errors_before,  # no dispatch happened
+                    "top_error_count_before": _count_error_lines(_errors_before),
+                    "top_error_count_after": _count_error_lines(_errors_before),
+                    "error_count_delta": 0,
+                    "action_cooldowns": dict(_action_cooldowns),
                     "sorry_delta": 0,
                     **outcome,
                 })
@@ -1179,12 +1996,50 @@ def run_agent8_loop(
 
         except Exception as exc:
             console.print(f"  [Agent8] Dispatch error: {exc}")
-            outcome = {"outcome": "dispatch_error", "error": str(exc)}
+            _is_net = _is_network_error(str(exc))
+            outcome = {
+                "outcome": "network_failure" if _is_net else "dispatch_error",
+                "error": str(exc),
+            }
 
         # Update running sorry count from outcome (keep previous on dispatch_error).
         _current_sorry_count = int(outcome.get("sorry_count", _current_sorry_count))
         _errors_after: str = current_errors[:300]
         _sorry_delta: int = _current_sorry_count - _sorry_before
+        _top_error_count_before = _count_error_lines(_errors_before)
+        _top_error_count_after = _count_error_lines(_errors_after)
+        _error_count_delta = _top_error_count_after - _top_error_count_before
+        _main_sig_changed = _signature_changed(_errors_before, _errors_after)
+        _route_effective: bool | None
+        if outcome.get("outcome") == "network_failure":
+            # Do not contaminate routing statistics with network transport failures.
+            _route_effective = None
+        else:
+            _route_effective = _top_error_count_after < _top_error_count_before
+        # api_shape_verified: True if Agent3 was dispatched for proof_api_mismatch
+        # and transactional report contains required proof of lookup/patch/verify.
+        _tx_valid = bool(isinstance(result, dict) and result.get("transaction_valid"))
+        _api_shape_verified = (
+            action == "agent3_tactical"
+            and _error_subtype == _SUBTYPE_PROOF_API_MISMATCH
+            and _tx_valid
+        )
+
+        _print_diagnostic_card(
+            tick=tick,
+            error_sig=error_sig,
+            hypothesis=hypothesis,
+            evidence=evidence,
+            chosen_action=action,
+            counterfactual=counterfactual,
+            outcome=outcome.get("outcome", "?"),
+            error_subtype=_error_subtype,
+            api_shape_verified=_api_shape_verified,
+            top_error_count_before=_top_error_count_before,
+            top_error_count_after=_top_error_count_after,
+            error_count_delta=_error_count_delta,
+            main_error_signature_changed=_main_sig_changed,
+        )
 
         # 6. Record decision
         decision_history.append({
@@ -1192,8 +2047,18 @@ def run_agent8_loop(
             "action": action,
             "target_theorem": decision.get("target_theorem"),
             "error_signature": error_sig,
+            "hypothesis": hypothesis,
+            "evidence_hash": _evidence_hash(evidence),
+            "error_subtype": _error_subtype,
+            "route_effective": _route_effective,
+            "api_shape_verified": _api_shape_verified,
+            "main_error_signature_changed": _main_sig_changed,
             "errors_before": _errors_before,
             "errors_after": _errors_after,
+            "top_error_count_before": _top_error_count_before,
+            "top_error_count_after": _top_error_count_after,
+            "error_count_delta": _error_count_delta,
+            "action_cooldowns": dict(_action_cooldowns),
             "sorry_delta": _sorry_delta,
             "lemma_status": dict(_pending_lemma_status),  # snapshot at this tick
             **outcome,
@@ -1232,6 +2097,13 @@ def run_agent8_loop(
             f"(exit={outcome.get('exit_code', '?')}, "
             f"sorry={outcome.get('sorry_count', '?')})"
         )
+        console.print(
+            "  [Agent8] Convergence: "
+            f"subtype={_error_subtype} action={action} "
+            f"delta={_error_count_delta:+d} "
+            f"signature_changed={_main_sig_changed} "
+            f"route_effective={_route_effective}"
+        )
 
     console.print(
         f"[yellow][Agent8] Exhausted {max_steps} steps without success."
@@ -1263,7 +2135,7 @@ def run_agent8_midcheck(
     Returns a dict with at least:
         {
             "action":          str,   # agent3_tactical | agent7_signature |
-                                      # agent7_then_agent6 | agent2_replan |
+                                      # agent7_then_agent6 | agent9_replan |
                                       # human_missing_assumption
             "reason":          str,
             "targeted_prompt": str,
@@ -1281,6 +2153,13 @@ def run_agent8_midcheck(
         f"for {algo_name}"
     )
 
+    # Classify error subtype for mid-check (same logic as main loop).
+    _mc_error_subtype = _classify_error_subtype(
+        current_errors, target_file,
+        decision_history=_decision_history,
+    )
+    console.print(f"  [Agent8 MidCheck] error_subtype={_mc_error_subtype}")
+
     # Build context — reuse existing helper, no plan-update banner needed here.
     ctx = _build_agent8_tick_context(
         target_file,
@@ -1292,6 +2171,7 @@ def run_agent8_midcheck(
         midcheck_mode=True,
         midcheck_turns_elapsed=turns_elapsed,
         baseline_errors=baseline_errors,
+        error_subtype=_mc_error_subtype,
     )
 
     # Call Agent8 (single round, reduced investigation budget for speed).
@@ -1299,7 +2179,7 @@ def run_agent8_midcheck(
     _inv_registry = ToolRegistry()
     _inv_registry.register_investigation_tools()
     _max_inv = min(RETRY_LIMITS.get("AGENT8_INVESTIGATION_TURNS", 3), 2)
-    raw_reply = agent8.call(ctx)
+    raw_reply = _safe_llm_call(agent8, ctx, idempotent=True, max_attempts=3)
 
     for _inv_round in range(_max_inv):
         try:
@@ -1322,22 +2202,29 @@ def run_agent8_midcheck(
             except Exception as _exc:
                 _tr = {"error": str(_exc)}
             _inv_results.append({"tool": _tn, "result": _tr})
-        raw_reply = agent8.call(
+        raw_reply = _safe_llm_call(
+            agent8,
             "Investigation results:\n"
             + json.dumps(_inv_results, indent=2, ensure_ascii=False)
-            + "\n\nNow output your final JSON decision."
+            + "\n\nNow output your final JSON decision.",
+            idempotent=True,
+            max_attempts=2,
         )
 
     # Parse with one retry attempt before falling back.
-    decision = _parse_agent8_decision(raw_reply)
+    decision, _ = _parse_agent8_decision(raw_reply)
     if decision is None:
         # One explicit retry.
-        raw_reply = agent8.call(
+        raw_reply = _safe_llm_call(
+            agent8,
             "Your response was not valid JSON. Return ONLY a single JSON "
             "object with the required fields: action, priority_level, reason, "
-            "targeted_prompt, error_signature. No markdown fences."
+            "targeted_prompt, error_signature, hypothesis, evidence, confidence, "
+            "counterfactual. No markdown fences.",
+            idempotent=True,
+            max_attempts=2,
         )
-        decision = _parse_agent8_decision(raw_reply)
+        decision, _ = _parse_agent8_decision(raw_reply)
 
     if decision is None:
         console.print(
@@ -1349,6 +2236,13 @@ def run_agent8_midcheck(
             "targeted_prompt": "",
             "error_signature": _extract_error_signature(current_errors),
             "priority_level": "P3",
+            "hypothesis": "Keep local tactical iteration when mid-check response is malformed.",
+            "evidence": [
+                {"source": "midcheck", "snippet": "decision parse failed"},
+                {"source": "lean_verify", "snippet": _extract_error_signature(current_errors)},
+            ],
+            "confidence": 0.2,
+            "counterfactual": "Do not escalate based on malformed routing response.",
         }
 
     # Anti-loop check using the shared history.
@@ -1357,9 +2251,58 @@ def run_agent8_midcheck(
         console.print(f"  [AntiLoop/MidCheck] {action} ← {_antiloop_reason}")
         decision["action"] = action
 
+    # Consistent compile-first subtype routing (mirrors main loop).
+    # derive from context if the decision carries the subtype
+    _mc_subtype = decision.get("error_subtype") or _mc_error_subtype
+    if _mc_subtype == _SUBTYPE_PROOF_API_MISMATCH and action == "agent7_signature":
+        console.print(
+            "  [Agent8 MidCheck subtype gate] proof_api_mismatch → "
+            "overriding agent7_signature to agent3_tactical"
+        )
+        decision["action"] = "agent3_tactical"
+        action = "agent3_tactical"
+    elif _mc_subtype == _SUBTYPE_DECLARATION_API_MISMATCH and action == "agent3_tactical":
+        # Only upgrade to agent7 if the error is clearly declaration-zone, not if mid-check
+        # simply defaulted to agent3 due to the soft-gate preference.
+        pass  # preserve soft-gate bias; agent3 can also fix declaration errors tactically
+
+    # Route downweight for mid-check (same window as main loop).
+    action, _mc_dw_reason = _check_route_downweight(action, _mc_subtype, _decision_history)
+    if _mc_dw_reason:
+        console.print(f"  [RouteDownweight/MidCheck] {action} ← {_mc_dw_reason}")
+        decision["action"] = action
+
+    # Hard gate + cooldown in mid-check, reusing latest cooldown snapshot.
+    _mc_cooldowns = {}
+    if _decision_history:
+        _mc_cooldowns = dict(_decision_history[-1].get("action_cooldowns", {}) or {})
+    action, _mc_hard_reason = _apply_hard_route_gate(
+        action,
+        _mc_subtype,
+        _decision_history,
+        _mc_cooldowns,
+        window=RETRY_LIMITS.get("AGENT8_ROUTE_NO_DELTA_WINDOW", 3),
+        cooldown_ticks=RETRY_LIMITS.get("AGENT8_ROUTE_COOLDOWN_TICKS", 2),
+    )
+    if _mc_hard_reason:
+        console.print(f"  [HardRouteGate/MidCheck] {action} ← {_mc_hard_reason}")
+        decision["action"] = action
+
+    _prev_errors = (
+        str(_decision_history[-1].get("errors_after", ""))
+        if _decision_history else current_errors
+    )
+    _mc_before = _count_error_lines(_prev_errors)
+    _mc_after = _count_error_lines(current_errors)
+    _mc_delta = _mc_after - _mc_before
+    _mc_sig_changed = _signature_changed(_prev_errors, current_errors)
+
     console.print(
         f"  [Agent8 MidCheck] Decision: {decision.get('action')} "
         f"(P={decision.get('priority_level', '?')}) "
+        f"| subtype={_mc_subtype} "
+        f"| delta={_mc_delta:+d} "
+        f"| signature_changed={_mc_sig_changed} "
         f"| reason=\"{decision.get('reason', '')[:80]}\""
     )
 

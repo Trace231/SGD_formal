@@ -440,3 +440,143 @@ def goals_to_patch_list(
         })
 
     return patches
+
+
+# ---------------------------------------------------------------------------
+# Staging mechanical repair helpers (rule-based, no LLM)
+# ---------------------------------------------------------------------------
+
+_LEAN_LINE_ERROR_RE = re.compile(
+    r"(?P<file>\S+):(?P<line>\d+):(?P<col>\d+): error: (?P<msg>[^\n]*)"
+)
+
+
+def _collect_file_errors(file_path: Path, error_text: str) -> list[tuple[int, str]]:
+    """Collect (line, message) errors for *file_path* from Lean error text."""
+    out: list[tuple[int, str]] = []
+    for m in _LEAN_LINE_ERROR_RE.finditer(error_text):
+        err_file = m.group("file")
+        if err_file != file_path.name and err_file != str(file_path):
+            continue
+        out.append((int(m.group("line")), m.group("msg").strip()))
+    return out
+
+
+def _forward_scan_tactic_line(lines: list[str], start_idx: int, window: int = 6) -> int:
+    """Find the nearest likely tactic line from *start_idx* (inclusive)."""
+    n = len(lines)
+    end = min(n, start_idx + window + 1)
+    for i in range(max(0, start_idx), end):
+        s = lines[i].strip()
+        if not s:
+            continue
+        if s.startswith(("simp", "exact", "convert", "rw", "linarith", "ring")):
+            return i
+    return max(0, min(start_idx, n - 1))
+
+
+def _forward_scan_for_prefix(
+    lines: list[str], start_idx: int, prefix: str, window: int = 8
+) -> int | None:
+    """Find first line in window whose stripped text starts with *prefix*."""
+    n = len(lines)
+    end = min(n, start_idx + window + 1)
+    for i in range(max(0, start_idx), end):
+        if lines[i].strip().startswith(prefix):
+            return i
+    return None
+
+
+def apply_lm_staging_patches(file_path: Path, patches: list[dict[str, str]]) -> int:
+    """Apply exact search/replace patch pairs to a Lean file.
+
+    Patch is applied only when ``search`` appears exactly once.
+    """
+    if not file_path.exists():
+        return 0
+    content = file_path.read_text(encoding="utf-8")
+    applied = 0
+    for p in patches:
+        search = str(p.get("search", ""))
+        replace = str(p.get("replace", ""))
+        if not search:
+            continue
+        occ = content.count(search)
+        if occ != 1:
+            continue
+        content = content.replace(search, replace, 1)
+        applied += 1
+    if applied > 0:
+        file_path.write_text(content, encoding="utf-8")
+    return applied
+
+
+def apply_staging_rules(file_path: Path, error_text: str) -> int:
+    """Apply deterministic tactical staging repairs.
+
+    Rules covered:
+    - overspecified ``simp [...]`` under ``simp made no progress`` -> ``simp``
+    - ``exact h`` type mismatch in funext-style goals -> ``exact funext h``
+    - redundant ``exact ...`` under ``No goals to be solved`` -> delete line
+    """
+    if not file_path.exists():
+        return 0
+    lines = file_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    errors = _collect_file_errors(file_path, error_text)
+    if not errors:
+        return 0
+
+    fixes = 0
+    for line_no, msg in errors:
+        if not lines:
+            break
+        idx = max(0, min(line_no - 1, len(lines) - 1))
+        target_idx = _forward_scan_tactic_line(lines, idx)
+        target = lines[target_idx]
+        target_strip = target.strip()
+        lower_msg = msg.lower()
+
+        # Rule 1: overspecified simp list that made no progress.
+        if "simp made no progress" in lower_msg or "unsolved goals" in lower_msg:
+            simp_idx = _forward_scan_for_prefix(lines, idx, "simp")
+            if simp_idx is not None:
+                target_idx = simp_idx
+                target = lines[target_idx]
+                target_strip = target.strip()
+            if "simp [" in target_strip:
+                indent = target[: len(target) - len(target.lstrip())]
+                lines[target_idx] = f"{indent}simp\n"
+                fixes += 1
+            continue
+
+        # Rule 2: type mismatch on exact h -> exact funext h
+        if "type mismatch" in lower_msg:
+            exact_idx = _forward_scan_for_prefix(lines, idx, "exact")
+            if exact_idx is not None:
+                target_idx = exact_idx
+                target = lines[target_idx]
+                target_strip = target.strip()
+        if "type mismatch" in lower_msg and target_strip.startswith("exact "):
+            m = re.match(r"\s*exact\s+([A-Za-z_][A-Za-z0-9_']*)\s*$", target_strip)
+            if m:
+                h = m.group(1)
+                indent = target[: len(target) - len(target.lstrip())]
+                lines[target_idx] = f"{indent}exact funext {h}\n"
+                fixes += 1
+            continue
+
+        # Rule 3: no goals left -> remove redundant exact line.
+        if "no goals to be solved" in lower_msg:
+            exact_idx = _forward_scan_for_prefix(lines, idx, "exact")
+            if exact_idx is not None:
+                target_idx = exact_idx
+                target = lines[target_idx]
+                target_strip = target.strip()
+        if "no goals to be solved" in lower_msg and target_strip.startswith("exact "):
+            del lines[target_idx]
+            fixes += 1
+            continue
+
+    if fixes > 0:
+        file_path.write_text("".join(lines), encoding="utf-8")
+    return fixes

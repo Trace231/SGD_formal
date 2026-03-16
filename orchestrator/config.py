@@ -27,6 +27,10 @@ AUDIT_FULL_PROMPTS_ENABLED = os.getenv("SGD_AUDIT_FULL_PROMPTS", "1") != "0"
 AUDIT_CODE_PATCH_ENABLED = os.getenv("SGD_AUDIT_CODE_PATCH", "1") != "0"
 AUDIT_FLUSH_INTERVAL_SECONDS = int(os.getenv("ORCHESTRATOR_AUDIT_FLUSH_INTERVAL", "60"))
 
+# Agent5 escalate(): default action when no human input. "a"=abort, "r"=replan, "f"=fix_assumptions.
+# Default "a" for unattended/Trae automation.
+AGENT5_DEFAULT_ACTION: str = os.getenv("AGENT5_DEFAULT_ACTION", "a")
+
 # ---------------------------------------------------------------------------
 # API keys (loaded from .env or environment)
 # ---------------------------------------------------------------------------
@@ -423,7 +427,7 @@ AGENT8_HUMAN_GATE_CONSECUTIVE_THRESHOLD: int = 3
 # tool turns, Agent8 makes a single routing decision.  If it returns
 # agent3_tactical the loop continues with the remaining budget unchanged
 # (soft gate — does NOT reset max_tool_turns).  Non-tactical routes
-# (agent7_*, agent2_replan, human_missing_assumption) are executed immediately.
+# (agent7_*, agent9_replan, human_missing_assumption) are executed immediately.
 # ---------------------------------------------------------------------------
 
 # Master switch.  Set env AGENT8_MIDCHECK_ENABLED=0 to disable entirely.

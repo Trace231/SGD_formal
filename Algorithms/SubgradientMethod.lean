@@ -64,21 +64,21 @@ structure SubgradientSetup
   hξ_ident : ∀ t, IdentDistrib (ξ t) (ξ 0) P P
   hgL : Measurable (Function.uncurry gradL)
 
+/-- Self-contained recursive process definition for subgradient method (Archetype B). -/
+noncomputable def SubgradientSetup.process (setup : SubgradientSetup E S Ω) : ℕ → Ω → E
+  | 0 => fun _ => setup.w₀
+  | t + 1 => fun ω => 
+      let w_t := process setup t ω
+      w_t - setup.η t • setup.gradL w_t (setup.ξ t ω)
+
 namespace SubgradientSetup
 
 variable (setup : SubgradientSetup E S Ω)
 
-/-- Self-contained recursive process definition for subgradient method (Archetype B). -/
-noncomputable def process : ℕ → Ω → E
-  | 0, _ => setup.w₀
-  | t + 1, ω => process t ω - setup.η t • setup.gradL (process t ω) (setup.ξ t ω)
-
-omit [SecondCountableTopology E] in
 @[simp]
-theorem process_zero : process 0 = fun _ => setup.w₀ := rfl
-omit [SecondCountableTopology E] in
+theorem process_zero : process setup 0 = fun _ => setup.w₀ := rfl
 @[simp]
-theorem process_succ (t : ℕ) : process (t + 1) = fun ω => process t ω - setup.η t • setup.gradL (process t ω) (setup.ξ t ω) := rfl
+theorem process_succ (t : ℕ) : process setup (t + 1) = fun ω => process setup t ω - setup.η t • setup.gradL (process setup t ω) (setup.ξ t ω) := rfl
 
 end SubgradientSetup
 
@@ -122,7 +122,7 @@ theorem subgradient_convergence_convex
         simp [setup.process_succ t]
         rw [norm_sq_sgd_step (setup.process t ω)
           (setup.gradL (setup.process t ω) (setup.ξ t ω)) wStar (setup.η t)]
-        rw [real_inner_comm]
+        rw [real_inner_comm (setup.gradL (setup.process t ω) (setup.ξ t ω)) (setup.process t ω - wStar)]
         <;> ring
     -- A2. Subgradient inequality → inner product lower bound
     have h_inner_lb : ∀ ω,
@@ -154,43 +154,79 @@ theorem subgradient_convergence_convex
     have h_int_sq_t := h_int_sq t
     have h_int_const : Integrable (fun _ : Ω => (f wStar : ℝ)) setup.P :=
       integrable_const _
+    have h_int_f_const : Integrable (fun ω => f (setup.process t ω) - f wStar) setup.P :=
+      h_int_f_t.sub h_int_const
+    have h_int_B : Integrable (fun ω => 2 * setup.η t * (f (setup.process t ω) - f wStar)) setup.P :=
+      h_int_f_const.const_mul (2 * setup.η t)
+    have h_int_term3 : Integrable (fun ω => (setup.η t) ^ 2 * ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2) setup.P :=
+      h_int_sq_t.const_mul ((setup.η t) ^ 2)
+    have h_int_rhs : Integrable (fun ω => ‖setup.process t ω - wStar‖ ^ 2
+        - 2 * setup.η t * (f (setup.process t ω) - f wStar)
+        + (setup.η t) ^ 2 * ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2) setup.P :=
+      (Integrable.sub h_int_curr h_int_B).add h_int_term3
     calc
       ∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P
         ≤ ∫ ω, (‖setup.process t ω - wStar‖ ^ 2
             - 2 * setup.η t * (f (setup.process t ω) - f wStar)
             + (setup.η t) ^ 2 * ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2) ∂setup.P :=
-          integral_mono h_int_next
-            (h_int_curr.add
-              ((h_int_f_t.const_mul (-2 * setup.η t)).add (h_int_const.const_mul (2 * setup.η t)))
-              |>.add (h_int_sq_t.const_mul ((setup.η t) ^ 2))) h_pointwise
+          by
+          apply integral_mono h_int_next h_int_rhs (fun ω => h_pointwise ω)
       _ = ∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P
           - 2 * setup.η t * (∫ ω, f (setup.process t ω) ∂setup.P - f wStar)
           + (setup.η t) ^ 2 * ∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P := by
-        have h_int_term2 : Integrable (fun ω => -2 * setup.η t * (f (setup.process t ω) - f wStar)) setup.P :=
-          (h_int_f_t.const_mul (-2 * setup.η t)).add (h_int_const.const_mul (2 * setup.η t))
+        have h_int_f_const : Integrable (fun ω => f (setup.process t ω) - f wStar) setup.P :=
+          h_int_f_t.sub h_int_const
+        have h_int_B : Integrable (fun ω => 2 * setup.η t * (f (setup.process t ω) - f wStar)) setup.P :=
+          h_int_f_const.const_mul (2 * setup.η t)
         have h_int_term3 : Integrable (fun ω => (setup.η t) ^ 2 * ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2) setup.P :=
           h_int_sq_t.const_mul ((setup.η t) ^ 2)
+        have h_int_AB : Integrable (fun ω => ‖setup.process t ω - wStar‖ ^ 2
+            - 2 * setup.η t * (f (setup.process t ω) - f wStar)) setup.P :=
+          Integrable.sub h_int_curr h_int_B
         have h_int_sum : Integrable (fun ω => ‖setup.process t ω - wStar‖ ^ 2
             - 2 * setup.η t * (f (setup.process t ω) - f wStar)
             + (setup.η t) ^ 2 * ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2) setup.P :=
-          h_int_curr.add h_int_term2 |>.add h_int_term3
-        rw [integral_add, integral_sub, integral_const_mul, integral_sub, integral_const_mul, integral_const_mul]
-        <;> simp [mul_assoc]
-        <;> try apply integrable_const
-        <;> try assumption
+          h_int_AB.add h_int_term3
+        calc
+          ∫ ω, (‖setup.process t ω - wStar‖ ^ 2
+              - 2 * setup.η t * (f (setup.process t ω) - f wStar)
+              + (setup.η t) ^ 2 * ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2) ∂setup.P
+            = ∫ ω, (‖setup.process t ω - wStar‖ ^ 2
+              - 2 * setup.η t * (f (setup.process t ω) - f wStar)) ∂setup.P
+              + ∫ ω, (setup.η t) ^ 2 * ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P := by
+              apply integral_add h_int_AB h_int_term3
+          _ = (∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P
+              - ∫ ω, 2 * setup.η t * (f (setup.process t ω) - f wStar) ∂setup.P)
+              + (setup.η t) ^ 2 * ∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P := by
+              rw [integral_sub h_int_curr h_int_B]
+              simp [integral_const_mul, h_int_sq_t]
+          _ = ∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P
+              - 2 * setup.η t * ∫ ω, (f (setup.process t ω) - f wStar) ∂setup.P
+              + (setup.η t) ^ 2 * ∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P := by
+              simp [integral_const_mul, h_int_f_const]
+          _ = ∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P
+              - 2 * setup.η t * (∫ ω, f (setup.process t ω) ∂setup.P - f wStar)
+              + (setup.η t) ^ 2 * ∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P := by
+              simp [integral_sub, h_int_f_t, h_int_const]
       _ ≤ ∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P
           - 2 * setup.η t * (∫ ω, f (setup.process t ω) ∂setup.P - f wStar)
           + (setup.η t) ^ 2 * G ^ 2 := by
         -- A5. Apply Pattern I glue lemma
         have h_var_bound : ∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P ≤ G ^ 2 := by
-          apply integral_mono (integrable_const _) h_int_sq_t
-          intro ω
-          have h1 : ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ≤ G := hbounded _ _
-          nlinarith [sq_nonneg (‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖), h1]
-        have hηt_pos : 0 < setup.η t := by rw [hη t]; exact hη_pos
+          have h_int_const : Integrable (fun _ : Ω => (G ^ 2 : ℝ)) setup.P := integrable_const _
+          calc
+            ∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P
+              ≤ ∫ ω, G ^ 2 ∂setup.P := integral_mono h_int_sq_t h_int_const
+                (fun ω => pow_le_pow_left₀ (norm_nonneg _) (hbounded (setup.process t ω) (setup.ξ t ω)) 2)
+            _ = G ^ 2 := by simp [integral_const, probReal_univ]
+        have hηt_eq : setup.η t = η := hη t
+        have hηt_pos : 0 < setup.η t := by rw [hηt_eq]; exact hη_pos
+        have : (setup.η t) ^ 2 * ∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P ≤ (setup.η t) ^ 2 * G ^ 2 := by
+          exact mul_le_mul_of_nonneg_left h_var_bound (sq_nonneg _)
+        have : -2 * setup.η t * (∫ ω, f (setup.process t ω) ∂setup.P - f wStar) = -2 * setup.η t * (∫ ω, f (setup.process t ω) ∂setup.P - f wStar) := rfl
+        have hηt_eq : setup.η t = η := hη t
+        rw [hηt_eq]
         nlinarith [h_var_bound]
-    rw [hη t] at this
-    exact this
   -- STEP B: Sum + telescope
   have hsum : 2 * η * ∑ t ∈ Finset.range T,
       (∫ ω, f (setup.process t ω) ∂setup.P - f wStar) ≤
@@ -200,8 +236,7 @@ theorem subgradient_convergence_convex
         (∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P -
           ∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P) =
         ∫ ω, ‖setup.process T ω - wStar‖ ^ 2 ∂setup.P - ∫ ω, ‖setup.process 0 ω - wStar‖ ^ 2 ∂setup.P := by
-      rw [Finset.sum_range_sub]
-      <;> simp
+      simp [Finset.sum_range_succ', Finset.sum_range_zero]
     have h_tel_bound : ∑ t ∈ Finset.range T,
         (∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P -
           ∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P) ≤
@@ -211,9 +246,9 @@ theorem subgradient_convergence_convex
       have hst := hstep t (Finset.mem_range.mp ht)
       linarith
     have h_nonneg : 0 ≤ ∫ ω, ‖setup.process T ω - wStar‖ ^ 2 ∂setup.P :=
-      integral_nonneg (h_int_norm_sq T) (fun _ => norm_sq_nonneg _ _)
+      integral_nonneg (fun _ => sq_nonneg _)
     have h_w0 : ∫ ω, ‖setup.process 0 ω - wStar‖ ^ 2 ∂setup.P = ‖setup.w₀ - wStar‖ ^ 2 := by
-      rw [SubgradientSetup.process_zero setup]
+      rw [setup.process_zero]
       simp
     calc
       2 * η * ∑ t ∈ Finset.range T, (∫ ω, f (setup.process t ω) ∂setup.P - f wStar)
@@ -241,8 +276,7 @@ theorem subgradient_convergence_convex
         field_simp [hη_pos.ne', hT_pos.ne']
         <;> ring
       _ ≤ (1 / (T : ℝ)) * (1 / (2 * η)) * (‖setup.w₀ - wStar‖ ^ 2 + (T : ℝ) * (η ^ 2 * G ^ 2)) := by
-        gcongr
-        exact hsum
+        apply mul_le_mul <;> try norm_num <;> try linarith [hη_pos] <;> exact hsum
       _ = ‖setup.w₀ - wStar‖ ^ 2 / (2 * η * T) + η * G ^ 2 / 2 := by
         field_simp [hη_pos.ne', hT_pos.ne']
         <;> ring
