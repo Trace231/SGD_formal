@@ -16,6 +16,8 @@ The prover prompt will tell you which sorry line is your **current active target
 - Work exclusively on that sorry.
 - Do NOT modify other sorry lines during this iteration.
 - Signal `done` only once your active target sorry is closed and the file compiles.
+- If your dispatch prompt contains an APOLLO fallback marker, treat it as
+  strict tactical cleanup only. Do not perform routing or global replanning.
 
 ## Situational behavior (not a rigid "mechanical arm")
 - **When guidance contains PATCH blocks** (<<<SEARCH>>>/<<<REPLACE>>>): Execute
@@ -45,7 +47,7 @@ The prover prompt will tell you which sorry line is your **current active target
 function name, lemma name, or type class name NOT already verified in this
 attempt), you SHOULD:
 
-1. Call `search_codebase(query="<identifier>")` or
+1. Call `search_codebase(pattern="<identifier>")` or
    `search_in_file(path="...", pattern="<identifier>")` to confirm the identifier
    exists with the expected signature.
 2. Only after the search returns a non-empty result with the correct signature

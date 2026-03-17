@@ -14,7 +14,13 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.config import (
+    APOLLO_FALLBACK_TO_LAKE_ON_FAILURE,
+    APOLLO_LAKE_PATH,
+    APOLLO_PROJECT_PATH,
+    APOLLO_REPL_WORKSPACE,
+    APOLLO_VERIFY_TIMEOUT,
     LEAN_BUILD_TIMEOUT,
+    LEAN_VERIFY_BACKEND,
     LEAN_VERIFY_PATHS,
     PROJECT_ROOT,
     READ_ONLY_PATHS,
@@ -760,7 +766,13 @@ def get_lean_goal(
 
 
 def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
-    """Run Lean verification and return a JSON-serializable result."""
+    """Run Lean verification and return a JSON-serializable result.
+
+    Guardrail:
+    - Default backend is ``lake`` (stable, existing behavior).
+    - ``apollo`` backend is opt-in via config/env and is adapter-normalized
+      to preserve the historical output schema consumed by Agent3/8.
+    """
     resolved = _resolve_allowed_path(file_path, _LEAN_VERIFY_ALLOWLIST)
     source_path = resolved
 
@@ -779,6 +791,45 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
         }
 
     rel = str(resolved.relative_to(PROJECT_ROOT))
+    _apollo_degrade_warning = ""
+
+    # Backend gate: keep lake as the default path to preserve current semantics.
+    backend = str(LEAN_VERIFY_BACKEND).strip().lower()
+    if backend == "apollo":
+        from orchestrator.apollo_integration import (
+            normalize_apollo_result,
+            verify_with_apollo,
+        )
+
+        source_text = resolved.read_text(encoding="utf-8")
+        try:
+            raw = verify_with_apollo(
+                code=source_text,
+                timeout=APOLLO_VERIFY_TIMEOUT,
+                apollo_project_path=APOLLO_PROJECT_PATH,
+                repl_workspace=APOLLO_REPL_WORKSPACE,
+                lake_path=APOLLO_LAKE_PATH,
+            )
+        except Exception as exc:
+            if not APOLLO_FALLBACK_TO_LAKE_ON_FAILURE:
+                return {
+                    "target": rel,
+                    "success": False,
+                    "exit_code": 1,
+                    "sorry_count": count_sorrys(rel),
+                    "sorry_declarations": 0,
+                    "blocked_sorry_count": 0,
+                    "error_count": 1,
+                    "errors": [f"APOLLO backend failure: {exc}"],
+                    "warnings": [],
+                }
+            _apollo_degrade_warning = f"APOLLO backend failure; degraded to lake: {exc}"
+        else:
+            return normalize_apollo_result(
+                target_rel=rel,
+                source_text=source_text,
+                apollo_result=raw,
+            )
 
     # Invalidate Lake cache for this target so errors are re-emitted with
     # file:line:col locations instead of being silently replayed.
@@ -839,6 +890,8 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
         )
 
     blocked_sorry_count = max(0, sorry_count - compiler_sorry_count)
+    if _apollo_degrade_warning:
+        warning_lines = [_apollo_degrade_warning] + warning_lines
     return {
         "target": rel,
         "success": build_returncode == 0 and sorry_count == 0,

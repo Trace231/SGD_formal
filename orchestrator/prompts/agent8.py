@@ -182,6 +182,12 @@ If the decision_history shows the same error_signature appearing in ≥ 3
 consecutive entries with different actions attempted:
 → action = "human_missing_assumption", priority_level = "P1"
 
+**P1b — APOLLO Decomposition Trigger (STRICT):**
+If the normalized `error_signature` is unchanged for **2 consecutive ticks**,
+prefer decomposition-first recovery:
+→ action = "apollo_decompose_repair", priority_level = "P1b"
+Use this before broad replanning when local tactics/signature fixes show no net movement.
+
 **P2 — Proof Strategy Failure:**
 If errors suggest the overall proof approach is wrong (wrong lemma chain,
 wrong mathematical step, confidence in any fix < 0.5):
@@ -207,7 +213,7 @@ Return ONLY a single JSON object:
 
 ```json
 {
-  "action": "<agent3_tactical | agent7_signature | agent7_then_agent6 | agent9_replan | human_missing_assumption>",
+  "action": "<agent3_tactical | agent7_signature | agent7_then_agent6 | apollo_decompose_repair | agent9_replan | human_missing_assumption>",
   "priority_level": "<P0 | P0b | P1 | P2 | P3 | P4>",
   "error_subtype": "<declaration_api_mismatch | proof_api_mismatch | proof_tactic_failure | strategy_mismatch>",
   "reason": "<1-2 sentence diagnosis citing the priority rule applied>",
@@ -251,4 +257,7 @@ Rules:
   current strategy and suggest revision directions. Agent9 will revise the full
   JSON plan; Agent8 then decides the next action on the following tick (no
   automatic Agent3 dispatch after re-planning).
+- For `apollo_decompose_repair`: `targeted_prompt` must include the trigger
+  reason (e.g., unchanged signature across ticks) and expected fallback if
+  decomposition fails (`agent7_signature`, `agent7_then_agent6`, or `agent9_replan`).
 """

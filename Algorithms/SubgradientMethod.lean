@@ -209,8 +209,8 @@ theorem subgradient_convergence_convex
               + (setup.η t) ^ 2 * ∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P := by
               simp [integral_sub, h_int_f_t, h_int_const]
       _ ≤ ∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P
-          - 2 * setup.η t * (∫ ω, f (setup.process t ω) ∂setup.P - f wStar)
-          + (setup.η t) ^ 2 * G ^ 2 := by
+          - 2 * η * (∫ ω, f (setup.process t ω) ∂setup.P - f wStar)
+          + η ^ 2 * G ^ 2 := by
         -- A5. Apply Pattern I glue lemma
         have h_var_bound : ∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P ≤ G ^ 2 := by
           have h_int_const : Integrable (fun _ : Ω => (G ^ 2 : ℝ)) setup.P := integrable_const _
@@ -223,9 +223,7 @@ theorem subgradient_convergence_convex
         have hηt_pos : 0 < setup.η t := by rw [hηt_eq]; exact hη_pos
         have : (setup.η t) ^ 2 * ∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P ≤ (setup.η t) ^ 2 * G ^ 2 := by
           exact mul_le_mul_of_nonneg_left h_var_bound (sq_nonneg _)
-        have : -2 * setup.η t * (∫ ω, f (setup.process t ω) ∂setup.P - f wStar) = -2 * setup.η t * (∫ ω, f (setup.process t ω) ∂setup.P - f wStar) := rfl
-        have hηt_eq : setup.η t = η := hη t
-        rw [hηt_eq]
+        simp [hηt_eq]
         nlinarith [h_var_bound]
   -- STEP B: Sum + telescope
   have hsum : 2 * η * ∑ t ∈ Finset.range T,
@@ -236,7 +234,18 @@ theorem subgradient_convergence_convex
         (∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P -
           ∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P) =
         ∫ ω, ‖setup.process T ω - wStar‖ ^ 2 ∂setup.P - ∫ ω, ‖setup.process 0 ω - wStar‖ ^ 2 ∂setup.P := by
-      simp [Finset.sum_range_succ', Finset.sum_range_zero]
+      classical
+      have h_tel' : ∀ n : ℕ, ∑ t ∈ Finset.range n,
+          (∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P -
+            ∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P) =
+          ∫ ω, ‖setup.process n ω - wStar‖ ^ 2 ∂setup.P - ∫ ω, ‖setup.process 0 ω - wStar‖ ^ 2 ∂setup.P := by
+        intro n
+        induction n with
+        | zero => simp
+        | succ n' ih =>
+          rw [Finset.sum_range_succ, ih]
+          ring
+      exact h_tel' T
     have h_tel_bound : ∑ t ∈ Finset.range T,
         (∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P -
           ∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P) ≤
@@ -264,7 +273,8 @@ theorem subgradient_convergence_convex
       _ = (T : ℝ) * (η ^ 2 * G ^ 2) -
           (∫ ω, ‖setup.process T ω - wStar‖ ^ 2 ∂setup.P - ∫ ω, ‖setup.process 0 ω - wStar‖ ^ 2 ∂setup.P) := by
         rw [Finset.sum_sub_distrib, Finset.sum_const, Finset.card_range]
-        <;> simp [h_tel]
+        rw [h_tel]
+        ring
       _ ≤ (T : ℝ) * (η ^ 2 * G ^ 2) + ‖setup.w₀ - wStar‖ ^ 2 := by
         rw [h_w0]
         linarith [h_nonneg]
@@ -276,7 +286,14 @@ theorem subgradient_convergence_convex
         field_simp [hη_pos.ne', hT_pos.ne']
         <;> ring
       _ ≤ (1 / (T : ℝ)) * (1 / (2 * η)) * (‖setup.w₀ - wStar‖ ^ 2 + (T : ℝ) * (η ^ 2 * G ^ 2)) := by
-        apply mul_le_mul <;> try norm_num <;> try linarith [hη_pos] <;> exact hsum
+        have hcoeff_pos : 0 < (1 / (T : ℝ)) * (1 / (2 * η)) := by
+          apply mul_pos
+          · exact one_div_pos.mpr hT_pos
+          · apply one_div_pos.mpr
+            linarith [hη_pos]
+        have : (2 * η * ∑ t ∈ Finset.range T, (∫ ω, f (setup.process t ω) ∂setup.P - f wStar)) ≤
+            ‖setup.w₀ - wStar‖ ^ 2 + (T : ℝ) * (η ^ 2 * G ^ 2) := hsum
+        nlinarith
       _ = ‖setup.w₀ - wStar‖ ^ 2 / (2 * η * T) + η * G ^ 2 / 2 := by
         field_simp [hη_pos.ne', hT_pos.ne']
         <;> ring

@@ -33,6 +33,8 @@ from orchestrator.contracts import (
     AGENT8_VALID_ERROR_SUBTYPES,
 )
 from orchestrator.config import (
+    AGENT8_APOLLO_DECOMPOSE_ENABLED,
+    AGENT8_AGENT3_SAMPLING_ENABLED,
     AGENT8_DEBUG,
     AGENT8_FILE_WINDOW_RADIUS,
     AGENT8_HUMAN_GATE_CONSECUTIVE_THRESHOLD,
@@ -399,7 +401,11 @@ def _check_route_downweight(
         _fallback = {
             _SUBTYPE_PROOF_API_MISMATCH: "agent7_signature",
             _SUBTYPE_DECLARATION_API_MISMATCH: "agent3_tactical",
-            _SUBTYPE_PROOF_TACTIC_FAILURE: "agent9_replan",
+            _SUBTYPE_PROOF_TACTIC_FAILURE: (
+                "apollo_decompose_repair"
+                if AGENT8_APOLLO_DECOMPOSE_ENABLED
+                else "agent9_replan"
+            ),
             _SUBTYPE_STRATEGY_MISMATCH: "human_missing_assumption",
         }.get(error_subtype, "agent9_replan")
         if _fallback == proposed_action:
@@ -441,6 +447,148 @@ def _apply_hard_route_gate(
         return fallback, "hard_gate " + reason
 
     return proposed_action, ""
+
+
+def _route_streak_len(decision_history: list[dict], action: str) -> int:
+    """Return contiguous same-action streak length from history tail."""
+    streak = 0
+    for entry in reversed(decision_history):
+        if entry.get("action") == action:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def _is_no_progress_entry(entry: dict) -> bool:
+    """No-progress rule: delta>=0 and main signature unchanged."""
+    try:
+        delta = int(entry.get("error_count_delta", 0))
+    except Exception:
+        delta = 0
+    sig_changed = bool(entry.get("main_error_signature_changed", False))
+    return delta >= 0 and not sig_changed
+
+
+def _apply_delta_force_fallback(
+    proposed_action: str,
+    decision_history: list[dict],
+    action_cooldowns: dict[str, int],
+    *,
+    window: int = 2,
+    cooldown_ticks: int = 2,
+) -> tuple[str, str]:
+    """Force fallback chain under explicit two-tick no-progress rule.
+
+    Rule:
+    - agent3_tactical no-progress(window) -> agent7_signature
+    - agent7_signature no-progress(window) -> agent9_replan
+    """
+    if proposed_action not in ("agent3_tactical", "agent7_signature"):
+        return proposed_action, ""
+    same_action_recent = [
+        e for e in reversed(decision_history) if e.get("action") == proposed_action
+    ]
+    if len(same_action_recent) < max(1, window):
+        return proposed_action, ""
+    check_slice = same_action_recent[:window]
+    if not all(_is_no_progress_entry(e) for e in check_slice):
+        return proposed_action, ""
+
+    forced = "agent7_signature" if proposed_action == "agent3_tactical" else "agent9_replan"
+    action_cooldowns[proposed_action] = max(1, int(cooldown_ticks))
+    return (
+        forced,
+        (
+            f"delta_force_fallback: action='{proposed_action}' had "
+            f"{window} consecutive no-progress ticks "
+            "(delta>=0 and normalized-signature unchanged)"
+        ),
+    )
+
+
+def _apollo_fallback_from_failure_kind(failure_kind: str) -> str:
+    """Map APOLLO failure classification to deterministic next route."""
+    return {
+        "interface_failure": "agent7_signature",
+        "instance_failure": "agent7_signature",
+        "glue_failure": "agent7_then_agent6",
+        "strategy_failure": "agent9_replan",
+    }.get(failure_kind, "agent9_replan")
+
+
+def _should_prefer_apollo_decompose(
+    proposed_action: str,
+    error_signature: str,
+    decision_history: list[dict],
+    blocked_sorry_count: int,
+    action_cooldowns: dict[str, int],
+) -> tuple[bool, str]:
+    """Policy gate for when Agent8 should prefer APOLLO decomposition route.
+
+    Primary trigger (prompt-aligned): if error signature is unchanged across the
+    last N ticks (default N=2), prefer ``apollo_decompose_repair``.
+    """
+    if not AGENT8_APOLLO_DECOMPOSE_ENABLED:
+        return False, ""
+    if proposed_action in ("human_missing_assumption", "apollo_decompose_repair"):
+        return False, ""
+    if int(action_cooldowns.get("apollo_decompose_repair", 0)) > 0:
+        return False, ""
+
+    sig_window = max(1, RETRY_LIMITS.get("AGENT8_APOLLO_SAME_ERROR_WINDOW", 2))
+    no_progress_window = max(1, RETRY_LIMITS.get("AGENT8_APOLLO_NO_PROGRESS_WINDOW", 2))
+    blocked_threshold = max(1, RETRY_LIMITS.get("AGENT8_APOLLO_BLOCKED_SORRY_THRESHOLD", 1))
+
+    reasons: list[str] = []
+    normalized_sig = _normalize_error_signature(error_signature)
+    _recent = [e for e in decision_history if e.get("outcome") != "network_failure"]
+    if normalized_sig and len(_recent) >= sig_window:
+        _tail = _recent[-sig_window:]
+        if all(
+            _normalize_error_signature(str(e.get("error_signature", ""))) == normalized_sig
+            for e in _tail
+        ):
+            reasons.append(f"error_signature unchanged for {sig_window} consecutive ticks")
+
+    if blocked_sorry_count >= blocked_threshold:
+        reasons.append(
+            f"blocked_sorry_count={blocked_sorry_count} >= threshold({blocked_threshold})"
+        )
+
+    if len(_recent) >= no_progress_window and all(
+        _is_no_progress_entry(e) for e in _recent[-no_progress_window:]
+    ):
+        reasons.append(f"no-progress persisted for {no_progress_window} ticks")
+
+    if reasons:
+        return True, "; ".join(reasons)
+    return False, ""
+
+
+_DECL_SIGNATURE_RE = re.compile(
+    r"^\s*(?:theorem|lemma|noncomputable\s+def|def)\s+\w+[^\n]*$",
+    re.MULTILINE,
+)
+
+
+def _extract_decl_signatures(text: str) -> list[str]:
+    """Extract normalized declaration header lines for signature stability checks."""
+    return [m.group(0).strip() for m in _DECL_SIGNATURE_RE.finditer(text or "")]
+
+
+def _estimate_patch_line_span(old_str: str, new_str: str) -> int:
+    """Estimate patch line span from old/new replacement blocks."""
+    old_n = len((old_str or "").splitlines()) or 1
+    new_n = len((new_str or "").splitlines()) or 1
+    return max(old_n, new_n)
+
+
+def _patch_touches_decl_signature(old_str: str, new_str: str) -> bool:
+    """Detect whether patch blocks contain declaration signature edits."""
+    old_has = bool(_DECL_SIGNATURE_RE.search(old_str or ""))
+    new_has = bool(_DECL_SIGNATURE_RE.search(new_str or ""))
+    return old_has or new_has
 
 
 # ---------------------------------------------------------------------------
@@ -586,7 +734,8 @@ def _build_agent8_tick_context(
             "its remaining budget unchanged.\n"
             "  • If the errors indicate a **structural** problem (unknown identifier / "
             "interface mismatch / missing glue lemma / wrong strategy), escalate to the "
-            "appropriate agent (agent7_signature, agent7_then_agent6, or agent9_replan).\n"
+            "appropriate agent (agent7_signature, agent7_then_agent6, "
+            "apollo_decompose_repair, or agent9_replan).\n"
             "Avoid agent9_replan unless truly necessary — prefer agent7 or agent3_tactical.\n\n"
         )
 
@@ -828,7 +977,17 @@ def _build_agent9_theorem_context(
 # Dispatch: Agent3 tactical fix
 # ---------------------------------------------------------------------------
 
-def _agent8_run_agent3(
+def _agent8_result_score(result: dict[str, Any]) -> tuple[int, int, int, int]:
+    """Lower score is better for APOLLO-aligned candidate selection."""
+    exit_code = int(result.get("exit_code", 1))
+    sorry_count = int(result.get("sorry_count", 10**6))
+    err_text = str(result.get("errors", "") or "")
+    err_count = len([ln for ln in err_text.splitlines() if ln.strip()])
+    is_clean = int(not (exit_code == 0 and sorry_count == 0))
+    return (is_clean, max(0, sorry_count), err_count, int(exit_code != 0))
+
+
+def _agent8_run_agent3_single(
     target_file: str,
     agent2_plan: str,
     targeted_prompt: str,
@@ -837,6 +996,8 @@ def _agent8_run_agent3(
     max_turns: int | None = None,
     compile_first_mode: bool = False,
     transactional_mode: bool = False,
+    candidate_index: int = 1,
+    candidate_total: int = 1,
 ) -> dict:
     """Run a fresh Agent3 with a targeted prompt and simplified tool loop.
 
@@ -877,6 +1038,15 @@ def _agent8_run_agent3(
             "If any field is missing, done will be rejected."
         )
 
+    _sampling_hint = ""
+    if candidate_total > 1:
+        _sampling_hint = (
+            "\n\nSAMPLING CANDIDATE MODE:\n"
+            f"- You are candidate {candidate_index}/{candidate_total}.\n"
+            "- Use a distinct tactical angle from generic simp-first attempts.\n"
+            "- Keep edits minimal and verifiable.\n"
+            "- Prioritize compile evidence over stylistic changes."
+        )
     initial_msg = (
         f"[AGENT8 DISPATCH — Tactical Fix]\n\n"
         f"{targeted_prompt}\n\n"
@@ -885,6 +1055,7 @@ def _agent8_run_agent3(
         f"Target file: {target_file}\n"
         f"{scope_instruction}\n\n"
         f"{transactional_instruction}\n\n"
+        f"{_sampling_hint}\n\n"
         "Fix the specified error. When done, signal tool=done. "
         "Output ONE JSON action per response: {{thought, tool, arguments}}."
     )
@@ -894,6 +1065,8 @@ def _agent8_run_agent3(
     _verify_snapshots: list[dict] = []
     _last_observed_signature = ""
     _last_callsite = ""
+    _max_patch_lines = int(RETRY_LIMITS.get("AGENT8_MAX_PATCH_LINES", 60))
+    _decl_snapshot = _extract_decl_signatures(load_file(target_file))
 
     for turn in range(max_turns):
         try:
@@ -927,6 +1100,14 @@ def _agent8_run_agent3(
                         "done rejected — transactional report missing fields: "
                         f"{_missing}. Please return tool=done with "
                         "arguments.transaction_report including all required fields."
+                    )
+                    continue
+                _decl_now = _extract_decl_signatures(load_file(target_file))
+                if _decl_now != _decl_snapshot:
+                    raw_reply = agent3.call(
+                        "done rejected — declaration type signatures changed in transactional "
+                        "mode. Revert declaration header edits and keep proof-body/API-shape "
+                        "fixes only."
                     )
                     continue
             verify = registry.call("run_lean_verify", target_file)
@@ -997,6 +1178,22 @@ def _agent8_run_agent3(
                     "Revert to minimal patching and verify before further edits."
                 )
                 continue
+            _old = str(args.get("old_str", "") or "")
+            _new = str(args.get("new_str", "") or "")
+            _patch_span = _estimate_patch_line_span(_old, _new)
+            if _patch_span > _max_patch_lines:
+                raw_reply = agent3.call(
+                    "Patch rejected — changed line span "
+                    f"({_patch_span}) exceeds AGENT8_MAX_PATCH_LINES={_max_patch_lines}. "
+                    "Submit a smaller patch."
+                )
+                continue
+            if transactional_mode and _patch_touches_decl_signature(_old, _new):
+                raw_reply = agent3.call(
+                    "Patch rejected — declaration signature edits are not allowed in "
+                    "transactional API-shape mode."
+                )
+                continue
         # Normalize path/file_path
         if "path" in args and "file_path" not in args:
             for k in ("get_lean_goal", "check_lean_have", "run_lean_verify"):
@@ -1050,6 +1247,90 @@ def _agent8_run_agent3(
         "target_callsite": _last_callsite,
         "minimal_patch": f"edit_calls={_edit_calls}",
         "verify_result": _verify_snapshots[-1] if _verify_snapshots else {},
+    }
+
+
+def _agent8_run_agent3(
+    target_file: str,
+    agent2_plan: str,
+    targeted_prompt: str,
+    allowed_edit_lines: str | None,
+    *,
+    max_turns: int | None = None,
+    compile_first_mode: bool = False,
+    transactional_mode: bool = False,
+) -> dict:
+    """Run Agent3 with optional APOLLO-aligned bounded sampling/search."""
+    max_turns = max_turns or RETRY_LIMITS.get("AGENT8_AGENT3_MAX_TURNS", 15)
+
+    # Guardrail: keep sampling off by default; keep transactional flow single-path.
+    sampling_enabled = AGENT8_AGENT3_SAMPLING_ENABLED and not transactional_mode
+    candidate_cap = RETRY_LIMITS.get("AGENT8_AGENT3_SAMPLE_MAX_CANDIDATES", 3)
+    candidate_count = min(
+        max(1, RETRY_LIMITS.get("AGENT8_AGENT3_SAMPLE_CANDIDATES", 3)),
+        max(1, candidate_cap),
+    )
+    per_candidate_turns = min(
+        max_turns,
+        max(1, RETRY_LIMITS.get("AGENT8_AGENT3_SAMPLE_MAX_TURNS_PER_CANDIDATE", 8)),
+    )
+    degrade_stop_after = max(
+        1, RETRY_LIMITS.get("AGENT8_AGENT3_SAMPLE_DEGRADE_TICKS", 2)
+    )
+
+    if not sampling_enabled or candidate_count <= 1:
+        return _agent8_run_agent3_single(
+            target_file,
+            agent2_plan,
+            targeted_prompt,
+            allowed_edit_lines,
+            max_turns=max_turns,
+            compile_first_mode=compile_first_mode,
+            transactional_mode=transactional_mode,
+            candidate_index=1,
+            candidate_total=1,
+        )
+
+    best_result: dict[str, Any] | None = None
+    best_score: tuple[int, int, int, int] | None = None
+    non_improving = 0
+    for idx in range(candidate_count):
+        candidate_result = _agent8_run_agent3_single(
+            target_file,
+            agent2_plan,
+            targeted_prompt,
+            allowed_edit_lines,
+            max_turns=per_candidate_turns,
+            compile_first_mode=compile_first_mode,
+            transactional_mode=transactional_mode,
+            candidate_index=idx + 1,
+            candidate_total=candidate_count,
+        )
+        score = _agent8_result_score(candidate_result)
+
+        if best_result is None or best_score is None or score < best_score:
+            best_result = candidate_result
+            best_score = score
+            non_improving = 0
+        else:
+            non_improving += 1
+
+        # Early stop exactly mirrors APOLLO-style bounded search behavior:
+        # return immediately when a clean candidate is found.
+        if int(candidate_result.get("exit_code", 1)) == 0 and int(
+            candidate_result.get("sorry_count", -1)
+        ) == 0:
+            return candidate_result
+
+        # Safeguard: if additional sampled candidates are not improving,
+        # cut back to avoid wasted turns/tokens.
+        if non_improving >= degrade_stop_after:
+            break
+
+    return best_result or {
+        "exit_code": 1,
+        "sorry_count": -1,
+        "errors": "Agent3 sampling failed to produce any candidate result.",
     }
 
 
@@ -1250,6 +1531,8 @@ def _print_diagnostic_card(
     top_error_count_after: int | None = None,
     error_count_delta: int | None = None,
     main_error_signature_changed: bool | None = None,
+    route_ticks_in_row: int | None = None,
+    route_status: str = "Active",
 ) -> None:
     """Emit a structured per-tick diagnostic card."""
     ev_lines = [
@@ -1257,25 +1540,27 @@ def _print_diagnostic_card(
         for idx, e in enumerate(evidence)
     ]
     subtype_line = f"ErrorSubtype: {error_subtype}  (api_shape_verified={api_shape_verified})\n" if error_subtype else ""
-    delta_line = ""
-    if top_error_count_before is not None and top_error_count_after is not None:
-        _delta = (
-            error_count_delta
-            if error_count_delta is not None
-            else (top_error_count_after - top_error_count_before)
-        )
-        _sigchg = (
-            main_error_signature_changed
-            if main_error_signature_changed is not None
-            else False
-        )
-        delta_line = (
-            f"ErrorCount: {top_error_count_before} -> {top_error_count_after} "
-            f"(delta={_delta:+d}) | main_signature_changed={_sigchg}\n"
-        )
+    _before = "?" if top_error_count_before is None else str(top_error_count_before)
+    _after = "?" if top_error_count_after is None else str(top_error_count_after)
+    if error_count_delta is None and top_error_count_before is not None and top_error_count_after is not None:
+        _delta_num = top_error_count_after - top_error_count_before
+    else:
+        _delta_num = error_count_delta
+    _delta = "?" if _delta_num is None else f"{_delta_num:+d}"
+    _sigchg = bool(main_error_signature_changed) if main_error_signature_changed is not None else False
+    _sig_label = "Yes" if _sigchg else "No"
+    _route_ticks = route_ticks_in_row if route_ticks_in_row is not None else 1
+    trend_line = f"[Trend] Before: {_before} | After: {_after} | Delta: {_delta}\n"
+    sig_line = f"[Signature] Changed: {_sig_label} (Normalized)\n"
+    route_line = (
+        f"[Route] Current: {chosen_action} | Ticks in Route: {_route_ticks} | "
+        f"Status: {route_status}\n"
+    )
     body = (
         f"{subtype_line}"
-        f"{delta_line}"
+        f"{trend_line}"
+        f"{sig_line}"
+        f"{route_line}"
         f"ErrorSig: {error_sig[:120]}\n"
         f"Hypothesis: {hypothesis[:220]}\n"
         f"Evidence:\n" + ("\n".join(ev_lines) if ev_lines else "  (none)") + "\n"
@@ -1501,6 +1786,7 @@ def run_agent8_loop(
         _fresh_exit = int(_fresh.get("exit_code", 1))
         _fresh_errors = str(_fresh.get("errors", ""))
         _fresh_sorry = int(_fresh.get("sorry_count", _current_sorry_count))
+        _fresh_blocked = int(_fresh.get("blocked_sorry_count", 0))
         _compile_first_mode = (_fresh_exit != 0 and _fresh_sorry == 0)
         # Override stale errors only when the fresh build produced hard errors,
         # or when current_errors is empty (nothing meaningful to preserve).
@@ -1683,6 +1969,12 @@ def run_agent8_loop(
         hypothesis = str(decision.get("hypothesis", "")).strip()
         evidence = _normalize_evidence(decision.get("evidence"))
         counterfactual = str(decision.get("counterfactual", "")).strip()
+        _route_ticks_pre = _route_streak_len(decision_history, action) + 1
+        _route_status_pre = (
+            "Cooldown"
+            if int(_action_cooldowns.get(action, 0)) > 0
+            else "Active"
+        )
         if _force_lookup_next_tick and not evidence:
             evidence = [{"source": "system_gate", "snippet": "lookup was required due to prior zero-progress"}]
 
@@ -1694,6 +1986,8 @@ def run_agent8_loop(
             chosen_action=action,
             counterfactual=counterfactual,
             error_subtype=_error_subtype,
+            route_ticks_in_row=_route_ticks_pre,
+            route_status=_route_status_pre,
         )
 
         console.print(
@@ -1727,7 +2021,22 @@ def run_agent8_loop(
                 f"[ROUTE DOWNWEIGHTED: {_downweight_reason}] " + targeted_prompt
             )
 
-        # 4c. Hard route gate with cooldown (falsifiable routing).
+        # 4c. Explicit delta-based force fallback chain (2 ticks by default).
+        action, _delta_force_reason = _apply_delta_force_fallback(
+            action,
+            decision_history,
+            _action_cooldowns,
+            window=RETRY_LIMITS.get("AGENT8_FORCE_FALLBACK_WINDOW", 2),
+            cooldown_ticks=RETRY_LIMITS.get("AGENT8_ROUTE_COOLDOWN_TICKS", 2),
+        )
+        if _delta_force_reason:
+            console.print(f"  [DeltaForceFallback] {action} ← {_delta_force_reason}")
+            decision["action"] = action
+            targeted_prompt = (
+                f"[DELTA FORCE FALLBACK: {_delta_force_reason}] " + targeted_prompt
+            )
+
+        # 4d. Hard route gate with cooldown (falsifiable routing).
         action, _hard_reason = _apply_hard_route_gate(
             action,
             _error_subtype,
@@ -1806,6 +2115,26 @@ def run_agent8_loop(
                     "Do not replan mathematical strategy in this tick.\n\n"
                     + targeted_prompt
                 )
+
+        # 4e. Stage-2 APOLLO decomposition policy gate.
+        _prefer_apollo, _apollo_policy_reason = _should_prefer_apollo_decompose(
+            action,
+            error_sig,
+            decision_history,
+            blocked_sorry_count=_fresh_blocked,
+            action_cooldowns=_action_cooldowns,
+        )
+        if _prefer_apollo:
+            action = "apollo_decompose_repair"
+            decision["action"] = action
+            decision["trigger_reason"] = _apollo_policy_reason
+            console.print(
+                "  [Agent8] APOLLO policy trigger: "
+                f"{_apollo_policy_reason} -> action=apollo_decompose_repair"
+            )
+            targeted_prompt = (
+                f"[APOLLO POLICY TRIGGER: {_apollo_policy_reason}] " + targeted_prompt
+            )
 
         # 5. Dispatch — capture state BEFORE action for delta computation.
         _errors_before: str = current_errors[:300]
@@ -1915,6 +2244,127 @@ def run_agent8_loop(
                                     f"  [Agent8] Lemma '{_lname}' exhausted "
                                     f"{_max_lemma_att} attempt(s) — marking failed."
                                 )
+
+            elif action == "apollo_decompose_repair":
+                console.print("  [Agent8→APOLLO] Dispatching decomposition repair...")
+                from orchestrator.apollo_repair import run_apollo_decompose_repair
+                from orchestrator.tools import run_lean_verify
+
+                apollo_result = run_apollo_decompose_repair(
+                    target_file=target_file,
+                    current_errors=current_errors,
+                    error_subtype=_error_subtype,
+                    policy_context={
+                        "trigger_reason": decision.get("trigger_reason", ""),
+                        "tick": tick,
+                    },
+                )
+                _apollo_status = str(apollo_result.get("status", "failed"))
+                _apollo_failure_kind = str(apollo_result.get("failure_kind", "strategy_failure"))
+                if _apollo_status == "success":
+                    verify = run_lean_verify(target_file)
+                    outcome = {
+                        "outcome": "success"
+                        if int(verify.get("exit_code", 1)) == 0
+                        and int(verify.get("sorry_count", -1)) == 0
+                        else "failed",
+                        "exit_code": int(verify.get("exit_code", 1)),
+                        "sorry_count": int(verify.get("sorry_count", -1)),
+                        "apollo_trigger_reason": decision.get("trigger_reason", ""),
+                        "apollo_summary": apollo_result.get("summary", ""),
+                    }
+                    current_errors = str(verify.get("errors", current_errors))
+                else:
+                    # Deterministic fallback map required by Stage-2 policy.
+                    _fallback_action = _apollo_fallback_from_failure_kind(
+                        _apollo_failure_kind
+                    )
+                    console.print(
+                        "  [Agent8→APOLLO] failed "
+                        f"(kind={_apollo_failure_kind}); fallback={_fallback_action}"
+                    )
+                    if _fallback_action == "agent7_signature":
+                        a7_prompt = (
+                            f"[APOLLO fallback from {_apollo_failure_kind}] "
+                            + decision.get("agent7_targeted_prompt", targeted_prompt)
+                        )
+                        a7_plan, _a7_raw = _agent8_run_agent7(
+                            target_file, current_errors, a7_prompt
+                        )
+                        if a7_plan:
+                            exec_registry = ToolRegistry()
+                            exec_registry.register_default_tools()
+                            for step in a7_plan.get("ordered_steps", []):
+                                if step.get("direct_apply") and step.get("tool") == "edit_file_patch":
+                                    req = step.get("required_args", {})
+                                    if req.get("old_str") and req.get("new_str"):
+                                        try:
+                                            exec_registry.call(
+                                                "edit_file_patch",
+                                                path=req.get("path", target_file),
+                                                old_str=req["old_str"],
+                                                new_str=req["new_str"],
+                                            )
+                                        except Exception:
+                                            pass
+                        verify = run_lean_verify(target_file)
+                        outcome = {
+                            "outcome": "success"
+                            if int(verify.get("exit_code", 1)) == 0
+                            and int(verify.get("sorry_count", -1)) == 0
+                            else "failed",
+                            "exit_code": int(verify.get("exit_code", 1)),
+                            "sorry_count": int(verify.get("sorry_count", -1)),
+                            "apollo_fallback_action": _fallback_action,
+                            "apollo_failure_kind": _apollo_failure_kind,
+                        }
+                        current_errors = str(verify.get("errors", current_errors))
+                    elif _fallback_action == "agent7_then_agent6":
+                        a7_prompt = (
+                            f"[APOLLO fallback from {_apollo_failure_kind}] "
+                            + decision.get("agent7_targeted_prompt", targeted_prompt)
+                        )
+                        a6_prompt = decision.get("agent6_targeted_prompt", targeted_prompt)
+                        result = _agent8_run_agent7_then_agent6(
+                            target_file,
+                            current_errors,
+                            a7_prompt,
+                            a6_prompt,
+                            agent9_plan=agent9_plan,
+                        )
+                        outcome = {
+                            "outcome": "success"
+                            if result["exit_code"] == 0 and result["sorry_count"] == 0
+                            else "failed",
+                            "exit_code": result["exit_code"],
+                            "sorry_count": result["sorry_count"],
+                            "apollo_fallback_action": _fallback_action,
+                            "apollo_failure_kind": _apollo_failure_kind,
+                        }
+                        current_errors = result.get("errors", current_errors)
+                    else:
+                        from orchestrator.phase3a_agent9 import run_agent9_replan as _run_a9_replan
+                        _new_plan = _run_a9_replan(
+                            target_file,
+                            current_errors,
+                            agent9_plan or {},
+                            algo_name,
+                            current_plan,
+                        )
+                        if _new_plan:
+                            agent9_plan = _new_plan
+                            current_plan = json.dumps(_new_plan, indent=2, ensure_ascii=False)
+                            _plan_updated_tick = tick
+                            _init_lemma_status_from_plan(_new_plan)
+                        _replan_verify = run_lean_verify(target_file)
+                        outcome = {
+                            "outcome": "replan_done",
+                            "exit_code": int(_replan_verify.get("exit_code", 1)),
+                            "sorry_count": int(_replan_verify.get("sorry_count", _current_sorry_count)),
+                            "apollo_fallback_action": _fallback_action,
+                            "apollo_failure_kind": _apollo_failure_kind,
+                        }
+                        current_errors = str(_replan_verify.get("errors", current_errors))
 
             elif action == "agent9_replan":
                 console.print("  [Agent8→Agent9] Dispatching strategy re-planning via Agent9...")
@@ -2039,6 +2489,12 @@ def run_agent8_loop(
             top_error_count_after=_top_error_count_after,
             error_count_delta=_error_count_delta,
             main_error_signature_changed=_main_sig_changed,
+            route_ticks_in_row=_route_streak_len(decision_history, action) + 1,
+            route_status=(
+                "Cooldown"
+                if int(_action_cooldowns.get(action, 0)) > 0
+                else "Active"
+            ),
         )
 
         # 6. Record decision
@@ -2135,7 +2591,8 @@ def run_agent8_midcheck(
     Returns a dict with at least:
         {
             "action":          str,   # agent3_tactical | agent7_signature |
-                                      # agent7_then_agent6 | agent9_replan |
+                                      # agent7_then_agent6 | apollo_decompose_repair |
+                                      # agent9_replan |
                                       # human_missing_assumption
             "reason":          str,
             "targeted_prompt": str,
@@ -2272,10 +2729,22 @@ def run_agent8_midcheck(
         console.print(f"  [RouteDownweight/MidCheck] {action} ← {_mc_dw_reason}")
         decision["action"] = action
 
-    # Hard gate + cooldown in mid-check, reusing latest cooldown snapshot.
+    # Explicit delta-based fallback in mid-check.
     _mc_cooldowns = {}
     if _decision_history:
         _mc_cooldowns = dict(_decision_history[-1].get("action_cooldowns", {}) or {})
+    action, _mc_delta_reason = _apply_delta_force_fallback(
+        action,
+        _decision_history,
+        _mc_cooldowns,
+        window=RETRY_LIMITS.get("AGENT8_FORCE_FALLBACK_WINDOW", 2),
+        cooldown_ticks=RETRY_LIMITS.get("AGENT8_ROUTE_COOLDOWN_TICKS", 2),
+    )
+    if _mc_delta_reason:
+        console.print(f"  [DeltaForceFallback/MidCheck] {action} ← {_mc_delta_reason}")
+        decision["action"] = action
+
+    # Hard gate + cooldown in mid-check, reusing latest cooldown snapshot.
     action, _mc_hard_reason = _apply_hard_route_gate(
         action,
         _mc_subtype,

@@ -93,6 +93,32 @@ LEAN_VERIFY_PATHS = ["Algorithms/", "Lib/"]
 # the project import graph and detect circular dependencies before adding imports.
 READ_ONLY_PATHS = ["Algorithms/", "Lib/", "docs/", "Main.lean", "lakefile.lean"]
 
+# ---------------------------------------------------------------------------
+# Lean verify backend controls (low-intrusion APOLLO integration)
+# ---------------------------------------------------------------------------
+_LEAN_VERIFY_BACKEND_RAW = os.getenv("LEAN_VERIFY_BACKEND", "lake").strip().lower()
+LEAN_VERIFY_BACKEND = (
+    _LEAN_VERIFY_BACKEND_RAW if _LEAN_VERIFY_BACKEND_RAW in {"lake", "apollo"} else "lake"
+)
+
+# APOLLO integration knobs.  These are read by orchestrator.apollo_integration and
+# tools.run_lean_verify when the backend is set to "apollo".
+APOLLO_PROJECT_PATH = Path(
+    os.getenv("APOLLO_PROJECT_PATH", str(PROJECT_ROOT.parent / "APOLLO"))
+)
+APOLLO_REPL_WORKSPACE = Path(
+    os.getenv("APOLLO_REPL_WORKSPACE", str(APOLLO_PROJECT_PATH / "repl"))
+)
+APOLLO_LAKE_PATH = os.getenv(
+    "APOLLO_LAKE_PATH",
+    os.getenv("LEAN_LAKE_PATH", str(Path.home() / ".elan" / "bin" / "lake")),
+)
+APOLLO_VERIFY_TIMEOUT = int(os.getenv("APOLLO_VERIFY_TIMEOUT", "300"))
+# If enabled, APOLLO backend failures immediately degrade to lake verify path.
+APOLLO_FALLBACK_TO_LAKE_ON_FAILURE = (
+    os.getenv("APOLLO_FALLBACK_TO_LAKE_ON_FAILURE", "1") != "0"
+)
+
 DOC_ANCHORS_BY_FILE: dict[str, list[str]] = {
     "docs/CATALOG.md": ["CATALOG_ALGO_LAYER", "CATALOG_ROADMAP"],
     "docs/GLUE_TRICKS.md": ["GLUE_PATTERNS"],
@@ -334,6 +360,17 @@ RETRY_LIMITS: dict[str, int] = {
     "AGENT8_MAX_STEPS": 15,
     # Agent8: maximum Agent3 tool turns per dispatch (simplified loop).
     "AGENT8_AGENT3_MAX_TURNS": 15,
+    # Agent3 APOLLO-aligned sampling/search controls.
+    "AGENT8_AGENT3_SAMPLE_CANDIDATES": 3,
+    "AGENT8_AGENT3_SAMPLE_MAX_CANDIDATES": 3,
+    "AGENT8_AGENT3_SAMPLE_MAX_TURNS_PER_CANDIDATE": 8,
+    "AGENT8_AGENT3_SAMPLE_DEGRADE_TICKS": 2,
+    # Agent8 delta-based forced fallback: two consecutive no-progress ticks.
+    "AGENT8_FORCE_FALLBACK_WINDOW": 2,
+    # Cooldown for routes that were forcibly switched away from.
+    "AGENT8_ROUTE_COOLDOWN_TICKS": 2,
+    # Agent3 patch guard: reject large edit patches in tactical/sampling flow.
+    "AGENT8_MAX_PATCH_LINES": 60,
     # Agent8 investigation phase: max read-only lookup rounds before final decision.
     "AGENT8_INVESTIGATION_TURNS": 3,
     # Agent8 context truncation constants (characters).
@@ -378,6 +415,11 @@ RETRY_LIMITS: dict[str, int] = {
     # missing_glue_lemma before that lemma is marked "failed" and the anti-loop
     # exemption for it is revoked.
     "AGENT8_MAX_LEMMA_ATTEMPTS": 3,
+    # Agent8 APOLLO decomposition policy gates.
+    "AGENT8_APOLLO_SAME_ERROR_WINDOW": 2,
+    "AGENT8_APOLLO_BLOCKED_SORRY_THRESHOLD": 1,
+    "AGENT8_APOLLO_NO_PROGRESS_WINDOW": 2,
+    "AGENT8_APOLLO_ROUTE_COOLDOWN_TICKS": 2,
 }
 
 TIMEOUTS: dict[str, int] = {
@@ -441,6 +483,16 @@ AGENT8_MIDCHECK_INTERVAL_TURNS: int = int(
 # Minimum total turns elapsed before the first mid-check fires.
 # Prevents interrupting Agent3 before it has had time to start.
 AGENT8_MIDCHECK_MIN_TURN: int = int(os.getenv("AGENT8_MIDCHECK_MIN_TURN", "8"))
+
+# Agent8 tactical sampling toggle.  Disabled by default for safe rollout.
+AGENT8_AGENT3_SAMPLING_ENABLED: bool = (
+    os.getenv("AGENT8_AGENT3_SAMPLING_ENABLED", "0") != "0"
+)
+
+# Agent8 decomposition route master switch (Stage-2, default off for safe rollout).
+AGENT8_APOLLO_DECOMPOSE_ENABLED: bool = (
+    os.getenv("AGENT8_APOLLO_DECOMPOSE_ENABLED", "0") != "0"
+)
 
 # Backward-compatible aliases (to be removed after full migration).
 MAX_APPROVAL_ROUNDS = RETRY_LIMITS["MAX_PHASE2_APPROVAL_ROUNDS"]

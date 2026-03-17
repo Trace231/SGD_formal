@@ -1,12 +1,16 @@
 """Regression checks for Agent8 evidence/replan policy upgrades,
 including API-mismatch precision (subtype classifier, route downweight)."""
 
+import orchestrator.phase3_agent8 as a8
+
 from orchestrator.phase3_agent8 import (
+    _apply_delta_force_fallback,
     _SUBTYPE_DECLARATION_API_MISMATCH,
     _SUBTYPE_PROOF_API_MISMATCH,
     _SUBTYPE_PROOF_TACTIC_FAILURE,
     _SUBTYPE_STRATEGY_MISMATCH,
     _apply_hard_route_gate,
+    _apollo_fallback_from_failure_kind,
     _build_agent9_theorem_context,
     _build_api_shape_contract,
     _check_anti_loop,
@@ -14,6 +18,7 @@ from orchestrator.phase3_agent8 import (
     _classify_error_subtype,
     _is_structural_error,
     _is_network_error,
+    _should_prefer_apollo_decompose,
     _signature_changed,
     _validate_agent8_decision_schema,
 )
@@ -41,6 +46,25 @@ def test_decision_schema_requires_evidence_protocol():
     ]
     ok2, _ = _validate_agent8_decision_schema(good)
     assert ok2
+
+
+def test_decision_schema_accepts_apollo_decompose_action():
+    good = {
+        "action": "apollo_decompose_repair",
+        "priority_level": "P1b",
+        "reason": "signature unchanged for 2 ticks",
+        "targeted_prompt": "run decomposition pipeline",
+        "error_signature": "application type mismatch",
+        "hypothesis": "local tactical route is stalled",
+        "evidence": [
+            {"source": "decision_history", "snippet": "same signature for 2 ticks"},
+            {"source": "run_lean_verify", "snippet": "blocked_sorry_count=2"},
+        ],
+        "confidence": 0.78,
+        "counterfactual": "agent3_tactical repeated with zero progress",
+    }
+    ok, msg = _validate_agent8_decision_schema(good)
+    assert ok, msg
 
 
 def test_structural_vs_tactical_classification_regression():
@@ -228,6 +252,121 @@ def test_hard_route_gate_blocks_action_under_cooldown():
     )
     assert action != "agent3_tactical"
     assert "cooldown blocks" in reason
+
+
+def test_apollo_fallback_mapping_is_deterministic():
+    assert _apollo_fallback_from_failure_kind("interface_failure") == "agent7_signature"
+    assert _apollo_fallback_from_failure_kind("instance_failure") == "agent7_signature"
+    assert _apollo_fallback_from_failure_kind("glue_failure") == "agent7_then_agent6"
+    assert _apollo_fallback_from_failure_kind("strategy_failure") == "agent9_replan"
+
+
+def test_should_prefer_apollo_when_signature_unchanged_two_ticks(monkeypatch):
+    monkeypatch.setattr(
+        "orchestrator.phase3_agent8.AGENT8_APOLLO_DECOMPOSE_ENABLED", True
+    )
+    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_APOLLO_SAME_ERROR_WINDOW", 2)
+    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_APOLLO_NO_PROGRESS_WINDOW", 2)
+    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_APOLLO_BLOCKED_SORRY_THRESHOLD", 1)
+    history = [
+        {
+            "error_signature": "Application type mismatch",
+            "error_count_delta": 0,
+            "main_error_signature_changed": False,
+            "outcome": "failed",
+        },
+        {
+            "error_signature": "Application type mismatch",
+            "error_count_delta": 0,
+            "main_error_signature_changed": False,
+            "outcome": "failed",
+        },
+    ]
+    ok, reason = _should_prefer_apollo_decompose(
+        "agent3_tactical",
+        "Application type mismatch",
+        history,
+        blocked_sorry_count=0,
+        action_cooldowns={},
+    )
+    assert ok
+    assert "unchanged" in reason
+
+
+def test_delta_force_fallback_agent3_to_agent7():
+    history = [
+        {
+            "action": "agent3_tactical",
+            "error_count_delta": 0,
+            "main_error_signature_changed": False,
+        },
+        {
+            "action": "agent3_tactical",
+            "error_count_delta": 1,
+            "main_error_signature_changed": False,
+        },
+    ]
+    cooldowns = {}
+    action, reason = _apply_delta_force_fallback(
+        "agent3_tactical",
+        history,
+        cooldowns,
+        window=2,
+        cooldown_ticks=2,
+    )
+    assert action == "agent7_signature"
+    assert "delta_force_fallback" in reason
+    assert cooldowns.get("agent3_tactical") == 2
+
+
+def test_delta_force_fallback_agent7_to_agent9():
+    history = [
+        {
+            "action": "agent7_signature",
+            "error_count_delta": 0,
+            "main_error_signature_changed": False,
+        },
+        {
+            "action": "agent7_signature",
+            "error_count_delta": 3,
+            "main_error_signature_changed": False,
+        },
+    ]
+    cooldowns = {}
+    action, _ = _apply_delta_force_fallback(
+        "agent7_signature",
+        history,
+        cooldowns,
+        window=2,
+        cooldown_ticks=2,
+    )
+    assert action == "agent9_replan"
+    assert cooldowns.get("agent7_signature") == 2
+
+
+def test_delta_force_fallback_not_triggered_when_signature_changed():
+    history = [
+        {
+            "action": "agent3_tactical",
+            "error_count_delta": 0,
+            "main_error_signature_changed": False,
+        },
+        {
+            "action": "agent3_tactical",
+            "error_count_delta": 0,
+            "main_error_signature_changed": True,
+        },
+    ]
+    cooldowns = {}
+    action, reason = _apply_delta_force_fallback(
+        "agent3_tactical",
+        history,
+        cooldowns,
+        window=2,
+        cooldown_ticks=2,
+    )
+    assert action == "agent3_tactical"
+    assert not reason
 
 
 def test_network_failure_not_used_in_downweight_window():

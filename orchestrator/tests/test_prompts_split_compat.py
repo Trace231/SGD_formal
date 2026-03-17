@@ -26,4 +26,11 @@ def test_key_prompt_phrases_still_present():
     assert "You are the Sorry Closer" in a3
     assert "You are the Decision Hub (Agent8)" in a8
     assert "You are the Strategy Planner (Agent9)" in a9
+    assert "apollo_decompose_repair" in a8
+
+
+def test_prompt_tool_signature_examples_match_tools():
+    a3_raw = AGENT3_PROMPT_TEXT
+    assert "search_codebase(query=" not in a3_raw
+    assert 'search_codebase(pattern="<identifier>")' in a3_raw
 

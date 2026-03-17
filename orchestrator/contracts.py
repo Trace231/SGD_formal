@@ -30,6 +30,7 @@ AGENT8_VALID_ACTIONS = frozenset(
         "agent3_tactical",
         "agent7_signature",
         "agent7_then_agent6",
+        "apollo_decompose_repair",
         "agent9_replan",
         "human_missing_assumption",
     }
@@ -66,6 +67,7 @@ Agent8Action = Literal[
     "agent3_tactical",
     "agent7_signature",
     "agent7_then_agent6",
+    "apollo_decompose_repair",
     "agent9_replan",
     "human_missing_assumption",
 ]
@@ -126,4 +128,6 @@ class Agent8Decision(TypedDict, total=False):
     allowed_edit_lines: str
     agent7_targeted_prompt: str
     agent6_targeted_prompt: str
+    trigger_reason: str
+    expected_fallback: str
 
