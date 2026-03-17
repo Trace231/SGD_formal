@@ -187,6 +187,8 @@ If the normalized `error_signature` is unchanged for **2 consecutive ticks**,
 prefer decomposition-first recovery:
 → action = "apollo_decompose_repair", priority_level = "P1b"
 Use this before broad replanning when local tactics/signature fixes show no net movement.
+Only escalate to `human_missing_assumption` after at least one decomposition
+attempt for the frozen signature has been executed and verified as non-progressing.
 
 **P2 — Proof Strategy Failure:**
 If errors suggest the overall proof approach is wrong (wrong lemma chain,

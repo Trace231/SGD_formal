@@ -16,6 +16,8 @@ from orchestrator.phase3_agent8 import (
     _check_anti_loop,
     _check_route_downweight,
     _classify_error_subtype,
+    _coerce_errors_text,
+    _error_count_from_verify,
     _is_structural_error,
     _is_network_error,
     _should_prefer_apollo_decompose,
@@ -385,6 +387,27 @@ def test_signature_changed_metric():
     after = "Foo.lean:12:8: error: application type mismatch"
     assert _signature_changed(before, after)
     assert not _signature_changed(before, before)
+
+
+def test_coerce_errors_text_with_mixed_payload():
+    payload = [
+        "Foo.lean:1:1: error: boom",
+        {"data": "Bar.lean:2:2: error: bang"},
+        "",
+    ]
+    text = _coerce_errors_text(payload)
+    assert "boom" in text
+    assert "bang" in text
+
+
+def test_error_count_prefers_verify_error_count_field():
+    verify = {"error_count": 5, "errors": ["a", "b"]}
+    assert _error_count_from_verify(verify, "x\ny") == 5
+
+
+def test_error_count_falls_back_to_errors_list_length():
+    verify = {"errors": ["a", "b", "c"]}
+    assert _error_count_from_verify(verify, "") == 3
 
 
 def test_network_error_classifier():

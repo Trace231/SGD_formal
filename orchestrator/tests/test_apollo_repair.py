@@ -11,6 +11,13 @@ def test_classify_failure_kind_prefers_interface_markers():
     assert "mismatch" in reason
 
 
+def test_classify_failure_kind_does_not_use_generic_declaration_token():
+    kind, _, _ = apollo_repair.classify_failure_kind(
+        "declaration elaboration failed with no structural markers"
+    )
+    assert kind == "strategy_failure"
+
+
 def test_classify_failure_kind_instance_markers():
     kind, _, _ = apollo_repair.classify_failure_kind(
         "failed to synthesize instance for Monoid Foo"
@@ -21,6 +28,17 @@ def test_classify_failure_kind_instance_markers():
 def test_classify_failure_kind_strategy_markers():
     kind, _, _ = apollo_repair.classify_failure_kind("tactic failed\nunsolved goals")
     assert kind == "strategy_failure"
+
+
+def test_build_subproblem_graph_prioritizes_compile_then_glue_then_strategy():
+    graph = apollo_repair.build_subproblem_graph(
+        current_errors="unknown identifier foo\nmissing glue bridge candidates",
+        error_subtype="declaration_api_mismatch",
+        lemma_count=1,
+    )
+    kinds = [n["kind"] for n in graph]
+    assert kinds[0] == "interface_signature"
+    assert "missing_glue" in kinds
 
 
 def test_run_apollo_decompose_repair_reports_bootstrap_failure(tmp_path, monkeypatch):
@@ -44,4 +62,5 @@ def test_run_apollo_decompose_repair_reports_bootstrap_failure(tmp_path, monkeyp
         "agent7_then_agent6",
         "agent9_replan",
     }
+    assert isinstance(out.get("subproblem_graph", []), list)
     assert "unavailable" in out["summary"].lower() or "failed" in out["classifier_reason"].lower()

@@ -420,6 +420,8 @@ RETRY_LIMITS: dict[str, int] = {
     "AGENT8_APOLLO_BLOCKED_SORRY_THRESHOLD": 1,
     "AGENT8_APOLLO_NO_PROGRESS_WINDOW": 2,
     "AGENT8_APOLLO_ROUTE_COOLDOWN_TICKS": 2,
+    # APOLLO serial subproblem queue: retries per node before fallback route.
+    "AGENT8_SUBPROBLEM_MAX_ATTEMPTS": 2,
 }
 
 TIMEOUTS: dict[str, int] = {
@@ -489,9 +491,22 @@ AGENT8_AGENT3_SAMPLING_ENABLED: bool = (
     os.getenv("AGENT8_AGENT3_SAMPLING_ENABLED", "0") != "0"
 )
 
-# Agent8 decomposition route master switch (Stage-2, default off for safe rollout).
+# APOLLO alignment rollout profile:
+# - safe: preserve historical defaults
+# - full: enable decomposition-first/serial subproblem defaults
+AGENT8_APOLLO_ALIGNMENT_MODE: str = os.getenv(
+    "AGENT8_APOLLO_ALIGNMENT_MODE",
+    "safe",
+).strip().lower()
+if AGENT8_APOLLO_ALIGNMENT_MODE not in {"safe", "full"}:
+    AGENT8_APOLLO_ALIGNMENT_MODE = "safe"
+
+# Agent8 decomposition route master switch.
 AGENT8_APOLLO_DECOMPOSE_ENABLED: bool = (
-    os.getenv("AGENT8_APOLLO_DECOMPOSE_ENABLED", "0") != "0"
+    os.getenv(
+        "AGENT8_APOLLO_DECOMPOSE_ENABLED",
+        "1" if AGENT8_APOLLO_ALIGNMENT_MODE == "full" else "0",
+    ) != "0"
 )
 
 # Backward-compatible aliases (to be removed after full migration).

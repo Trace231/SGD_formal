@@ -3,13 +3,19 @@
 from orchestrator import phase3_agent8 as a8
 
 
+def _mk_target(tmp_path):
+    target = tmp_path / "SubgradientMethod.lean"
+    target.write_text("theorem t : True := by\n  trivial\n", encoding="utf-8")
+    return str(target)
+
+
 def test_agent8_result_score_prefers_clean_outcome():
     clean = {"exit_code": 0, "sorry_count": 0, "errors": ""}
     noisy = {"exit_code": 1, "sorry_count": 2, "errors": "Foo.lean:1:1: error: x"}
     assert a8._agent8_result_score(clean) < a8._agent8_result_score(noisy)
 
 
-def test_sampling_early_stops_on_clean_candidate(monkeypatch):
+def test_sampling_early_stops_on_clean_candidate(monkeypatch, tmp_path):
     monkeypatch.setattr(a8, "AGENT8_AGENT3_SAMPLING_ENABLED", True)
     monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_AGENT3_SAMPLE_CANDIDATES", 3)
     monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_AGENT3_SAMPLE_MAX_CANDIDATES", 3)
@@ -26,13 +32,13 @@ def test_sampling_early_stops_on_clean_candidate(monkeypatch):
         return {"exit_code": 1, "sorry_count": 3, "errors": "err"}
 
     monkeypatch.setattr(a8, "_agent8_run_agent3_single", _fake_single)
-    out = a8._agent8_run_agent3("Algorithms/SubgradientMethod.lean", "plan", "prompt", None)
+    out = a8._agent8_run_agent3(_mk_target(tmp_path), "plan", "prompt", None)
     assert out["exit_code"] == 0
     assert out["sorry_count"] == 0
     assert calls == [1, 2]
 
 
-def test_sampling_non_improving_candidates_trigger_cutoff(monkeypatch):
+def test_sampling_non_improving_candidates_trigger_cutoff(monkeypatch, tmp_path):
     monkeypatch.setattr(a8, "AGENT8_AGENT3_SAMPLING_ENABLED", True)
     monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_AGENT3_SAMPLE_CANDIDATES", 3)
     monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_AGENT3_SAMPLE_MAX_CANDIDATES", 3)
@@ -46,12 +52,12 @@ def test_sampling_non_improving_candidates_trigger_cutoff(monkeypatch):
         return {"exit_code": 1, "sorry_count": 5, "errors": "same"}
 
     monkeypatch.setattr(a8, "_agent8_run_agent3_single", _fake_single)
-    _ = a8._agent8_run_agent3("Algorithms/SubgradientMethod.lean", "plan", "prompt", None)
+    _ = a8._agent8_run_agent3(_mk_target(tmp_path), "plan", "prompt", None)
     # First sample sets baseline, second non-improving sample triggers cutoff.
     assert calls == [1, 2]
 
 
-def test_sampling_disabled_falls_back_to_single_path(monkeypatch):
+def test_sampling_disabled_falls_back_to_single_path(monkeypatch, tmp_path):
     monkeypatch.setattr(a8, "AGENT8_AGENT3_SAMPLING_ENABLED", False)
     calls: list[tuple[int, int]] = []
 
@@ -60,7 +66,7 @@ def test_sampling_disabled_falls_back_to_single_path(monkeypatch):
         return {"exit_code": 1, "sorry_count": 1, "errors": "e"}
 
     monkeypatch.setattr(a8, "_agent8_run_agent3_single", _fake_single)
-    _ = a8._agent8_run_agent3("Algorithms/SubgradientMethod.lean", "plan", "prompt", None)
+    _ = a8._agent8_run_agent3(_mk_target(tmp_path), "plan", "prompt", None)
     assert calls == [(1, 1)]
 
 

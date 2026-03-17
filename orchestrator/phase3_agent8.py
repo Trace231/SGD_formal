@@ -222,6 +222,36 @@ def _count_error_lines(errors_text: str) -> int:
     return count
 
 
+def _coerce_errors_text(errors: Any) -> str:
+    """Normalize verify ``errors`` payload to a stable multi-line string."""
+    if errors is None:
+        return ""
+    if isinstance(errors, str):
+        return errors
+    if isinstance(errors, list):
+        lines: list[str] = []
+        for item in errors:
+            if isinstance(item, dict):
+                lines.append(str(item.get("data", "")).strip())
+            else:
+                lines.append(str(item).strip())
+        return "\n".join([ln for ln in lines if ln])
+    return str(errors)
+
+
+def _error_count_from_verify(verify_result: dict[str, Any], errors_text: str) -> int:
+    """Get canonical error count from verify payload with text fallback."""
+    try:
+        if "error_count" in verify_result:
+            return max(0, int(verify_result.get("error_count", 0)))
+    except Exception:
+        pass
+    errs = verify_result.get("errors", [])
+    if isinstance(errs, list):
+        return len(errs)
+    return _count_error_lines(errors_text)
+
+
 def _normalize_error_signature(sig: str) -> str:
     """Normalize an error signature for stable cross-tick comparison."""
     if not sig:
@@ -564,6 +594,30 @@ def _should_prefer_apollo_decompose(
     if reasons:
         return True, "; ".join(reasons)
     return False, ""
+
+
+def _subproblem_kind_to_action(kind: str) -> str:
+    """Deterministic serial dispatch mapping for APOLLO subproblem nodes."""
+    return {
+        "interface_signature": "agent7_signature",
+        "proof_api_shape": "agent3_tactical",
+        "missing_glue": "agent7_then_agent6",
+        "local_tactic_repair": "agent3_tactical",
+        "global_strategy": "agent9_replan",
+        "assumption_gap": "human_missing_assumption",
+    }.get(kind, "agent9_replan")
+
+
+def _subproblem_kind_fallback_action(kind: str) -> str:
+    """Fallback when a serial subproblem node exceeds its retry budget."""
+    return {
+        "interface_signature": "agent7_then_agent6",
+        "proof_api_shape": "agent7_signature",
+        "missing_glue": "agent9_replan",
+        "local_tactic_repair": "agent9_replan",
+        "global_strategy": "human_missing_assumption",
+        "assumption_gap": "human_missing_assumption",
+    }.get(kind, "agent9_replan")
 
 
 _DECL_SIGNATURE_RE = re.compile(
@@ -1291,10 +1345,18 @@ def _agent8_run_agent3(
             candidate_total=1,
         )
 
+    target_path = Path(target_file)
+    if not target_path.is_absolute():
+        target_path = (PROJECT_ROOT / target_path).resolve()
+    baseline_content = target_path.read_text(encoding="utf-8")
+    best_content = baseline_content
     best_result: dict[str, Any] | None = None
     best_score: tuple[int, int, int, int] | None = None
     non_improving = 0
     for idx in range(candidate_count):
+        # APOLLO-aligned candidate isolation:
+        # every sampled candidate starts from the same baseline source.
+        target_path.write_text(baseline_content, encoding="utf-8")
         candidate_result = _agent8_run_agent3_single(
             target_file,
             agent2_plan,
@@ -1307,10 +1369,12 @@ def _agent8_run_agent3(
             candidate_total=candidate_count,
         )
         score = _agent8_result_score(candidate_result)
+        candidate_content = target_path.read_text(encoding="utf-8")
 
         if best_result is None or best_score is None or score < best_score:
             best_result = candidate_result
             best_score = score
+            best_content = candidate_content
             non_improving = 0
         else:
             non_improving += 1
@@ -1320,6 +1384,8 @@ def _agent8_run_agent3(
         if int(candidate_result.get("exit_code", 1)) == 0 and int(
             candidate_result.get("sorry_count", -1)
         ) == 0:
+            best_content = candidate_content
+            target_path.write_text(best_content, encoding="utf-8")
             return candidate_result
 
         # Safeguard: if additional sampled candidates are not improving,
@@ -1327,6 +1393,7 @@ def _agent8_run_agent3(
         if non_improving >= degrade_stop_after:
             break
 
+    target_path.write_text(best_content, encoding="utf-8")
     return best_result or {
         "exit_code": 1,
         "sorry_count": -1,
@@ -1399,40 +1466,44 @@ def _agent8_run_agent7_then_agent6(
         target_file, errors_text, agent7_targeted_prompt
     )
 
-    if a7_plan:
+    if a7_plan and isinstance(a7_plan, dict):
         console.print(
             f"  [Agent8→Agent7] Root cause: {a7_plan.get('root_cause', '?')}"
         )
         # If Agent7 is in CREATE_STUB mode, strip any request_agent6_glue steps
         # to prevent double-dispatch (Agent8 handles Agent6 dispatch itself).
         if a7_plan.get("create_stubs"):
-            a7_plan["ordered_steps"] = [
-                s for s in a7_plan.get("ordered_steps", [])
-                if s.get("tool") != "request_agent6_glue"
-            ]
+            ordered_steps = a7_plan.get("ordered_steps", [])
+            if isinstance(ordered_steps, list):
+                a7_plan["ordered_steps"] = [
+                    s for s in ordered_steps
+                    if isinstance(s, dict) and s.get("tool") != "request_agent6_glue"
+                ]
 
         # Execute direct_apply steps from Agent7 protocol
         exec_registry = ToolRegistry()
         exec_registry.register_default_tools()
-        for step in a7_plan.get("ordered_steps", []):
-            if step.get("direct_apply"):
-                _tool = step.get("tool", "")
-                req_args = step.get("required_args", {})
-                if _tool == "edit_file_patch" and req_args.get("old_str") and req_args.get("new_str"):
-                    try:
-                        exec_registry.call(
-                            "edit_file_patch",
-                            path=req_args.get("path", target_file),
-                            old_str=req_args["old_str"],
-                            new_str=req_args["new_str"],
-                        )
-                    except Exception:
-                        pass
+        ordered_steps = a7_plan.get("ordered_steps", [])
+        if isinstance(ordered_steps, list):
+            for step in ordered_steps:
+                if isinstance(step, dict) and step.get("direct_apply"):
+                    _tool = step.get("tool", "")
+                    req_args = step.get("required_args", {})
+                    if isinstance(req_args, dict) and _tool == "edit_file_patch" and req_args.get("old_str") and req_args.get("new_str"):
+                        try:
+                            exec_registry.call(
+                                "edit_file_patch",
+                                path=req_args.get("path", target_file),
+                                old_str=req_args["old_str"],
+                                new_str=req_args["new_str"],
+                            )
+                        except Exception:
+                            pass
 
     # Phase 1.5: Validate target file compiles after Agent7's writes.
     from orchestrator.tools import run_lean_verify as _stub_verify
     _target_check = _stub_verify(target_file)
-    _stub_exit = int(_target_check.get("exit_code", 1))
+    _stub_exit = int(_target_check.get("exit_code", 1)) if isinstance(_target_check, dict) else 1
     if _stub_exit != 0:
         console.print(
             f"  [Agent7 stub] Target compile FAILED (exit={_stub_exit}) — "
@@ -1441,7 +1512,7 @@ def _agent8_run_agent7_then_agent6(
         return {
             "exit_code": 1,
             "sorry_count": -1,
-            "errors": str(_target_check.get("errors", "")),
+            "errors": str(_target_check.get("errors", "")) if isinstance(_target_check, dict) else "",
             "stub_compile_failed": True,
             "lemma_proven": False,
         }
@@ -1533,6 +1604,10 @@ def _print_diagnostic_card(
     main_error_signature_changed: bool | None = None,
     route_ticks_in_row: int | None = None,
     route_status: str = "Active",
+    node_id: str = "",
+    node_kind: str = "",
+    node_attempt: int = 0,
+    queue_remaining: int = 0,
 ) -> None:
     """Emit a structured per-tick diagnostic card."""
     ev_lines = [
@@ -1556,11 +1631,18 @@ def _print_diagnostic_card(
         f"[Route] Current: {chosen_action} | Ticks in Route: {_route_ticks} | "
         f"Status: {route_status}\n"
     )
+    node_line = ""
+    if node_id or node_kind:
+        node_line = (
+            f"[Subproblem] id={node_id or '?'} kind={node_kind or '?'} "
+            f"attempt={node_attempt} queue_remaining={queue_remaining}\n"
+        )
     body = (
         f"{subtype_line}"
         f"{trend_line}"
         f"{sig_line}"
         f"{route_line}"
+        f"{node_line}"
         f"ErrorSig: {error_sig[:120]}\n"
         f"Hypothesis: {hypothesis[:220]}\n"
         f"Evidence:\n" + ("\n".join(ev_lines) if ev_lines else "  (none)") + "\n"
@@ -1732,6 +1814,10 @@ def run_agent8_loop(
     _last_error_sig: str = ""
     _force_lookup_next_tick: bool = False
     _action_cooldowns: dict[str, int] = {}
+    _decompose_attempted_for_signature: set[str] = set()
+    _serial_subproblem_queue: list[dict[str, Any]] = []
+    _serial_subproblem_attempts: dict[str, int] = {}
+    _serial_max_attempts = max(1, int(RETRY_LIMITS.get("AGENT8_SUBPROBLEM_MAX_ATTEMPTS", 2)))
 
     # Per-lemma attempt tracking for sorry-only scenarios.
     # Populated from agent9_plan's missing_glue_lemmas at startup and after replans.
@@ -1773,6 +1859,7 @@ def run_agent8_loop(
 
     for tick in range(1, max_steps + 1):
         console.print(f"\n[magenta]--- Agent8 Tick {tick}/{max_steps} ---")
+        _active_subproblem_node: dict[str, Any] | None = None
         # Decrement action cooldowns at the start of each tick.
         for _a in list(_action_cooldowns.keys()):
             _action_cooldowns[_a] = max(0, int(_action_cooldowns.get(_a, 0)) - 1)
@@ -1784,14 +1871,13 @@ def run_agent8_loop(
         from orchestrator.tools import run_lean_verify as _tick_verify
         _fresh = _tick_verify(target_file)
         _fresh_exit = int(_fresh.get("exit_code", 1))
-        _fresh_errors = str(_fresh.get("errors", ""))
+        _fresh_errors = _coerce_errors_text(_fresh.get("errors", ""))
+        _fresh_error_count = _error_count_from_verify(_fresh, _fresh_errors)
         _fresh_sorry = int(_fresh.get("sorry_count", _current_sorry_count))
         _fresh_blocked = int(_fresh.get("blocked_sorry_count", 0))
         _compile_first_mode = (_fresh_exit != 0 and _fresh_sorry == 0)
-        # Override stale errors only when the fresh build produced hard errors,
-        # or when current_errors is empty (nothing meaningful to preserve).
-        if _fresh_errors.strip() or not current_errors.strip():
-            current_errors = _fresh_errors
+        # Always use fresh verifier output as the source of truth.
+        current_errors = _fresh_errors
         _current_sorry_count = _fresh_sorry
 
         # Classify error subtype before building context so it can be injected.
@@ -1804,7 +1890,7 @@ def run_agent8_loop(
             f"  [Agent8] Fresh verify: exit={_fresh_exit}, "
             f"sorry={_fresh_sorry} | subtype={_error_subtype}"
         )
-        if _compile_first_mode:
+        if _compile_first_mode and not _active_subproblem_node:
             console.print(
                 f"  [Agent8] Compile-First mode active (exit=1, sorry=0): "
                 f"subtype={_error_subtype} — "
@@ -1969,6 +2055,41 @@ def run_agent8_loop(
         hypothesis = str(decision.get("hypothesis", "")).strip()
         evidence = _normalize_evidence(decision.get("evidence"))
         counterfactual = str(decision.get("counterfactual", "")).strip()
+        _active_subproblem_node = None
+        if _serial_subproblem_queue:
+            _active_subproblem_node = _serial_subproblem_queue.pop(0)
+            _node_id = str(_active_subproblem_node.get("id", f"node-{tick}"))
+            _node_kind = str(_active_subproblem_node.get("kind", "global_strategy"))
+            _node_attempt = _serial_subproblem_attempts.get(_node_id, 0) + 1
+            _serial_subproblem_attempts[_node_id] = _node_attempt
+            _node_evidence = str(_active_subproblem_node.get("evidence", "")).strip()
+            if _node_attempt > _serial_max_attempts:
+                action = _subproblem_kind_fallback_action(_node_kind)
+                targeted_prompt = (
+                    f"[SERIAL NODE RETRY EXHAUSTED] node={_node_id} kind={_node_kind} "
+                    f"attempt={_node_attempt}>{_serial_max_attempts}. "
+                    "Switching to deterministic fallback route."
+                )
+            else:
+                action = _subproblem_kind_to_action(_node_kind)
+                targeted_prompt = (
+                    f"[SERIAL SUBPROBLEM] node={_node_id} kind={_node_kind} "
+                    f"attempt={_node_attempt}/{_serial_max_attempts}.\n"
+                    f"Target: {str(_active_subproblem_node.get('target', ''))}\n"
+                    f"Evidence: {_node_evidence}\n"
+                    "Follow deterministic routing for this node."
+                )
+            decision["action"] = action
+            decision["targeted_prompt"] = targeted_prompt
+            decision["reason"] = (
+                f"serial subproblem dispatcher active ({_node_kind})"
+            )
+            decision["subproblem_node"] = _active_subproblem_node
+            if not evidence:
+                evidence = [{
+                    "source": "apollo_subproblem_queue",
+                    "snippet": f"{_node_id}:{_node_kind} {_node_evidence[:120]}",
+                }]
         _route_ticks_pre = _route_streak_len(decision_history, action) + 1
         _route_status_pre = (
             "Cooldown"
@@ -1988,6 +2109,22 @@ def run_agent8_loop(
             error_subtype=_error_subtype,
             route_ticks_in_row=_route_ticks_pre,
             route_status=_route_status_pre,
+            node_id=(
+                str(_active_subproblem_node.get("id", ""))
+                if _active_subproblem_node
+                else ""
+            ),
+            node_kind=(
+                str(_active_subproblem_node.get("kind", ""))
+                if _active_subproblem_node
+                else ""
+            ),
+            node_attempt=(
+                int(_serial_subproblem_attempts.get(str(_active_subproblem_node.get("id", "")), 0))
+                if _active_subproblem_node
+                else 0
+            ),
+            queue_remaining=len(_serial_subproblem_queue),
         )
 
         console.print(
@@ -1998,76 +2135,60 @@ def run_agent8_loop(
         )
         console.print(f"  [Agent8] Reason: {decision.get('reason', '?')}")
 
-        # 4a. Anti-loop check (behavior-driven)
-        action, _antiloop_reason = _check_anti_loop(
-            decision, decision_history,
-            pending_lemma_status=_pending_lemma_status,
-        )
-        if _antiloop_reason:
-            console.print(f"  [AntiLoop] {action} ← {_antiloop_reason}")
-            decision["action"] = action
-            targeted_prompt = (
-                f"[FORCED by anti-loop: {_antiloop_reason}] " + targeted_prompt
+        if not _active_subproblem_node:
+            # 4a. Anti-loop check (behavior-driven)
+            action, _antiloop_reason = _check_anti_loop(
+                decision, decision_history,
+                pending_lemma_status=_pending_lemma_status,
             )
-
-        # 4b. Route downweight: subtype + action with zero error-count progress
-        action, _downweight_reason = _check_route_downweight(
-            action, _error_subtype, decision_history,
-        )
-        if _downweight_reason:
-            console.print(f"  [RouteDownweight] {action} ← {_downweight_reason}")
-            decision["action"] = action
-            targeted_prompt = (
-                f"[ROUTE DOWNWEIGHTED: {_downweight_reason}] " + targeted_prompt
-            )
-
-        # 4c. Explicit delta-based force fallback chain (2 ticks by default).
-        action, _delta_force_reason = _apply_delta_force_fallback(
-            action,
-            decision_history,
-            _action_cooldowns,
-            window=RETRY_LIMITS.get("AGENT8_FORCE_FALLBACK_WINDOW", 2),
-            cooldown_ticks=RETRY_LIMITS.get("AGENT8_ROUTE_COOLDOWN_TICKS", 2),
-        )
-        if _delta_force_reason:
-            console.print(f"  [DeltaForceFallback] {action} ← {_delta_force_reason}")
-            decision["action"] = action
-            targeted_prompt = (
-                f"[DELTA FORCE FALLBACK: {_delta_force_reason}] " + targeted_prompt
-            )
-
-        # 4d. Hard route gate with cooldown (falsifiable routing).
-        action, _hard_reason = _apply_hard_route_gate(
-            action,
-            _error_subtype,
-            decision_history,
-            _action_cooldowns,
-            window=RETRY_LIMITS.get("AGENT8_ROUTE_NO_DELTA_WINDOW", 3),
-            cooldown_ticks=RETRY_LIMITS.get("AGENT8_ROUTE_COOLDOWN_TICKS", 2),
-        )
-        if _hard_reason:
-            console.print(f"  [HardRouteGate] {action} ← {_hard_reason}")
-            decision["action"] = action
-            targeted_prompt = (
-                f"[HARD ROUTE GATE: {_hard_reason}] " + targeted_prompt
-            )
-
-        # Hard trigger: same error_signature too many consecutive ticks → human gate.
-        # Kept as a final safety net on top of _check_anti_loop.
-        if error_sig and error_sig == _last_error_sig:
-            _consecutive_same_error += 1
-        else:
-            _consecutive_same_error = 1
-            _last_error_sig = error_sig
-
-        if _consecutive_same_error >= AGENT8_HUMAN_GATE_CONSECUTIVE_THRESHOLD:
-            if action != "human_missing_assumption":
-                console.print(
-                    f"  [Agent8] HARD TRIGGER: same error {_consecutive_same_error}× "
-                    "→ forcing human_missing_assumption"
-                )
-                action = "human_missing_assumption"
+            if _antiloop_reason:
+                console.print(f"  [AntiLoop] {action} ← {_antiloop_reason}")
                 decision["action"] = action
+                targeted_prompt = (
+                    f"[FORCED by anti-loop: {_antiloop_reason}] " + targeted_prompt
+                )
+
+            # 4b. Route downweight: subtype + action with zero error-count progress
+            action, _downweight_reason = _check_route_downweight(
+                action, _error_subtype, decision_history,
+            )
+            if _downweight_reason:
+                console.print(f"  [RouteDownweight] {action} ← {_downweight_reason}")
+                decision["action"] = action
+                targeted_prompt = (
+                    f"[ROUTE DOWNWEIGHTED: {_downweight_reason}] " + targeted_prompt
+                )
+
+            # 4c. Explicit delta-based force fallback chain (2 ticks by default).
+            action, _delta_force_reason = _apply_delta_force_fallback(
+                action,
+                decision_history,
+                _action_cooldowns,
+                window=RETRY_LIMITS.get("AGENT8_FORCE_FALLBACK_WINDOW", 2),
+                cooldown_ticks=RETRY_LIMITS.get("AGENT8_ROUTE_COOLDOWN_TICKS", 2),
+            )
+            if _delta_force_reason:
+                console.print(f"  [DeltaForceFallback] {action} ← {_delta_force_reason}")
+                decision["action"] = action
+                targeted_prompt = (
+                    f"[DELTA FORCE FALLBACK: {_delta_force_reason}] " + targeted_prompt
+                )
+
+            # 4d. Hard route gate with cooldown (falsifiable routing).
+            action, _hard_reason = _apply_hard_route_gate(
+                action,
+                _error_subtype,
+                decision_history,
+                _action_cooldowns,
+                window=RETRY_LIMITS.get("AGENT8_ROUTE_NO_DELTA_WINDOW", 3),
+                cooldown_ticks=RETRY_LIMITS.get("AGENT8_ROUTE_COOLDOWN_TICKS", 2),
+            )
+            if _hard_reason:
+                console.print(f"  [HardRouteGate] {action} ← {_hard_reason}")
+                decision["action"] = action
+                targeted_prompt = (
+                    f"[HARD ROUTE GATE: {_hard_reason}] " + targeted_prompt
+                )
 
         # Compile-first subtype routing:
         # When exit=1 && sorry=0, route based on classified error subtype
@@ -2117,32 +2238,84 @@ def run_agent8_loop(
                 )
 
         # 4e. Stage-2 APOLLO decomposition policy gate.
-        _prefer_apollo, _apollo_policy_reason = _should_prefer_apollo_decompose(
-            action,
-            error_sig,
-            decision_history,
-            blocked_sorry_count=_fresh_blocked,
-            action_cooldowns=_action_cooldowns,
-        )
-        if _prefer_apollo:
-            action = "apollo_decompose_repair"
-            decision["action"] = action
-            decision["trigger_reason"] = _apollo_policy_reason
-            console.print(
-                "  [Agent8] APOLLO policy trigger: "
-                f"{_apollo_policy_reason} -> action=apollo_decompose_repair"
+        if not _active_subproblem_node:
+            _prefer_apollo, _apollo_policy_reason = _should_prefer_apollo_decompose(
+                action,
+                error_sig,
+                decision_history,
+                blocked_sorry_count=_fresh_blocked,
+                action_cooldowns=_action_cooldowns,
             )
-            targeted_prompt = (
-                f"[APOLLO POLICY TRIGGER: {_apollo_policy_reason}] " + targeted_prompt
-            )
+            if _prefer_apollo:
+                action = "apollo_decompose_repair"
+                decision["action"] = action
+                decision["trigger_reason"] = _apollo_policy_reason
+                console.print(
+                    "  [Agent8] APOLLO policy trigger: "
+                    f"{_apollo_policy_reason} -> action=apollo_decompose_repair"
+                )
+                targeted_prompt = (
+                    f"[APOLLO POLICY TRIGGER: {_apollo_policy_reason}] " + targeted_prompt
+                )
+
+        # Hard trigger: same signature should attempt APOLLO decomposition once
+        # before escalating to human gate.
+        _norm_sig = _normalize_error_signature(error_sig)
+        if error_sig and error_sig == _last_error_sig:
+            _consecutive_same_error += 1
+        else:
+            _consecutive_same_error = 1
+            _last_error_sig = error_sig
+        if not _active_subproblem_node and _consecutive_same_error >= AGENT8_HUMAN_GATE_CONSECUTIVE_THRESHOLD:
+            if (
+                AGENT8_APOLLO_DECOMPOSE_ENABLED
+                and _norm_sig
+                and _norm_sig not in _decompose_attempted_for_signature
+                and int(_action_cooldowns.get("apollo_decompose_repair", 0)) <= 0
+            ):
+                action = "apollo_decompose_repair"
+                decision["action"] = action
+                decision["trigger_reason"] = (
+                    f"hard-trigger signature freeze {_consecutive_same_error}×; "
+                    "forcing one APOLLO decomposition attempt before human gate"
+                )
+                targeted_prompt = (
+                    f"[FORCED DECOMPOSE BEFORE HUMAN GATE] "
+                    f"signature={_norm_sig[:80]}\n\n{targeted_prompt}"
+                )
+            elif action != "human_missing_assumption":
+                console.print(
+                    f"  [Agent8] HARD TRIGGER: same error {_consecutive_same_error}× "
+                    "→ forcing human_missing_assumption"
+                )
+                action = "human_missing_assumption"
+                decision["action"] = action
 
         # 5. Dispatch — capture state BEFORE action for delta computation.
-        _errors_before: str = current_errors[:300]
+        _errors_before: str = current_errors
         _sorry_before: int = _current_sorry_count
+        _top_error_count_before = _fresh_error_count
         outcome: dict = {"outcome": "unknown"}
         result: dict = {}
+        _direct_apply_errors: list[str] = []
 
         try:
+            # Safety check: ensure decision is a valid dict
+            if not isinstance(decision, dict):
+                console.print("  [Agent8] WARNING: decision is not a dict, defaulting to agent3_tactical")
+                action = "agent3_tactical"
+                decision = {
+                    "action": action,
+                    "priority_level": "P2",
+                    "reason": "Decision dict was invalid",
+                    "targeted_prompt": "Fix the proof",
+                    "error_signature": error_sig,
+                    "hypothesis": "Decision parsing failed",
+                    "evidence": [],
+                    "confidence": 0.5,
+                    "counterfactual": "",
+                }
+            
             if action == "agent3_tactical":
                 console.print("  [Agent8→Agent3] Dispatching tactical fix...")
                 _a9_thm_ctx = _build_agent9_theorem_context(
@@ -2167,60 +2340,78 @@ def run_agent8_loop(
                     compile_first_mode=_compile_first_mode,
                     transactional_mode=(_error_subtype == _SUBTYPE_PROOF_API_MISMATCH),
                 )
+                # Safety check for result dict
+                if not isinstance(result, dict):
+                    result = {"exit_code": 1, "sorry_count": -1, "errors": "Agent3 result was not a dict"}
                 outcome = {
-                    "outcome": "success" if result["exit_code"] == 0 and result["sorry_count"] == 0 else "failed",
-                    "exit_code": result["exit_code"],
-                    "sorry_count": result["sorry_count"],
+                    "outcome": "success" if result.get("exit_code", 1) == 0 and result.get("sorry_count", -1) == 0 else "failed",
+                    "exit_code": result.get("exit_code", 1),
+                    "sorry_count": result.get("sorry_count", -1),
+                    "error_count": _count_error_lines(_coerce_errors_text(result.get("errors", ""))),
                 }
-                current_errors = result.get("errors", current_errors)
+                current_errors = _coerce_errors_text(result.get("errors", current_errors))
 
             elif action == "agent7_signature":
                 console.print("  [Agent8→Agent7] Dispatching signature audit...")
-                a7_prompt = decision.get("agent7_targeted_prompt", targeted_prompt)
+                a7_prompt = decision.get("agent7_targeted_prompt", targeted_prompt) if isinstance(decision, dict) else targeted_prompt
                 a7_plan, _a7_raw = _agent8_run_agent7(
                     target_file, current_errors, a7_prompt
                 )
                 # Execute direct_apply steps
-                if a7_plan:
+                if a7_plan and isinstance(a7_plan, dict):
                     exec_registry = ToolRegistry()
                     exec_registry.register_default_tools()
-                    for step in a7_plan.get("ordered_steps", []):
-                        if step.get("direct_apply") and step.get("tool") == "edit_file_patch":
-                            req = step.get("required_args", {})
-                            if req.get("old_str") and req.get("new_str"):
-                                try:
-                                    exec_registry.call(
-                                        "edit_file_patch",
-                                        path=req.get("path", target_file),
-                                        old_str=req["old_str"],
-                                        new_str=req["new_str"],
-                                    )
-                                except Exception:
-                                    pass
+                    ordered_steps = a7_plan.get("ordered_steps", [])
+                    if isinstance(ordered_steps, list):
+                        for step in ordered_steps:
+                            if isinstance(step, dict) and step.get("direct_apply") and step.get("tool") == "edit_file_patch":
+                                req = step.get("required_args", {})
+                                if isinstance(req, dict) and req.get("old_str") and req.get("new_str"):
+                                    try:
+                                        exec_registry.call(
+                                            "edit_file_patch",
+                                            path=req.get("path", target_file),
+                                            old_str=req["old_str"],
+                                            new_str=req["new_str"],
+                                        )
+                                    except Exception as _exc:
+                                        _direct_apply_errors.append(
+                                            f"agent7_signature direct_apply failed: {_exc}"
+                                        )
 
                 from orchestrator.tools import run_lean_verify
                 verify = run_lean_verify(target_file)
+                verify_exit = int(verify.get("exit_code", 1)) if isinstance(verify, dict) else 1
+                verify_sorry = int(verify.get("sorry_count", -1)) if isinstance(verify, dict) else -1
                 outcome = {
-                    "outcome": "success" if int(verify.get("exit_code", 1)) == 0 and int(verify.get("sorry_count", -1)) == 0 else "failed",
-                    "exit_code": int(verify.get("exit_code", 1)),
-                    "sorry_count": int(verify.get("sorry_count", -1)),
+                    "outcome": "success" if verify_exit == 0 and verify_sorry == 0 else "failed",
+                    "exit_code": verify_exit,
+                    "sorry_count": verify_sorry,
+                    "error_count": _error_count_from_verify(
+                        verify if isinstance(verify, dict) else {},
+                        _coerce_errors_text(verify.get("errors", "") if isinstance(verify, dict) else ""),
+                    ),
                 }
-                current_errors = str(verify.get("errors", current_errors))
+                current_errors = _coerce_errors_text(verify.get("errors", current_errors) if isinstance(verify, dict) else current_errors)
 
             elif action == "agent7_then_agent6":
                 console.print("  [Agent8→Agent7→Agent6] Dispatching signature + glue...")
-                a7_prompt = decision.get("agent7_targeted_prompt", targeted_prompt)
-                a6_prompt = decision.get("agent6_targeted_prompt", targeted_prompt)
+                a7_prompt = decision.get("agent7_targeted_prompt", targeted_prompt) if isinstance(decision, dict) else targeted_prompt
+                a6_prompt = decision.get("agent6_targeted_prompt", targeted_prompt) if isinstance(decision, dict) else targeted_prompt
                 result = _agent8_run_agent7_then_agent6(
                     target_file, current_errors, a7_prompt, a6_prompt,
                     agent9_plan=agent9_plan,
                 )
+                # Safety check for result dict
+                if not isinstance(result, dict):
+                    result = {"exit_code": 1, "sorry_count": -1, "errors": "Agent7→Agent6 result was not a dict"}
                 outcome = {
-                    "outcome": "success" if result["exit_code"] == 0 and result["sorry_count"] == 0 else "failed",
-                    "exit_code": result["exit_code"],
-                    "sorry_count": result["sorry_count"],
+                    "outcome": "success" if result.get("exit_code", 1) == 0 and result.get("sorry_count", -1) == 0 else "failed",
+                    "exit_code": result.get("exit_code", 1),
+                    "sorry_count": result.get("sorry_count", -1),
+                    "error_count": _count_error_lines(_coerce_errors_text(result.get("errors", ""))),
                 }
-                current_errors = result.get("errors", current_errors)
+                current_errors = _coerce_errors_text(result.get("errors", current_errors))
 
                 # Update per-lemma status from the dispatch result.
                 _max_lemma_att = RETRY_LIMITS.get("AGENT8_MAX_LEMMA_ATTEMPTS", 3)
@@ -2235,7 +2426,7 @@ def run_agent8_loop(
                             )
                         elif result.get("lemma_proven"):
                             _pending_lemma_status[_lname]["status"] = "success"
-                        elif outcome["outcome"] != "dispatch_error":
+                        elif outcome.get("outcome") != "dispatch_error":
                             # A real attempt was made but lemma is not proven yet.
                             _pending_lemma_status[_lname]["attempts"] += 1
                             if _pending_lemma_status[_lname]["attempts"] >= _max_lemma_att:
@@ -2250,6 +2441,8 @@ def run_agent8_loop(
                 from orchestrator.apollo_repair import run_apollo_decompose_repair
                 from orchestrator.tools import run_lean_verify
 
+                if _norm_sig:
+                    _decompose_attempted_for_signature.add(_norm_sig)
                 apollo_result = run_apollo_decompose_repair(
                     target_file=target_file,
                     current_errors=current_errors,
@@ -2272,9 +2465,16 @@ def run_agent8_loop(
                         "sorry_count": int(verify.get("sorry_count", -1)),
                         "apollo_trigger_reason": decision.get("trigger_reason", ""),
                         "apollo_summary": apollo_result.get("summary", ""),
+                        "error_count": _error_count_from_verify(
+                            verify,
+                            _coerce_errors_text(verify.get("errors", "")),
+                        ),
                     }
-                    current_errors = str(verify.get("errors", current_errors))
+                    current_errors = _coerce_errors_text(verify.get("errors", current_errors))
                 else:
+                    _graph_nodes = apollo_result.get("subproblem_graph", []) or []
+                    if isinstance(_graph_nodes, list) and _graph_nodes:
+                        _serial_subproblem_queue = [n for n in _graph_nodes if isinstance(n, dict)]
                     # Deterministic fallback map required by Stage-2 policy.
                     _fallback_action = _apollo_fallback_from_failure_kind(
                         _apollo_failure_kind
@@ -2305,8 +2505,10 @@ def run_agent8_loop(
                                                 old_str=req["old_str"],
                                                 new_str=req["new_str"],
                                             )
-                                        except Exception:
-                                            pass
+                                        except Exception as _exc:
+                                            _direct_apply_errors.append(
+                                                f"apollo_fallback(agent7) direct_apply failed: {_exc}"
+                                            )
                         verify = run_lean_verify(target_file)
                         outcome = {
                             "outcome": "success"
@@ -2317,8 +2519,12 @@ def run_agent8_loop(
                             "sorry_count": int(verify.get("sorry_count", -1)),
                             "apollo_fallback_action": _fallback_action,
                             "apollo_failure_kind": _apollo_failure_kind,
+                            "error_count": _error_count_from_verify(
+                                verify,
+                                _coerce_errors_text(verify.get("errors", "")),
+                            ),
                         }
-                        current_errors = str(verify.get("errors", current_errors))
+                        current_errors = _coerce_errors_text(verify.get("errors", current_errors))
                     elif _fallback_action == "agent7_then_agent6":
                         a7_prompt = (
                             f"[APOLLO fallback from {_apollo_failure_kind}] "
@@ -2340,8 +2546,11 @@ def run_agent8_loop(
                             "sorry_count": result["sorry_count"],
                             "apollo_fallback_action": _fallback_action,
                             "apollo_failure_kind": _apollo_failure_kind,
+                            "error_count": _count_error_lines(
+                                _coerce_errors_text(result.get("errors", ""))
+                            ),
                         }
-                        current_errors = result.get("errors", current_errors)
+                        current_errors = _coerce_errors_text(result.get("errors", current_errors))
                     else:
                         from orchestrator.phase3a_agent9 import run_agent9_replan as _run_a9_replan
                         _new_plan = _run_a9_replan(
@@ -2363,8 +2572,12 @@ def run_agent8_loop(
                             "sorry_count": int(_replan_verify.get("sorry_count", _current_sorry_count)),
                             "apollo_fallback_action": _fallback_action,
                             "apollo_failure_kind": _apollo_failure_kind,
+                            "error_count": _error_count_from_verify(
+                                _replan_verify,
+                                _coerce_errors_text(_replan_verify.get("errors", "")),
+                            ),
                         }
-                        current_errors = str(_replan_verify.get("errors", current_errors))
+                        current_errors = _coerce_errors_text(_replan_verify.get("errors", current_errors))
 
             elif action == "agent9_replan":
                 console.print("  [Agent8→Agent9] Dispatching strategy re-planning via Agent9...")
@@ -2400,8 +2613,12 @@ def run_agent8_loop(
                     "sorry_count": int(
                         _replan_verify.get("sorry_count", _current_sorry_count)
                     ),
+                    "error_count": _error_count_from_verify(
+                        _replan_verify,
+                        _coerce_errors_text(_replan_verify.get("errors", "")),
+                    ),
                 }
-                current_errors = str(_replan_verify.get("errors", current_errors))
+                current_errors = _coerce_errors_text(_replan_verify.get("errors", current_errors))
 
             elif action == "human_missing_assumption":
                 console.print(
@@ -2427,8 +2644,8 @@ def run_agent8_loop(
                     "main_error_signature_changed": False,
                     "errors_before": _errors_before,
                     "errors_after": _errors_before,  # no dispatch happened
-                    "top_error_count_before": _count_error_lines(_errors_before),
-                    "top_error_count_after": _count_error_lines(_errors_before),
+                    "top_error_count_before": _top_error_count_before,
+                    "top_error_count_after": _top_error_count_before,
                     "error_count_delta": 0,
                     "action_cooldowns": dict(_action_cooldowns),
                     "sorry_delta": 0,
@@ -2451,13 +2668,16 @@ def run_agent8_loop(
                 "outcome": "network_failure" if _is_net else "dispatch_error",
                 "error": str(exc),
             }
+        if _direct_apply_errors:
+            outcome["direct_apply_errors"] = list(_direct_apply_errors)
 
         # Update running sorry count from outcome (keep previous on dispatch_error).
         _current_sorry_count = int(outcome.get("sorry_count", _current_sorry_count))
-        _errors_after: str = current_errors[:300]
+        _errors_after: str = current_errors
         _sorry_delta: int = _current_sorry_count - _sorry_before
-        _top_error_count_before = _count_error_lines(_errors_before)
-        _top_error_count_after = _count_error_lines(_errors_after)
+        _top_error_count_after = int(
+            outcome.get("error_count", _count_error_lines(_errors_after))
+        )
         _error_count_delta = _top_error_count_after - _top_error_count_before
         _main_sig_changed = _signature_changed(_errors_before, _errors_after)
         _route_effective: bool | None
@@ -2466,6 +2686,14 @@ def run_agent8_loop(
             _route_effective = None
         else:
             _route_effective = _top_error_count_after < _top_error_count_before
+        if (
+            _active_subproblem_node
+            and outcome.get("outcome") not in {"success", "replan_done"}
+        ):
+            _node_id = str(_active_subproblem_node.get("id", ""))
+            _attempts = int(_serial_subproblem_attempts.get(_node_id, 0))
+            if _attempts < _serial_max_attempts:
+                _serial_subproblem_queue.append(_active_subproblem_node)
         # api_shape_verified: True if Agent3 was dispatched for proof_api_mismatch
         # and transactional report contains required proof of lookup/patch/verify.
         _tx_valid = bool(isinstance(result, dict) and result.get("transaction_valid"))
@@ -2495,6 +2723,22 @@ def run_agent8_loop(
                 if int(_action_cooldowns.get(action, 0)) > 0
                 else "Active"
             ),
+            node_id=(
+                str(_active_subproblem_node.get("id", ""))
+                if _active_subproblem_node
+                else ""
+            ),
+            node_kind=(
+                str(_active_subproblem_node.get("kind", ""))
+                if _active_subproblem_node
+                else ""
+            ),
+            node_attempt=(
+                int(_serial_subproblem_attempts.get(str(_active_subproblem_node.get("id", "")), 0))
+                if _active_subproblem_node
+                else 0
+            ),
+            queue_remaining=len(_serial_subproblem_queue),
         )
 
         # 6. Record decision
@@ -2517,6 +2761,17 @@ def run_agent8_loop(
             "action_cooldowns": dict(_action_cooldowns),
             "sorry_delta": _sorry_delta,
             "lemma_status": dict(_pending_lemma_status),  # snapshot at this tick
+            "subproblem_node_id": (
+                str(_active_subproblem_node.get("id", ""))
+                if _active_subproblem_node
+                else ""
+            ),
+            "subproblem_kind": (
+                str(_active_subproblem_node.get("kind", ""))
+                if _active_subproblem_node
+                else ""
+            ),
+            "subproblem_queue_remaining": len(_serial_subproblem_queue),
             **outcome,
         })
         _debug_log(
@@ -2542,7 +2797,7 @@ def run_agent8_loop(
                 )
                 return True, current_plan, ""
             # Not actually clean — update errors and continue
-            current_errors = str(verify.get("errors", current_errors))
+            current_errors = _coerce_errors_text(verify.get("errors", current_errors))
             console.print(
                 f"  [Agent8] Reported success but verify shows "
                 f"exit={exit_code}, sorry={sorry_count}. Continuing..."

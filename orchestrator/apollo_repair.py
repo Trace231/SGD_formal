@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
@@ -32,52 +31,56 @@ def _flatten_apollo_errors(verify_result: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+_INTERFACE_MARKERS = (
+    "invalid field",
+    "application type mismatch",
+    "unknown constant",
+    "unknown identifier",
+    "field notation",
+    "invalid projection",
+)
+_INSTANCE_MARKERS = (
+    "failed to synthesize instance",
+    "typeclass instance problem is stuck",
+)
+_GLUE_MARKERS = (
+    "missing glue",
+    "bridge lemma",
+    "no such lemma",
+    "not found in codebase",
+    "unknown theorem",
+    "missing glue bridge candidates",
+)
+_STRATEGY_MARKERS = (
+    "tactic failed",
+    "unsolved goals",
+    "rewrite failed",
+    "did not simplify",
+    "no goals to be solved",
+)
+
+
 def classify_failure_kind(errors_text: str) -> tuple[str, str, str]:
     """Classify failure into deterministic routing kinds for Agent8."""
     t = str(errors_text or "").strip()
     hay = t.lower()
     snippet = t.splitlines()[0][:240] if t else ""
 
-    if any(
-        m in hay
-        for m in (
-            "invalid field",
-            "application type mismatch",
-            "declaration",
-            "unknown constant",
-            "unknown identifier",
-        )
-    ):
-        return "interface_failure", "declaration/API/type-shape mismatch markers found", snippet
+    # Precedence: instance > interface > glue > strategy.
+    # This avoids over-routing interface for clear typeclass failures.
+    if any(m in hay for m in _INSTANCE_MARKERS):
+        return "instance_failure", "typeclass synthesis failure markers found (confidence=0.95)", snippet
 
-    if "failed to synthesize instance" in hay:
-        return "instance_failure", "typeclass synthesis failure markers found", snippet
+    if any(m in hay for m in _INTERFACE_MARKERS):
+        return "interface_failure", "declaration/API/type-shape mismatch markers found (confidence=0.90)", snippet
 
-    if any(
-        m in hay
-        for m in (
-            "missing glue",
-            "bridge lemma",
-            "no such lemma",
-            "not found in codebase",
-            "unknown theorem",
-        )
-    ):
-        return "glue_failure", "missing bridge/glue markers found", snippet
+    if any(m in hay for m in _GLUE_MARKERS):
+        return "glue_failure", "missing bridge/glue markers found (confidence=0.85)", snippet
 
-    if any(
-        m in hay
-        for m in (
-            "tactic failed",
-            "unsolved goals",
-            "rewrite failed",
-            "did not simplify",
-            "no goals to be solved",
-        )
-    ):
-        return "strategy_failure", "proof-body tactic/strategy failure markers found", snippet
+    if any(m in hay for m in _STRATEGY_MARKERS):
+        return "strategy_failure", "proof-body tactic/strategy failure markers found (confidence=0.75)", snippet
 
-    return "strategy_failure", "fallback strategy classification (insufficient structural evidence)", snippet
+    return "strategy_failure", "fallback strategy classification (confidence=0.40)", snippet
 
 
 def _next_route_hint(failure_kind: str) -> str:
@@ -87,6 +90,53 @@ def _next_route_hint(failure_kind: str) -> str:
         "glue_failure": "agent7_then_agent6",
         "strategy_failure": "agent9_replan",
     }.get(failure_kind, "agent9_replan")
+
+
+def build_subproblem_graph(
+    *,
+    current_errors: str,
+    error_subtype: str = "",
+    lemma_count: int = 0,
+) -> list[dict[str, Any]]:
+    """Build an APOLLO-aligned serial subproblem graph for Agent8."""
+    errors_text = str(current_errors or "")
+    kind, _, snippet = classify_failure_kind(errors_text)
+    graph: list[dict[str, Any]] = []
+    idx = 1
+
+    def _push(kind_name: str, priority: int, target: str, evidence: str) -> None:
+        nonlocal idx
+        graph.append(
+            {
+                "id": f"sp-{idx:02d}-{kind_name}",
+                "kind": kind_name,
+                "priority": priority,
+                "target": target,
+                "evidence": evidence[:240],
+            }
+        )
+        idx += 1
+
+    # Compile blockers first.
+    if error_subtype == "declaration_api_mismatch" or kind in {"interface_failure", "instance_failure"}:
+        _push("interface_signature", 10, "declaration/proof header", snippet or "interface markers")
+    if error_subtype == "proof_api_mismatch":
+        _push("proof_api_shape", 20, "proof callsites", snippet or "proof API markers")
+
+    # Glue blockers next.
+    if kind == "glue_failure" or lemma_count > 0:
+        _push("missing_glue", 30, f"bridge_lemmas(count={lemma_count})", snippet or "glue markers")
+
+    # Local tactic and strategy tails.
+    if kind == "strategy_failure":
+        _push("local_tactic_repair", 40, "proof body", snippet or "tactic markers")
+        _push("global_strategy", 50, "overall theorem strategy", "local route stalled")
+
+    if not graph:
+        _push("global_strategy", 50, "overall theorem strategy", snippet or "insufficient evidence")
+
+    graph.sort(key=lambda n: int(n.get("priority", 999)))
+    return graph
 
 
 def run_apollo_decompose_repair(
@@ -103,6 +153,11 @@ def run_apollo_decompose_repair(
 
         path = (PROJECT_ROOT / path).resolve()
     if not path.exists():
+        graph = build_subproblem_graph(
+            current_errors=current_errors,
+            error_subtype=error_subtype,
+            lemma_count=0,
+        )
         return {
             "status": "failed",
             "failure_kind": "interface_failure",
@@ -110,6 +165,7 @@ def run_apollo_decompose_repair(
             "raw_error_snippet": str(target_file),
             "next_route_hint": "agent7_signature",
             "summary": "APOLLO route aborted: target file missing.",
+            "subproblem_graph": graph,
         }
 
     source = path.read_text(encoding="utf-8")
@@ -125,6 +181,11 @@ def run_apollo_decompose_repair(
         base_verify = verifier(source)
     except Exception as exc:
         kind, reason, snippet = classify_failure_kind(str(exc) or current_errors)
+        graph = build_subproblem_graph(
+            current_errors=str(exc) or current_errors,
+            error_subtype=error_subtype,
+            lemma_count=0,
+        )
         return {
             "status": "failed",
             "failure_kind": kind,
@@ -133,6 +194,7 @@ def run_apollo_decompose_repair(
             "next_route_hint": _next_route_hint(kind),
             "summary": f"APOLLO verifier unavailable: {exc}",
             "metrics": metrics,
+            "subproblem_graph": graph,
         }
 
     working = source
@@ -148,6 +210,7 @@ def run_apollo_decompose_repair(
             "next_route_hint": "",
             "summary": "Already complete under APOLLO verifier.",
             "metrics": metrics,
+            "subproblem_graph": [],
         }
 
     # Step 1: syntax correction
@@ -167,6 +230,11 @@ def run_apollo_decompose_repair(
         final_verify = verifier(working)
     except Exception as exc:
         kind, reason, snippet = classify_failure_kind(str(exc) or current_errors)
+        graph = build_subproblem_graph(
+            current_errors=str(exc) or current_errors,
+            error_subtype=error_subtype,
+            lemma_count=0,
+        )
         return {
             "status": "failed",
             "failure_kind": kind,
@@ -175,6 +243,7 @@ def run_apollo_decompose_repair(
             "next_route_hint": _next_route_hint(kind),
             "summary": f"APOLLO final verify call failed: {exc}",
             "metrics": metrics,
+            "subproblem_graph": graph,
         }
 
     metrics["final_pass"] = bool(final_verify.get("pass", False))
@@ -193,6 +262,7 @@ def run_apollo_decompose_repair(
             "next_route_hint": "",
             "summary": "APOLLO decomposition completed and file updated.",
             "metrics": metrics,
+            "subproblem_graph": [],
         }
 
     # Step 5: failure typing + optional sublemma extraction signal.
@@ -203,6 +273,11 @@ def run_apollo_decompose_repair(
     else:
         inferred_error = flattened or current_errors
     kind, reason, snippet = classify_failure_kind(inferred_error)
+    graph = build_subproblem_graph(
+        current_errors=inferred_error,
+        error_subtype=error_subtype,
+        lemma_count=int(lemma_meta.get("count", 0)),
+    )
     return {
         "status": "failed",
         "failure_kind": kind,
@@ -214,5 +289,6 @@ def run_apollo_decompose_repair(
             f"failure_kind={kind}, lemmas={int(lemma_meta.get('count', 0))}."
         ),
         "metrics": metrics,
+        "subproblem_graph": graph,
     }
 
