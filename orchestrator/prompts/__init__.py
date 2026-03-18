@@ -10,26 +10,46 @@ from __future__ import annotations
 from orchestrator.config import AGENT7_ROUTING_CRITERIA, DOCS_DIR
 from orchestrator.file_io import load_file
 
+_DEFAULT_META_PROMPT_A = """## Meta-Prompt A
+Produce a Lean-first proof plan for the requested stochastic optimization algorithm.
+Keep the plan concise, prefer reusable infrastructure over ad hoc local lemmas, and
+explicitly mark any open proof obligations that still need verification.
+"""
+
+_DEFAULT_META_PROMPT_B = """## Meta-Prompt B
+Persist only the minimum durable artifacts from a completed proof. Prefer concise
+documentation, keep glue extraction conservative, and avoid assuming that any
+non-essential docs still exist.
+"""
+
+
+def _load_meta_prompts_content() -> str:
+    """Load ``docs/META_PROMPTS.md`` with a minimal built-in fallback."""
+    try:
+        return load_file(DOCS_DIR / "META_PROMPTS.md")
+    except FileNotFoundError:
+        return f"{_DEFAULT_META_PROMPT_A}\n\n{_DEFAULT_META_PROMPT_B}"
+
 # ---------------------------------------------------------------------------
 # Meta-Prompt loaders (raw text from docs/)
 # ---------------------------------------------------------------------------
 
 def load_meta_prompt_a() -> str:
     """Return the raw Meta-Prompt A template from ``docs/META_PROMPTS.md``."""
-    content = load_file(DOCS_DIR / "META_PROMPTS.md")
+    content = _load_meta_prompts_content()
     start = content.find("## Meta-Prompt A")
     end = content.find("## Meta-Prompt B")
     if start == -1:
-        return content
+        return _DEFAULT_META_PROMPT_A
     return content[start:end].strip() if end != -1 else content[start:].strip()
 
 
 def load_meta_prompt_b() -> str:
     """Return the raw Meta-Prompt B template from ``docs/META_PROMPTS.md``."""
-    content = load_file(DOCS_DIR / "META_PROMPTS.md")
+    content = _load_meta_prompts_content()
     start = content.find("## Meta-Prompt B")
     if start == -1:
-        return content
+        return _DEFAULT_META_PROMPT_B
     return content[start:].strip()
 
 
@@ -721,6 +741,9 @@ Before writing your protocol, for EVERY symbol involved in the error:
 
 This is NON-NEGOTIABLE. Do not guess a signature — verify it with check_lean_expr first.
 The tool is fast (reuses pre-built .olean files). It prevents wrong direct_apply patches.
+Before final JSON, re-check the CURRENT target block and ensure every symbol in
+`mismatch_table` is backed by lookup/check_lean_expr evidence from THIS run.
+If a symbol is not evidenced in this run, do not emit it in the protocol.
 
 Examples of check_lean_expr usage:
   check_lean_expr("integral_nonneg")

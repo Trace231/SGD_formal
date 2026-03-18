@@ -1,6 +1,7 @@
 """Regression tests for APOLLO-aligned Agent3 sampling/search policy."""
 
 from orchestrator import phase3_agent8 as a8
+from orchestrator import phase3_agent3 as a3
 
 
 def _mk_target(tmp_path):
@@ -15,59 +16,37 @@ def test_agent8_result_score_prefers_clean_outcome():
     assert a8._agent8_result_score(clean) < a8._agent8_result_score(noisy)
 
 
-def test_sampling_early_stops_on_clean_candidate(monkeypatch, tmp_path):
-    monkeypatch.setattr(a8, "AGENT8_AGENT3_SAMPLING_ENABLED", True)
-    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_AGENT3_SAMPLE_CANDIDATES", 3)
-    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_AGENT3_SAMPLE_MAX_CANDIDATES", 3)
-    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_AGENT3_SAMPLE_DEGRADE_TICKS", 2)
-    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_AGENT3_SAMPLE_MAX_TURNS_PER_CANDIDATE", 8)
+def test_agent8_budget_wrapper_delegates_to_agent3_kernel(monkeypatch, tmp_path):
+    captured = {}
 
-    calls: list[int] = []
+    def _fake_kernel(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return {"exit_code": 0, "sorry_count": 0, "errors": "", "candidate_id": "d1.c1"}
 
-    def _fake_single(*_args, **kwargs):
-        idx = int(kwargs["candidate_index"])
-        calls.append(idx)
-        if idx == 2:
-            return {"exit_code": 0, "sorry_count": 0, "errors": ""}
-        return {"exit_code": 1, "sorry_count": 3, "errors": "err"}
-
-    monkeypatch.setattr(a8, "_agent8_run_agent3_single", _fake_single)
+    monkeypatch.setattr(a3, "run_agent3_search_kernel", _fake_kernel)
     out = a8._agent8_run_agent3(_mk_target(tmp_path), "plan", "prompt", None)
     assert out["exit_code"] == 0
-    assert out["sorry_count"] == 0
-    assert calls == [1, 2]
+    assert out["candidate_id"] == "d1.c1"
+    assert captured["kwargs"]["run_single_candidate"] is a8._agent8_run_agent3_single
 
 
-def test_sampling_non_improving_candidates_trigger_cutoff(monkeypatch, tmp_path):
-    monkeypatch.setattr(a8, "AGENT8_AGENT3_SAMPLING_ENABLED", True)
-    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_AGENT3_SAMPLE_CANDIDATES", 3)
-    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_AGENT3_SAMPLE_MAX_CANDIDATES", 3)
-    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_AGENT3_SAMPLE_DEGRADE_TICKS", 1)
-    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_AGENT3_SAMPLE_MAX_TURNS_PER_CANDIDATE", 8)
+def test_agent8_wrapper_passes_error_subtype_to_kernel(monkeypatch, tmp_path):
+    seen = {}
 
-    calls: list[int] = []
-
-    def _fake_single(*_args, **kwargs):
-        calls.append(int(kwargs["candidate_index"]))
-        return {"exit_code": 1, "sorry_count": 5, "errors": "same"}
-
-    monkeypatch.setattr(a8, "_agent8_run_agent3_single", _fake_single)
-    _ = a8._agent8_run_agent3(_mk_target(tmp_path), "plan", "prompt", None)
-    # First sample sets baseline, second non-improving sample triggers cutoff.
-    assert calls == [1, 2]
-
-
-def test_sampling_disabled_falls_back_to_single_path(monkeypatch, tmp_path):
-    monkeypatch.setattr(a8, "AGENT8_AGENT3_SAMPLING_ENABLED", False)
-    calls: list[tuple[int, int]] = []
-
-    def _fake_single(*_args, **kwargs):
-        calls.append((int(kwargs["candidate_index"]), int(kwargs["candidate_total"])))
+    def _fake_kernel(*args, **kwargs):
+        seen["error_subtype"] = kwargs.get("error_subtype")
         return {"exit_code": 1, "sorry_count": 1, "errors": "e"}
 
-    monkeypatch.setattr(a8, "_agent8_run_agent3_single", _fake_single)
-    _ = a8._agent8_run_agent3(_mk_target(tmp_path), "plan", "prompt", None)
-    assert calls == [(1, 1)]
+    monkeypatch.setattr(a3, "run_agent3_search_kernel", _fake_kernel)
+    _ = a8._agent8_run_agent3(
+        _mk_target(tmp_path),
+        "plan",
+        "prompt",
+        None,
+        error_subtype="proof_api_mismatch",
+    )
+    assert seen["error_subtype"] == "proof_api_mismatch"
 
 
 def test_patch_line_span_estimator_and_limit_guard():

@@ -101,19 +101,28 @@ LEAN_VERIFY_BACKEND = (
     _LEAN_VERIFY_BACKEND_RAW if _LEAN_VERIFY_BACKEND_RAW in {"lake", "apollo"} else "lake"
 )
 
+# Strict mode for backend validation: when enabled, backend misconfiguration is
+# surfaced as explicit failure instead of degrading to lake.
+VERIFY_BACKEND_STRICT = os.getenv("VERIFY_BACKEND_STRICT", "0") != "0"
+
 # APOLLO integration knobs.  These are read by orchestrator.apollo_integration and
 # tools.run_lean_verify when the backend is set to "apollo".
 APOLLO_PROJECT_PATH = Path(
     os.getenv("APOLLO_PROJECT_PATH", str(PROJECT_ROOT.parent / "APOLLO"))
 )
-APOLLO_REPL_WORKSPACE = Path(
-    os.getenv("APOLLO_REPL_WORKSPACE", str(APOLLO_PROJECT_PATH / "repl"))
-)
+_REPL_WORKSPACE_OVERRIDE = os.getenv("REPL_WORKSPACE_PATH", "").strip()
+if _REPL_WORKSPACE_OVERRIDE:
+    APOLLO_REPL_WORKSPACE = Path(_REPL_WORKSPACE_OVERRIDE)
+else:
+    APOLLO_REPL_WORKSPACE = Path(
+        os.getenv("APOLLO_REPL_WORKSPACE", str(PROJECT_ROOT.parent / "repl428"))
+    )
 APOLLO_LAKE_PATH = os.getenv(
     "APOLLO_LAKE_PATH",
     os.getenv("LEAN_LAKE_PATH", str(Path.home() / ".elan" / "bin" / "lake")),
 )
 APOLLO_VERIFY_TIMEOUT = int(os.getenv("APOLLO_VERIFY_TIMEOUT", "300"))
+REPL_VERIFY_TIMEOUT = int(os.getenv("REPL_VERIFY_TIMEOUT", "60"))
 # If enabled, APOLLO backend failures immediately degrade to lake verify path.
 APOLLO_FALLBACK_TO_LAKE_ON_FAILURE = (
     os.getenv("APOLLO_FALLBACK_TO_LAKE_ON_FAILURE", "1") != "0"
@@ -490,6 +499,39 @@ AGENT8_MIDCHECK_MIN_TURN: int = int(os.getenv("AGENT8_MIDCHECK_MIN_TURN", "8"))
 AGENT8_AGENT3_SAMPLING_ENABLED: bool = (
     os.getenv("AGENT8_AGENT3_SAMPLING_ENABLED", "0") != "0"
 )
+
+# Agent3 search-kernel controls (APOLLO core parity, MVP).
+AGENT3_SEARCH_ENABLED: bool = os.getenv("AGENT3_SEARCH_ENABLED", "1") != "0"
+AGENT3_CANDIDATE_COUNT: int = max(1, int(os.getenv("AGENT3_CANDIDATE_COUNT", "2")))
+AGENT3_RECURSION_DEPTH: int = max(0, int(os.getenv("AGENT3_RECURSION_DEPTH", "1")))
+AGENT3_NO_IMPROVEMENT_WINDOW: int = max(
+    1, int(os.getenv("AGENT3_NO_IMPROVEMENT_WINDOW", "2"))
+)
+_DEFAULT_AGENT3_TACTIC_STRATEGIES = [
+    "omega / linarith (linear arithmetic goals - integers and naturals)",
+    "simp / norm_num / decide (normalization and decidable goals)",
+    "ring / field_simp / ring_nf (algebraic / polynomial equality goals)",
+    "nlinarith / positivity (nonlinear arithmetic and non-negativity goals)",
+    "exact? / apply? / library_search (library search - avoid inventing tactics)",
+    "constructor / intro / cases / induction (structural and logical goals)",
+    "general (no tactic preference - trust LLM judgment)",
+]
+try:
+    AGENT3_TACTIC_STRATEGIES: list[str] = json.loads(
+        os.getenv("AGENT3_TACTIC_STRATEGIES", json.dumps(_DEFAULT_AGENT3_TACTIC_STRATEGIES))
+    )
+    if not isinstance(AGENT3_TACTIC_STRATEGIES, list) or not AGENT3_TACTIC_STRATEGIES:
+        AGENT3_TACTIC_STRATEGIES = list(_DEFAULT_AGENT3_TACTIC_STRATEGIES)
+    else:
+        AGENT3_TACTIC_STRATEGIES = [str(x) for x in AGENT3_TACTIC_STRATEGIES]
+except Exception:
+    AGENT3_TACTIC_STRATEGIES = list(_DEFAULT_AGENT3_TACTIC_STRATEGIES)
+AGENT3_TACTIC_PROBE_STR: str = os.getenv(
+    "AGENT3_TACTIC_PROBE_STR",
+    "try norm_cast; try norm_num; try simp_all; try ring_nf at *; "
+    "try native_decide; try linarith; try nlinarith",
+)
+AGENT3_TACTIC_PROBE_ENABLED: bool = os.getenv("AGENT3_TACTIC_PROBE_ENABLED", "1") != "0"
 
 # APOLLO alignment rollout profile:
 # - safe: preserve historical defaults

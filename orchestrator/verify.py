@@ -46,13 +46,28 @@ def lake_build(target: str | None = None) -> BuildResult:
     if target:
         cmd.append(target)
 
-    result = subprocess.run(
-        cmd,
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=LEAN_BUILD_TIMEOUT,
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=LEAN_BUILD_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        cmd_display = " ".join(cmd)
+        timeout_msg = (
+            f"lake_build timeout: command `{cmd_display}` exceeded "
+            f"{LEAN_BUILD_TIMEOUT}s"
+        )
+        # Return a structured failure instead of bubbling the exception and
+        # crashing the orchestrator main loop.
+        return BuildResult(
+            success=False,
+            errors=timeout_msg + f"\n{exc}",
+            sorry_count=0,
+            returncode=124,
+        )
     errors = (result.stderr + result.stdout) if result.returncode != 0 else ""
     sorry_count = _count_sorry_in_output(result.stderr + result.stdout)
     return BuildResult(

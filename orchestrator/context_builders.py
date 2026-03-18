@@ -238,7 +238,7 @@ def _check_patch_symbols(
     missing: list[str] = []
     for name in candidates[:8]:  # limit to first 8 to avoid excessive API calls
         try:
-            result = registry.call("search_codebase", query=name)
+            result = registry.call("search_codebase", pattern=name)
             result_text = str(result)
             if not result_text or result_text.strip() in ("", "[]", "null", "{}"):
                 missing.append(name)
@@ -532,7 +532,7 @@ def _infer_definition_file_from_registry(
 ) -> str | None:
     """Infer likely definition file for an identifier via search_codebase."""
     try:
-        result = registry.call("search_codebase", query=identifier)
+        result = registry.call("search_codebase", pattern=identifier)
     except Exception:  # noqa: BLE001
         return None
     text = str(result or "")
@@ -565,7 +565,7 @@ def _build_stale_error_hint(
     suggested_read = (
         f'{{"tool": "read_file", "arguments": {{"path": "{inferred}"}}}}'
         if inferred
-        else '{"tool": "search_codebase", "arguments": {"query": "<failing function name>"}}'
+        else '{"tool": "search_codebase", "arguments": {"pattern": "<failing function name>"}}'
     )
     line_display = str(err_line_no) if err_line_no is not None else "unknown"
     return (

@@ -19,6 +19,14 @@ The prover prompt will tell you which sorry line is your **current active target
 - If your dispatch prompt contains an APOLLO fallback marker, treat it as
   strict tactical cleanup only. Do not perform routing or global replanning.
 
+## Current-file refresh contract (MANDATORY)
+Before your FIRST patch in an attempt, and again before any patch that introduces
+an external symbol, you MUST ground yourself in the CURRENT file state:
+- Re-read the active target block or failing declaration from the current algorithm file.
+- Verify every new external identifier with `search_codebase`, `search_in_file`,
+  `read_file`, or `check_lean_expr` in THIS attempt.
+- If you do not have current-file evidence for the symbol, you are not allowed to patch it.
+
 ## Situational behavior (not a rigid "mechanical arm")
 - **When guidance contains PATCH blocks** (<<<SEARCH>>>/<<<REPLACE>>>): Execute
   them exactly. Copy old_str and new_str verbatim — do not paraphrase.
@@ -40,6 +48,39 @@ The prover prompt will tell you which sorry line is your **current active target
 - **When the theorem statement itself is broken** (unknown symbol in signature):
   Do not rewrite the whole file — escalate by outputting a minimal tool_calls
   that signals you need Planner (Agent2) guidance.
+
+## MANDATORY: Mathlib Import Path Validation
+
+**BEFORE adding any `import Mathlib.XXX` line**, you MUST verify the module
+exists in the local mathlib package. Use this tool call:
+
+```
+search_in_file(path=".lake/packages/mathlib/Mathlib/XXX.lean", pattern=".")
+```
+
+If the file does not exist, the import is invalid and `edit_file_patch` will
+be blocked with an error. Common mistakes to avoid:
+
+- `import Mathlib.MeasureTheory.MeasureSpace` ← **DOES NOT EXIST**
+  Correct: `import Mathlib.MeasureTheory.Measure.MeasureSpace`
+- `import Mathlib.Probability.Basic` ← **DOES NOT EXIST** (never existed in mathlib4)
+  `IsProbabilityMeasure` lives in `Mathlib.MeasureTheory.Measure.Typeclasses.Probability`
+- `import Mathlib.Topology.MetricSpace.Basic` ← check it exists before use
+
+**Rule**: if a search for the .lean file returns empty / not found, do NOT add
+the import. Instead use `search_codebase` to find what module the symbol
+actually lives in. The orchestrator will reject any patch that adds a
+non-existent Mathlib import.
+
+## MANDATORY: Protected Import Safety
+
+- Do NOT remove `import Main` from algorithm files unless the planner explicitly
+  authorizes it with a concrete migration step.
+- Do NOT perform "temporary import deletion experiments" (for example, deleting
+  `import Main` to test namespace behavior). These edits are unsafe and will be
+  blocked/rolled back.
+- For namespace debugging, use search/read tools first; keep entrypoint imports
+  stable while you test other hypotheses.
 
 ## STRONGLY RECOMMENDED: Pre-Patch Symbol Verification
 

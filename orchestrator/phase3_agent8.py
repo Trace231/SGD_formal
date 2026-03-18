@@ -34,7 +34,6 @@ from orchestrator.contracts import (
 )
 from orchestrator.config import (
     AGENT8_APOLLO_DECOMPOSE_ENABLED,
-    AGENT8_AGENT3_SAMPLING_ENABLED,
     AGENT8_DEBUG,
     AGENT8_FILE_WINDOW_RADIUS,
     AGENT8_HUMAN_GATE_CONSECUTIVE_THRESHOLD,
@@ -44,11 +43,17 @@ from orchestrator.config import (
     RETRY_LIMITS,
 )
 from orchestrator.context_builders import (
+    _build_stale_error_hint,
     _build_escalation_file_context,
     _extract_imported_algo_sigs,
+    _prioritize_error_text,
     _prequery_dependency_signatures,
 )
-from orchestrator.error_classifier import _extract_first_error_line, _json_candidates
+from orchestrator.error_classifier import (
+    _extract_first_error_line,
+    _json_candidates,
+    _parse_lean_errors,
+)
 from orchestrator.file_io import load_file, snapshot_file
 
 console = Console()
@@ -78,6 +83,23 @@ def _extract_error_signature(errors_text: str) -> str:
     return errors_text.strip()[:60]
 
 
+def _canonical_error_signature(errors_text: str) -> str:
+    """Stable verifier-derived primary error signature."""
+    if not errors_text:
+        return ""
+    for line in errors_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("--"):
+            continue
+        m = re.match(r"(.*?):(\d+):(\d+):\s*(?:error:\s*)?(.*)", line)
+        if m:
+            file_part = Path(m.group(1)).name
+            msg = re.sub(r"\s+", " ", m.group(4).strip()).lower()
+            return f"{file_part}:{m.group(2)}:{msg[:160]}"
+        return re.sub(r"\s+", " ", line).lower()[:160]
+    return re.sub(r"\s+", " ", errors_text.strip()).lower()[:160]
+
+
 def _is_structural_error(error_signature: str, errors_text: str) -> bool:
     """Heuristic: structural errors require at least one investigation lookup."""
     hay = f"{error_signature}\n{errors_text}".lower()
@@ -97,7 +119,8 @@ def _is_structural_error(error_signature: str, errors_text: str) -> bool:
 # Error Subtype Classifier
 # ---------------------------------------------------------------------------
 
-# Stable string constant for the four canonical subtypes.
+# Stable string constant for the canonical subtypes.
+_SUBTYPE_DECLARATION_SYNTAX_FAILURE = "declaration_syntax_failure"
 _SUBTYPE_DECLARATION_API_MISMATCH = "declaration_api_mismatch"
 _SUBTYPE_PROOF_API_MISMATCH       = "proof_api_mismatch"
 _SUBTYPE_PROOF_TACTIC_FAILURE     = "proof_tactic_failure"
@@ -148,6 +171,15 @@ _DECLARATION_ZONE_MARKERS = (
     "failed to synthesize",
     "typeclass",
 )
+_DECLARATION_SYNTAX_MARKERS = (
+    "unexpected token",
+    "invalid syntax",
+    "unexpected end of input",
+    "expected '}'",
+    "expected ']'",
+    "expected ')'",
+    "parser",
+)
 
 
 def _classify_error_subtype(
@@ -158,7 +190,8 @@ def _classify_error_subtype(
 ) -> str:
     """Classify the dominant error category for routing decisions.
 
-    Returns one of four canonical subtype strings:
+    Returns one of canonical subtype strings:
+    - ``declaration_syntax_failure`` — parser/syntax error before semantic checks
     - ``declaration_api_mismatch``  — error before ``:= by`` (declaration zone)
     - ``proof_api_mismatch``        — API shape/arg error inside proof body
     - ``proof_tactic_failure``      — pure tactic logic failure inside proof body
@@ -175,6 +208,10 @@ def _classify_error_subtype(
 
     hay = errors_text.lower()
     error_sig = _extract_error_signature(errors_text).lower()
+
+    # Stage 0 — Declaration syntax/parser failure (highest priority)
+    if any(m in hay for m in _DECLARATION_SYNTAX_MARKERS):
+        return _SUBTYPE_DECLARATION_SYNTAX_FAILURE
 
     # Stage 1 — Declaration zone: strong structural markers
     if any(m in hay for m in _DECLARATION_ZONE_MARKERS):
@@ -239,6 +276,20 @@ def _coerce_errors_text(errors: Any) -> str:
     return str(errors)
 
 
+def _coerce_prompt_text(value: Any, fallback: str) -> str:
+    """Normalize optional prompt fields to a guaranteed non-empty string."""
+    if isinstance(value, str) and value.strip():
+        return value
+    return fallback if isinstance(fallback, str) else str(fallback or "")
+
+
+def _resolve_decision_prompt(decision: Any, key: str, fallback: str) -> str:
+    """Fetch optional prompt text from decision dict with None/empty safety."""
+    if not isinstance(decision, dict):
+        return _coerce_prompt_text(None, fallback)
+    return _coerce_prompt_text(decision.get(key), fallback)
+
+
 def _error_count_from_verify(verify_result: dict[str, Any], errors_text: str) -> int:
     """Get canonical error count from verify payload with text fallback."""
     try:
@@ -287,6 +338,65 @@ _NETWORK_ERROR_MARKERS = (
 def _is_network_error(text: str) -> bool:
     t = str(text).lower()
     return any(m in t for m in _NETWORK_ERROR_MARKERS)
+
+
+def _compute_post_dispatch_observability(
+    *,
+    outcome: dict[str, Any],
+    has_verified_after_state: bool,
+    errors_before: str,
+    errors_after_candidate: str,
+    top_error_count_before: int,
+    sorry_before: int,
+    current_sorry_count: int,
+) -> dict[str, Any]:
+    """Compute coherent post-dispatch observability fields for one tick."""
+    _dispatch_outcome = str(outcome.get("outcome", ""))
+    _is_network = _dispatch_outcome == "network_failure"
+    _is_dispatch_error = _dispatch_outcome == "dispatch_error"
+    _verified = bool(has_verified_after_state) and not (_is_network or _is_dispatch_error)
+
+    if _verified:
+        errors_after = _coerce_errors_text(errors_after_candidate)
+        top_error_count_after = int(
+            outcome.get("error_count", _count_error_lines(errors_after))
+        )
+        error_count_delta = top_error_count_after - int(top_error_count_before)
+        main_sig_changed = _signature_changed(errors_before, errors_after)
+        sorry_after = int(outcome.get("sorry_count", current_sorry_count))
+    else:
+        errors_after = errors_before
+        top_error_count_after = int(top_error_count_before)
+        error_count_delta = 0
+        main_sig_changed = False
+        sorry_after = int(sorry_before)
+
+    if _is_network:
+        route_effective: bool | None = None
+    elif not _verified:
+        route_effective = False
+    else:
+        route_effective = (
+            top_error_count_after < int(top_error_count_before)
+            or main_sig_changed
+        )
+
+    return {
+        "has_verified_after_state": _verified,
+        "errors_after": errors_after,
+        "top_error_count_after": top_error_count_after,
+        "error_count_delta": error_count_delta,
+        "main_error_signature_changed": main_sig_changed,
+        "route_effective": route_effective,
+        "sorry_after": sorry_after,
+        "sorry_delta": sorry_after - int(sorry_before),
+    }
+
+
+def _has_informative_investigation(tool_names: list[str]) -> bool:
+    """True only for read/search/typecheck investigation tools."""
+    informative = {"read_file", "search_in_file", "search_codebase", "check_lean_expr"}
+    return any(str(name) in informative for name in tool_names)
 
 
 def _safe_llm_call(
@@ -429,6 +539,7 @@ def _check_route_downweight(
         )
         # Select next best action based on subtype
         _fallback = {
+            _SUBTYPE_DECLARATION_SYNTAX_FAILURE: "agent3_tactical",
             _SUBTYPE_PROOF_API_MISMATCH: "agent7_signature",
             _SUBTYPE_DECLARATION_API_MISMATCH: "agent3_tactical",
             _SUBTYPE_PROOF_TACTIC_FAILURE: (
@@ -443,6 +554,139 @@ def _check_route_downweight(
         return _fallback, _reason
 
     return proposed_action, ""
+
+
+def _apply_subtype_route_policy(
+    proposed_action: str,
+    error_subtype: str,
+    decision_history: list[dict],
+) -> tuple[str, str, str, bool]:
+    """Subtype-aware route policy with explicit first-try stage for declaration syntax.
+
+    Returns (action, policy_stage, reason, forced_lock).
+    """
+    if error_subtype != _SUBTYPE_DECLARATION_SYNTAX_FAILURE:
+        return proposed_action, "none", "", False
+
+    same_subtype_history = [
+        e
+        for e in decision_history
+        if e.get("error_subtype") == _SUBTYPE_DECLARATION_SYNTAX_FAILURE
+    ]
+    prior_agent7_attempts = sum(
+        1
+        for e in same_subtype_history
+        if e.get("action") == "agent7_signature"
+    )
+
+    if prior_agent7_attempts == 0:
+        # First shot keeps signature audit for conservative diagnosis.
+        if proposed_action != "agent7_signature":
+            return (
+                "agent7_signature",
+                "first_try_agent7",
+                "declaration_syntax_failure first attempt uses agent7_signature.",
+                False,
+            )
+        return proposed_action, "first_try_agent7", "", False
+
+    if proposed_action == "agent7_signature":
+        return (
+            "agent3_tactical",
+            "forced_to_agent3",
+            "declaration_syntax_failure persisted after initial agent7 attempt.",
+            True,
+        )
+    if proposed_action == "agent9_replan":
+        return (
+            "agent3_tactical",
+            "forced_to_agent3",
+            "declaration_syntax_failure prefers tactical syntax patch before replan.",
+            True,
+        )
+    return proposed_action, "forced_to_agent3", "", False
+
+
+def _apply_network_cooldown_fallback(
+    proposed_action: str,
+    error_subtype: str,
+    decision_history: list[dict],
+    action_cooldowns: dict[str, int],
+    *,
+    cooldown_ticks: int = 2,
+) -> tuple[str, str, bool]:
+    """If last tick had agent7 network/dispatch failure, cooldown agent7 and prefer agent3."""
+    if error_subtype not in (
+        _SUBTYPE_DECLARATION_SYNTAX_FAILURE,
+        _SUBTYPE_DECLARATION_API_MISMATCH,
+    ):
+        return proposed_action, "", False
+    if not decision_history:
+        return proposed_action, "", False
+
+    last = decision_history[-1]
+    if (
+        last.get("action") == "agent7_signature"
+        and last.get("outcome") in {"network_failure", "dispatch_error"}
+    ):
+        action_cooldowns["agent7_signature"] = max(
+            int(action_cooldowns.get("agent7_signature", 0)),
+            max(1, int(cooldown_ticks)),
+        )
+        if proposed_action == "agent7_signature":
+            return (
+                "agent3_tactical",
+                "network_cooldown: prior agent7 dispatch/network failure; forcing agent3_tactical.",
+                True,
+            )
+        return proposed_action, "network_cooldown applied to agent7_signature.", True
+
+    return proposed_action, "", False
+
+
+def _apply_compile_first_subtype_gate(
+    action: str,
+    error_subtype: str,
+    targeted_prompt: str,
+    *,
+    forced_route_lock: bool,
+) -> tuple[str, str, str]:
+    """Apply compile-first subtype policy unless force-lock is active."""
+    if forced_route_lock:
+        return action, targeted_prompt, ""
+
+    if error_subtype == _SUBTYPE_PROOF_API_MISMATCH and action not in (
+        "agent3_tactical", "human_missing_assumption"
+    ):
+        action = "agent3_tactical"
+        targeted_prompt = (
+            "[compile-first/proof_api_mismatch] Fix proof-body API shape "
+            "error: look up the target lemma's current signature first, "
+            "then apply a minimal patch matching actual arg count/order. "
+            "Verify after each edit.\n\n"
+            + targeted_prompt
+        )
+        return action, targeted_prompt, "proof_api_mismatch -> agent3_tactical"
+    if error_subtype == _SUBTYPE_DECLARATION_API_MISMATCH and action == "agent9_replan":
+        action = "agent7_signature"
+        targeted_prompt = (
+            "[compile-first/declaration_api_mismatch] Fix declaration-zone "
+            "API/signature mismatch before replanning strategy.\n\n"
+            + targeted_prompt
+        )
+        return action, targeted_prompt, "declaration_api_mismatch -> agent7_signature"
+    if action == "agent9_replan" and error_subtype not in (
+        _SUBTYPE_STRATEGY_MISMATCH,
+    ):
+        action = "agent7_signature"
+        targeted_prompt = (
+            "[compile-first guard] Focus on declaration/API/type alignment. "
+            "Do not replan mathematical strategy in this tick.\n\n"
+            + targeted_prompt
+        )
+        return action, targeted_prompt, "compile-first guard -> agent7_signature"
+
+    return action, targeted_prompt, ""
 
 
 def _apply_hard_route_gate(
@@ -661,6 +905,11 @@ def _build_agent8_tick_context(
     pending_lemma_status: dict | None = None,
     baseline_errors: str = "",
     error_subtype: str = "",
+    canonical_error_signature: str = "",
+    stale_error_hint: str = "",
+    reset_hypothesis_bias: bool = False,
+    verify_backend_used: str = "",
+    verify_backend_reason: str = "",
 ) -> str:
     """Build a minimal, non-truncated diagnostic prompt for Agent8.
 
@@ -732,7 +981,7 @@ def _build_agent8_tick_context(
                 _outcome_tag = "[REPLAN]"
             elif _eb and _ea and _eb[:120] == _ea[:120] and _delta == 0:
                 _outcome_tag = "[NO-CHANGE]"
-            elif _delta is not None and _delta < 0:
+            elif (_delta is not None and _delta < 0) or bool(entry.get("main_error_signature_changed", False)):
                 _outcome_tag = "[PROGRESS]"
             else:
                 _outcome_tag = "[FAIL]"
@@ -861,6 +1110,7 @@ def _build_agent8_tick_context(
     _subtype_block = ""
     if error_subtype:
         _subtype_routing = {
+            _SUBTYPE_DECLARATION_SYNTAX_FAILURE: "→ Preferred action: agent7_signature (first attempt), then agent3_tactical if no-progress/network stall",
             _SUBTYPE_DECLARATION_API_MISMATCH: "→ Preferred action: agent7_signature (declaration zone fix)",
             _SUBTYPE_PROOF_API_MISMATCH:       "→ Preferred action: agent3_tactical (proof-body API shape patch; lookup signature first)",
             _SUBTYPE_PROOF_TACTIC_FAILURE:     "→ Preferred action: agent3_tactical (tactic / lemma name fix)",
@@ -873,19 +1123,51 @@ def _build_agent8_tick_context(
             "This is a heuristic signal — override with compile evidence if conflicting.\n\n"
         )
 
+    _canonical_block = ""
+    if canonical_error_signature:
+        _canonical_block = (
+            "## Canonical Current Error (verifier-derived)\n"
+            f"`{canonical_error_signature}`\n"
+            "Treat this as the source of truth for routing and anti-loop logic.\n\n"
+        )
+
+    _reset_block = ""
+    if reset_hypothesis_bias:
+        _reset_block = (
+            "## Hypothesis Reset\n"
+            "The canonical primary error changed across recent ticks. Discard stale root-cause "
+            "stories and re-diagnose from the current verifier output only.\n\n"
+        )
+
+    _stale_block = ""
+    if stale_error_hint:
+        _stale_block = f"{stale_error_hint}\n"
+
+    _backend_block = ""
+    if verify_backend_used or verify_backend_reason:
+        _backend_block = (
+            "## Verifier Backend\n"
+            f"backend_used: `{verify_backend_used or 'unknown'}`\n"
+            f"backend_reason: `{verify_backend_reason or 'unknown'}`\n\n"
+        )
+
     return (
         f"{_midcheck_banner}"
         f"{_new_plan_banner}"
+        f"{_reset_block}"
         "## Current Algorithm File (smart-truncated around error lines)\n"
         f"File: {target_file}\n"
         f"```lean\n{algo_display}\n```\n\n"
         f"{_baseline_block}"
         f"```\n{errors_text[:_err_chars]}\n```\n\n"
+        f"{_canonical_block}"
+        f"{_backend_block}"
         f"## Proof Plan (current)\n{agent2_plan[:_plan_chars]}\n\n"
         f"## Library Files Available\n{lib_desc}\n\n"
         f"{_a9_block}"
         f"{_subtype_block}"
         f"{_api_shape_block}"
+        f"{_stale_block}"
         f"{_pending_lemma_block}"
         f"## Decision History (recent)\n{history_block}\n\n"
         f"{dep_sigs}"
@@ -1224,6 +1506,16 @@ def _agent8_run_agent3_single(
 
         # Execute tool
         args = dict(arguments)
+        if tool_name == "edit_file_patch":
+            _requested_path = str(args.get("path", target_file))
+            if _requested_path != target_file:
+                raw_reply = agent3.call(
+                    "Candidate isolation active: edit_file_patch path must match the "
+                    f"target file exactly ({target_file}). "
+                    f"Requested path was: {_requested_path}"
+                )
+                continue
+            args["path"] = target_file
         if transactional_mode and tool_name == "edit_file_patch":
             _edit_calls += 1
             if _edit_calls > 2:
@@ -1313,92 +1605,23 @@ def _agent8_run_agent3(
     max_turns: int | None = None,
     compile_first_mode: bool = False,
     transactional_mode: bool = False,
+    error_subtype: str = "",
 ) -> dict:
-    """Run Agent3 with optional APOLLO-aligned bounded sampling/search."""
+    """Dispatch Agent3 through Agent3-owned search kernel (Agent8 budget wrapper)."""
+    from orchestrator.phase3_agent3 import run_agent3_search_kernel
+
     max_turns = max_turns or RETRY_LIMITS.get("AGENT8_AGENT3_MAX_TURNS", 15)
-
-    # Guardrail: keep sampling off by default; keep transactional flow single-path.
-    sampling_enabled = AGENT8_AGENT3_SAMPLING_ENABLED and not transactional_mode
-    candidate_cap = RETRY_LIMITS.get("AGENT8_AGENT3_SAMPLE_MAX_CANDIDATES", 3)
-    candidate_count = min(
-        max(1, RETRY_LIMITS.get("AGENT8_AGENT3_SAMPLE_CANDIDATES", 3)),
-        max(1, candidate_cap),
+    return run_agent3_search_kernel(
+        target_file,
+        agent2_plan,
+        targeted_prompt,
+        allowed_edit_lines,
+        max_turns=max_turns,
+        compile_first_mode=compile_first_mode,
+        transactional_mode=transactional_mode,
+        error_subtype=error_subtype,
+        run_single_candidate=_agent8_run_agent3_single,
     )
-    per_candidate_turns = min(
-        max_turns,
-        max(1, RETRY_LIMITS.get("AGENT8_AGENT3_SAMPLE_MAX_TURNS_PER_CANDIDATE", 8)),
-    )
-    degrade_stop_after = max(
-        1, RETRY_LIMITS.get("AGENT8_AGENT3_SAMPLE_DEGRADE_TICKS", 2)
-    )
-
-    if not sampling_enabled or candidate_count <= 1:
-        return _agent8_run_agent3_single(
-            target_file,
-            agent2_plan,
-            targeted_prompt,
-            allowed_edit_lines,
-            max_turns=max_turns,
-            compile_first_mode=compile_first_mode,
-            transactional_mode=transactional_mode,
-            candidate_index=1,
-            candidate_total=1,
-        )
-
-    target_path = Path(target_file)
-    if not target_path.is_absolute():
-        target_path = (PROJECT_ROOT / target_path).resolve()
-    baseline_content = target_path.read_text(encoding="utf-8")
-    best_content = baseline_content
-    best_result: dict[str, Any] | None = None
-    best_score: tuple[int, int, int, int] | None = None
-    non_improving = 0
-    for idx in range(candidate_count):
-        # APOLLO-aligned candidate isolation:
-        # every sampled candidate starts from the same baseline source.
-        target_path.write_text(baseline_content, encoding="utf-8")
-        candidate_result = _agent8_run_agent3_single(
-            target_file,
-            agent2_plan,
-            targeted_prompt,
-            allowed_edit_lines,
-            max_turns=per_candidate_turns,
-            compile_first_mode=compile_first_mode,
-            transactional_mode=transactional_mode,
-            candidate_index=idx + 1,
-            candidate_total=candidate_count,
-        )
-        score = _agent8_result_score(candidate_result)
-        candidate_content = target_path.read_text(encoding="utf-8")
-
-        if best_result is None or best_score is None or score < best_score:
-            best_result = candidate_result
-            best_score = score
-            best_content = candidate_content
-            non_improving = 0
-        else:
-            non_improving += 1
-
-        # Early stop exactly mirrors APOLLO-style bounded search behavior:
-        # return immediately when a clean candidate is found.
-        if int(candidate_result.get("exit_code", 1)) == 0 and int(
-            candidate_result.get("sorry_count", -1)
-        ) == 0:
-            best_content = candidate_content
-            target_path.write_text(best_content, encoding="utf-8")
-            return candidate_result
-
-        # Safeguard: if additional sampled candidates are not improving,
-        # cut back to avoid wasted turns/tokens.
-        if non_improving >= degrade_stop_after:
-            break
-
-    target_path.write_text(best_content, encoding="utf-8")
-    return best_result or {
-        "exit_code": 1,
-        "sorry_count": -1,
-        "errors": "Agent3 sampling failed to produce any candidate result.",
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -1608,6 +1831,10 @@ def _print_diagnostic_card(
     node_kind: str = "",
     node_attempt: int = 0,
     queue_remaining: int = 0,
+    forced_route_lock: bool = False,
+    forced_route_reason: str = "",
+    network_cooldown_triggered: bool = False,
+    subtype_policy_stage: str = "none",
 ) -> None:
     """Emit a structured per-tick diagnostic card."""
     ev_lines = [
@@ -1631,6 +1858,14 @@ def _print_diagnostic_card(
         f"[Route] Current: {chosen_action} | Ticks in Route: {_route_ticks} | "
         f"Status: {route_status}\n"
     )
+    policy_line = (
+        f"[Policy] forced_route_lock={forced_route_lock} "
+        f"| network_cooldown={network_cooldown_triggered} "
+        f"| subtype_stage={subtype_policy_stage}\n"
+    )
+    forced_line = ""
+    if forced_route_reason:
+        forced_line = f"[ForcedRouteReason] {forced_route_reason[:220]}\n"
     node_line = ""
     if node_id or node_kind:
         node_line = (
@@ -1642,6 +1877,8 @@ def _print_diagnostic_card(
         f"{trend_line}"
         f"{sig_line}"
         f"{route_line}"
+        f"{policy_line}"
+        f"{forced_line}"
         f"{node_line}"
         f"ErrorSig: {error_sig[:120]}\n"
         f"Hypothesis: {hypothesis[:220]}\n"
@@ -1809,6 +2046,7 @@ def run_agent8_loop(
     decision_history: list[dict] = []
     current_plan = agent2_plan
     current_errors = last_errors
+    _baseline_errors = last_errors
     _consecutive_parse_failures = 0
     _consecutive_same_error: int = 0
     _last_error_sig: str = ""
@@ -1875,9 +2113,28 @@ def run_agent8_loop(
         _fresh_error_count = _error_count_from_verify(_fresh, _fresh_errors)
         _fresh_sorry = int(_fresh.get("sorry_count", _current_sorry_count))
         _fresh_blocked = int(_fresh.get("blocked_sorry_count", 0))
+        _fresh_backend_used = str(_fresh.get("verify_backend_used", ""))
+        _fresh_backend_reason = str(_fresh.get("verify_backend_reason", ""))
         _compile_first_mode = (_fresh_exit != 0 and _fresh_sorry == 0)
         # Always use fresh verifier output as the source of truth.
         current_errors = _fresh_errors
+        _current_structured_errors = _parse_lean_errors(current_errors)
+        _current_error_line = _extract_first_error_line(current_errors)
+        _prioritized_current_errors = _prioritize_error_text(
+            _current_structured_errors,
+            current_errors,
+            _current_error_line,
+            target_file,
+        )
+        _baseline_structured_errors = _parse_lean_errors(_baseline_errors)
+        _baseline_error_line = _extract_first_error_line(_baseline_errors)
+        _prioritized_baseline_errors = _prioritize_error_text(
+            _baseline_structured_errors,
+            _baseline_errors,
+            _baseline_error_line,
+            target_file,
+        )
+        _canonical_sig = _canonical_error_signature(current_errors)
         _current_sorry_count = _fresh_sorry
 
         # Classify error subtype before building context so it can be injected.
@@ -1898,12 +2155,48 @@ def run_agent8_loop(
             )
 
         # 1. Build context
+        _recent_canonicals = [
+            str(e.get("canonical_error_signature", "")).strip()
+            for e in decision_history[-2:]
+            if str(e.get("canonical_error_signature", "")).strip()
+        ]
+        _reset_hypothesis_bias = (
+            len(_recent_canonicals) == 2
+            and _recent_canonicals[0] != _recent_canonicals[1]
+            and _recent_canonicals[1] != _canonical_sig
+        )
+        _same_sig_streak = 1
+        for _entry in reversed(decision_history):
+            if str(_entry.get("canonical_error_signature", "")) == _canonical_sig:
+                _same_sig_streak += 1
+            else:
+                break
+        _stale_hint = ""
+        if _same_sig_streak >= 3:
+            try:
+                _ctx_registry = ToolRegistry()
+                _ctx_registry.register_readonly_tools()
+                _stale_hint = _build_stale_error_hint(
+                    _ctx_registry,
+                    target_file,
+                    current_errors,
+                    _current_error_line,
+                    _same_sig_streak,
+                )
+            except Exception:  # noqa: BLE001
+                _stale_hint = ""
         ctx = _build_agent8_tick_context(
-            target_file, current_errors, current_plan, decision_history,
+            target_file, _prioritized_current_errors, current_plan, decision_history,
             agent9_plan=agent9_plan,
             plan_updated_tick=_plan_updated_tick,
             pending_lemma_status=_pending_lemma_status,
+            baseline_errors=_prioritized_baseline_errors,
             error_subtype=_error_subtype,
+            canonical_error_signature=_canonical_sig,
+            stale_error_hint=_stale_hint,
+            reset_hypothesis_bias=_reset_hypothesis_bias,
+            verify_backend_used=_fresh_backend_used,
+            verify_backend_reason=_fresh_backend_reason,
         )
         if _force_lookup_next_tick:
             ctx += (
@@ -1918,6 +2211,7 @@ def run_agent8_loop(
         _inv_registry.register_investigation_tools()
         _max_inv = RETRY_LIMITS.get("AGENT8_INVESTIGATION_TURNS", 3)
         _investigation_rounds_this_tick = 0
+        _investigation_tools_this_tick: list[str] = []
         raw_reply = _safe_llm_call(agent8, ctx, idempotent=True, max_attempts=3)
 
         for _inv_round in range(_max_inv):
@@ -1941,6 +2235,7 @@ def run_agent8_loop(
                 except Exception as _exc:
                     _tr = {"error": str(_exc)}
                 _inv_results.append({"tool": _tn, "result": _tr})
+                _investigation_tools_this_tick.append(str(_tn))
             _investigation_rounds_this_tick += 1
             raw_reply = _safe_llm_call(
                 agent8,
@@ -1969,11 +2264,11 @@ def run_agent8_loop(
                     "priority_level": "P2",
                     "reason": "Agent8 JSON parse failures — falling back to replan",
                     "targeted_prompt": "Revise the proof strategy.",
-                    "error_signature": _extract_error_signature(current_errors),
+                    "error_signature": _canonical_sig,
                     "hypothesis": "Current decision protocol output is malformed; regenerate a fresh structured plan.",
                     "evidence": [
                         {"source": "agent8_parse", "snippet": _parse_error},
-                        {"source": "lean_verify", "snippet": _extract_error_signature(current_errors)},
+                        {"source": "lean_verify", "snippet": _canonical_sig},
                     ],
                     "confidence": 0.4,
                     "counterfactual": "Do not keep local tactical loop when decision JSON is repeatedly invalid.",
@@ -1993,11 +2288,14 @@ def run_agent8_loop(
                 if decision is None:
                     continue
         _consecutive_parse_failures = 0
+        decision["error_signature"] = _canonical_sig
+        decision["canonical_error_signature"] = _canonical_sig
 
+        _has_real_investigation = _has_informative_investigation(_investigation_tools_this_tick)
         if _is_structural_error(
-            decision.get("error_signature", ""),
+            _canonical_sig,
             current_errors,
-        ) and _investigation_rounds_this_tick == 0:
+        ) and not _has_real_investigation:
             console.print(
                 "  [Agent8] Mandatory lookup gate: structural error requires at least "
                 "one investigation lookup before routing."
@@ -2030,6 +2328,7 @@ def run_agent8_loop(
                     except Exception as _exc:
                         _tr = {"error": str(_exc)}
                     _inv_results.append({"tool": _tn, "result": _tr})
+                    _investigation_tools_this_tick.append(str(_tn))
                 _investigation_rounds_this_tick += 1
                 raw_reply = _safe_llm_call(
                     agent8,
@@ -2042,20 +2341,24 @@ def run_agent8_loop(
             decision2, parse_err2 = _parse_agent8_decision(raw_reply)
             if decision2 is not None:
                 decision = decision2
+                decision["error_signature"] = _canonical_sig
+                decision["canonical_error_signature"] = _canonical_sig
             else:
                 console.print(f"  [Agent8] Mandatory lookup re-parse failed: {parse_err2}")
-        if _investigation_rounds_this_tick > 0:
+        if _has_informative_investigation(_investigation_tools_this_tick):
             _force_lookup_next_tick = False
 
         action = decision.get("action", "agent3_tactical")
-        error_sig = decision.get(
-            "error_signature", _extract_error_signature(current_errors)
-        )
+        error_sig = _canonical_sig
         targeted_prompt = decision.get("targeted_prompt", "")
         hypothesis = str(decision.get("hypothesis", "")).strip()
         evidence = _normalize_evidence(decision.get("evidence"))
         counterfactual = str(decision.get("counterfactual", "")).strip()
         _active_subproblem_node = None
+        _forced_route_lock = False
+        _forced_route_reason = ""
+        _network_cooldown_triggered = False
+        _subtype_policy_stage = "none"
         if _serial_subproblem_queue:
             _active_subproblem_node = _serial_subproblem_queue.pop(0)
             _node_id = str(_active_subproblem_node.get("id", f"node-{tick}"))
@@ -2125,6 +2428,10 @@ def run_agent8_loop(
                 else 0
             ),
             queue_remaining=len(_serial_subproblem_queue),
+            forced_route_lock=_forced_route_lock,
+            forced_route_reason=_forced_route_reason,
+            network_cooldown_triggered=_network_cooldown_triggered,
+            subtype_policy_stage=_subtype_policy_stage,
         )
 
         console.print(
@@ -2136,6 +2443,20 @@ def run_agent8_loop(
         console.print(f"  [Agent8] Reason: {decision.get('reason', '?')}")
 
         if not _active_subproblem_node:
+            # 4a0. Subtype-specific route policy (first-try vs forced tactical fallback).
+            action, _subtype_policy_stage, _subtype_policy_reason, _subtype_force = (
+                _apply_subtype_route_policy(action, _error_subtype, decision_history)
+            )
+            if _subtype_policy_reason:
+                console.print(f"  [SubtypePolicy] {action} ← {_subtype_policy_reason}")
+                decision["action"] = action
+                targeted_prompt = (
+                    f"[SUBTYPE POLICY: {_subtype_policy_reason}] " + targeted_prompt
+                )
+            if _subtype_force:
+                _forced_route_lock = True
+                _forced_route_reason = _subtype_policy_reason
+
             # 4a. Anti-loop check (behavior-driven)
             action, _antiloop_reason = _check_anti_loop(
                 decision, decision_history,
@@ -2173,6 +2494,8 @@ def run_agent8_loop(
                 targeted_prompt = (
                     f"[DELTA FORCE FALLBACK: {_delta_force_reason}] " + targeted_prompt
                 )
+                _forced_route_lock = True
+                _forced_route_reason = _delta_force_reason
 
             # 4d. Hard route gate with cooldown (falsifiable routing).
             action, _hard_reason = _apply_hard_route_gate(
@@ -2189,52 +2512,49 @@ def run_agent8_loop(
                 targeted_prompt = (
                     f"[HARD ROUTE GATE: {_hard_reason}] " + targeted_prompt
                 )
+                _forced_route_lock = True
+                _forced_route_reason = _hard_reason
+
+            # 4d1. Network-failure cooldown fallback for agent7 loops.
+            action, _net_cooldown_reason, _net_cooldown_on = _apply_network_cooldown_fallback(
+                action,
+                _error_subtype,
+                decision_history,
+                _action_cooldowns,
+                cooldown_ticks=RETRY_LIMITS.get("AGENT8_ROUTE_COOLDOWN_TICKS", 2),
+            )
+            if _net_cooldown_reason:
+                console.print(f"  [NetworkCooldown] {action} ← {_net_cooldown_reason}")
+                decision["action"] = action
+                targeted_prompt = (
+                    f"[NETWORK COOLDOWN: {_net_cooldown_reason}] " + targeted_prompt
+                )
+            if _net_cooldown_on:
+                _network_cooldown_triggered = True
+                _forced_route_lock = True
+                if not _forced_route_reason:
+                    _forced_route_reason = _net_cooldown_reason
 
         # Compile-first subtype routing:
         # When exit=1 && sorry=0, route based on classified error subtype
         # rather than forcing everything to agent7_signature.
         if _compile_first_mode:
-            if _error_subtype == _SUBTYPE_PROOF_API_MISMATCH and action not in (
-                "agent3_tactical", "human_missing_assumption"
-            ):
+            action, targeted_prompt, _cf_reason = _apply_compile_first_subtype_gate(
+                action,
+                _error_subtype,
+                targeted_prompt,
+                forced_route_lock=_forced_route_lock,
+            )
+            if _cf_reason:
                 console.print(
-                    "  [Agent8] Compile-First subtype gate: proof_api_mismatch → "
-                    "overriding to agent3_tactical (proof-body API shape fix)."
+                    "  [Agent8] Compile-First subtype gate: "
+                    f"{_cf_reason}."
                 )
-                action = "agent3_tactical"
                 decision["action"] = action
-                targeted_prompt = (
-                    "[compile-first/proof_api_mismatch] Fix proof-body API shape "
-                    "error: look up the target lemma's current signature first, "
-                    "then apply a minimal patch matching actual arg count/order. "
-                    "Verify after each edit.\n\n"
-                    + targeted_prompt
-                )
-            elif _error_subtype == _SUBTYPE_DECLARATION_API_MISMATCH and action == "agent9_replan":
+            elif _forced_route_lock:
                 console.print(
-                    "  [Agent8] Compile-First subtype gate: declaration_api_mismatch → "
-                    "overriding agent9_replan to agent7_signature."
-                )
-                action = "agent7_signature"
-                decision["action"] = action
-                targeted_prompt = (
-                    "[compile-first/declaration_api_mismatch] Fix declaration-zone "
-                    "API/signature mismatch before replanning strategy.\n\n"
-                    + targeted_prompt
-                )
-            elif action == "agent9_replan" and _error_subtype not in (
-                _SUBTYPE_STRATEGY_MISMATCH,
-            ):
-                console.print(
-                    "  [Agent8] Compile-First guard: suppressing replan for "
-                    f"subtype={_error_subtype}, forcing signature-level repair first."
-                )
-                action = "agent7_signature"
-                decision["action"] = action
-                targeted_prompt = (
-                    "[compile-first guard] Focus on declaration/API/type alignment. "
-                    "Do not replan mathematical strategy in this tick.\n\n"
-                    + targeted_prompt
+                    "  [Agent8] Compile-First gate skipped due to forced_route_lock: "
+                    f"{_forced_route_reason or 'route already force-switched'}"
                 )
 
         # 4e. Stage-2 APOLLO decomposition policy gate.
@@ -2298,6 +2618,7 @@ def run_agent8_loop(
         outcome: dict = {"outcome": "unknown"}
         result: dict = {}
         _direct_apply_errors: list[str] = []
+        _has_verified_after_state = False
 
         try:
             # Safety check: ensure decision is a valid dict
@@ -2339,6 +2660,7 @@ def run_agent8_loop(
                     decision.get("allowed_edit_lines"),
                     compile_first_mode=_compile_first_mode,
                     transactional_mode=(_error_subtype == _SUBTYPE_PROOF_API_MISMATCH),
+                    error_subtype=_error_subtype,
                 )
                 # Safety check for result dict
                 if not isinstance(result, dict):
@@ -2348,12 +2670,22 @@ def run_agent8_loop(
                     "exit_code": result.get("exit_code", 1),
                     "sorry_count": result.get("sorry_count", -1),
                     "error_count": _count_error_lines(_coerce_errors_text(result.get("errors", ""))),
+                    "failure_kind": str(result.get("failure_kind", "")),
+                    "observed_signature": str(result.get("observed_signature", "")),
+                    "best_failed_candidate_summary": result.get("best_failed_candidate_summary", {}),
+                    "candidate_id": str(result.get("candidate_id", "")),
+                    "candidate_score": result.get("candidate_score", []),
+                    "recursion_depth": int(result.get("recursion_depth", 0) or 0),
+                    "budget_remaining": result.get("budget_remaining", {}),
                 }
                 current_errors = _coerce_errors_text(result.get("errors", current_errors))
+                _has_verified_after_state = True
 
             elif action == "agent7_signature":
                 console.print("  [Agent8→Agent7] Dispatching signature audit...")
-                a7_prompt = decision.get("agent7_targeted_prompt", targeted_prompt) if isinstance(decision, dict) else targeted_prompt
+                a7_prompt = _resolve_decision_prompt(
+                    decision, "agent7_targeted_prompt", targeted_prompt
+                )
                 a7_plan, _a7_raw = _agent8_run_agent7(
                     target_file, current_errors, a7_prompt
                 )
@@ -2393,11 +2725,16 @@ def run_agent8_loop(
                     ),
                 }
                 current_errors = _coerce_errors_text(verify.get("errors", current_errors) if isinstance(verify, dict) else current_errors)
+                _has_verified_after_state = True
 
             elif action == "agent7_then_agent6":
                 console.print("  [Agent8→Agent7→Agent6] Dispatching signature + glue...")
-                a7_prompt = decision.get("agent7_targeted_prompt", targeted_prompt) if isinstance(decision, dict) else targeted_prompt
-                a6_prompt = decision.get("agent6_targeted_prompt", targeted_prompt) if isinstance(decision, dict) else targeted_prompt
+                a7_prompt = _resolve_decision_prompt(
+                    decision, "agent7_targeted_prompt", targeted_prompt
+                )
+                a6_prompt = _resolve_decision_prompt(
+                    decision, "agent6_targeted_prompt", targeted_prompt
+                )
                 result = _agent8_run_agent7_then_agent6(
                     target_file, current_errors, a7_prompt, a6_prompt,
                     agent9_plan=agent9_plan,
@@ -2412,6 +2749,7 @@ def run_agent8_loop(
                     "error_count": _count_error_lines(_coerce_errors_text(result.get("errors", ""))),
                 }
                 current_errors = _coerce_errors_text(result.get("errors", current_errors))
+                _has_verified_after_state = True
 
                 # Update per-lemma status from the dispatch result.
                 _max_lemma_att = RETRY_LIMITS.get("AGENT8_MAX_LEMMA_ATTEMPTS", 3)
@@ -2471,6 +2809,7 @@ def run_agent8_loop(
                         ),
                     }
                     current_errors = _coerce_errors_text(verify.get("errors", current_errors))
+                    _has_verified_after_state = True
                 else:
                     _graph_nodes = apollo_result.get("subproblem_graph", []) or []
                     if isinstance(_graph_nodes, list) and _graph_nodes:
@@ -2484,9 +2823,12 @@ def run_agent8_loop(
                         f"(kind={_apollo_failure_kind}); fallback={_fallback_action}"
                     )
                     if _fallback_action == "agent7_signature":
+                        _base_a7_prompt = _resolve_decision_prompt(
+                            decision, "agent7_targeted_prompt", targeted_prompt
+                        )
                         a7_prompt = (
                             f"[APOLLO fallback from {_apollo_failure_kind}] "
-                            + decision.get("agent7_targeted_prompt", targeted_prompt)
+                            + _base_a7_prompt
                         )
                         a7_plan, _a7_raw = _agent8_run_agent7(
                             target_file, current_errors, a7_prompt
@@ -2525,12 +2867,18 @@ def run_agent8_loop(
                             ),
                         }
                         current_errors = _coerce_errors_text(verify.get("errors", current_errors))
+                        _has_verified_after_state = True
                     elif _fallback_action == "agent7_then_agent6":
+                        _base_a7_prompt = _resolve_decision_prompt(
+                            decision, "agent7_targeted_prompt", targeted_prompt
+                        )
                         a7_prompt = (
                             f"[APOLLO fallback from {_apollo_failure_kind}] "
-                            + decision.get("agent7_targeted_prompt", targeted_prompt)
+                            + _base_a7_prompt
                         )
-                        a6_prompt = decision.get("agent6_targeted_prompt", targeted_prompt)
+                        a6_prompt = _resolve_decision_prompt(
+                            decision, "agent6_targeted_prompt", targeted_prompt
+                        )
                         result = _agent8_run_agent7_then_agent6(
                             target_file,
                             current_errors,
@@ -2551,6 +2899,7 @@ def run_agent8_loop(
                             ),
                         }
                         current_errors = _coerce_errors_text(result.get("errors", current_errors))
+                        _has_verified_after_state = True
                     else:
                         from orchestrator.phase3a_agent9 import run_agent9_replan as _run_a9_replan
                         _new_plan = _run_a9_replan(
@@ -2578,6 +2927,7 @@ def run_agent8_loop(
                             ),
                         }
                         current_errors = _coerce_errors_text(_replan_verify.get("errors", current_errors))
+                        _has_verified_after_state = True
 
             elif action == "agent9_replan":
                 console.print("  [Agent8→Agent9] Dispatching strategy re-planning via Agent9...")
@@ -2619,6 +2969,7 @@ def run_agent8_loop(
                     ),
                 }
                 current_errors = _coerce_errors_text(_replan_verify.get("errors", current_errors))
+                _has_verified_after_state = True
 
             elif action == "human_missing_assumption":
                 console.print(
@@ -2636,9 +2987,13 @@ def run_agent8_loop(
                     "action": action,
                     "target_theorem": decision.get("target_theorem"),
                     "error_signature": error_sig,
+                    "canonical_error_signature": _canonical_sig,
                     "hypothesis": hypothesis,
                     "evidence_hash": _evidence_hash(evidence),
+                    "investigation_tools": list(_investigation_tools_this_tick),
                     "error_subtype": _error_subtype,
+                    "verify_backend_used": _fresh_backend_used,
+                    "verify_backend_reason": _fresh_backend_reason,
                     "route_effective": False,
                     "api_shape_verified": False,
                     "main_error_signature_changed": False,
@@ -2649,6 +3004,10 @@ def run_agent8_loop(
                     "error_count_delta": 0,
                     "action_cooldowns": dict(_action_cooldowns),
                     "sorry_delta": 0,
+                    "forced_route_lock": _forced_route_lock,
+                    "forced_route_reason": _forced_route_reason,
+                    "network_cooldown_triggered": _network_cooldown_triggered,
+                    "subtype_policy_stage": _subtype_policy_stage,
                     **outcome,
                 })
                 _debug_log(
@@ -2668,24 +3027,36 @@ def run_agent8_loop(
                 "outcome": "network_failure" if _is_net else "dispatch_error",
                 "error": str(exc),
             }
+            if action == "agent7_signature" and outcome["outcome"] in {"network_failure", "dispatch_error"}:
+                _action_cooldowns["agent7_signature"] = max(
+                    int(_action_cooldowns.get("agent7_signature", 0)),
+                    max(1, int(RETRY_LIMITS.get("AGENT8_ROUTE_COOLDOWN_TICKS", 2))),
+                )
+                _network_cooldown_triggered = True
+                _forced_route_lock = True
+                _forced_route_reason = (
+                    "agent7_signature dispatch/network failure: apply cooldown and force alternate route next tick."
+                )
         if _direct_apply_errors:
             outcome["direct_apply_errors"] = list(_direct_apply_errors)
 
-        # Update running sorry count from outcome (keep previous on dispatch_error).
-        _current_sorry_count = int(outcome.get("sorry_count", _current_sorry_count))
-        _errors_after: str = current_errors
-        _sorry_delta: int = _current_sorry_count - _sorry_before
-        _top_error_count_after = int(
-            outcome.get("error_count", _count_error_lines(_errors_after))
+        _obs = _compute_post_dispatch_observability(
+            outcome=outcome,
+            has_verified_after_state=_has_verified_after_state,
+            errors_before=_errors_before,
+            errors_after_candidate=current_errors,
+            top_error_count_before=_top_error_count_before,
+            sorry_before=_sorry_before,
+            current_sorry_count=_current_sorry_count,
         )
-        _error_count_delta = _top_error_count_after - _top_error_count_before
-        _main_sig_changed = _signature_changed(_errors_before, _errors_after)
-        _route_effective: bool | None
-        if outcome.get("outcome") == "network_failure":
-            # Do not contaminate routing statistics with network transport failures.
-            _route_effective = None
-        else:
-            _route_effective = _top_error_count_after < _top_error_count_before
+        _has_verified_after_state = bool(_obs["has_verified_after_state"])
+        _errors_after = str(_obs["errors_after"])
+        _top_error_count_after = int(_obs["top_error_count_after"])
+        _error_count_delta = int(_obs["error_count_delta"])
+        _main_sig_changed = bool(_obs["main_error_signature_changed"])
+        _route_effective = _obs["route_effective"]
+        _current_sorry_count = int(_obs["sorry_after"])
+        _sorry_delta = int(_obs["sorry_delta"])
         if (
             _active_subproblem_node
             and outcome.get("outcome") not in {"success", "replan_done"}
@@ -2739,6 +3110,10 @@ def run_agent8_loop(
                 else 0
             ),
             queue_remaining=len(_serial_subproblem_queue),
+            forced_route_lock=_forced_route_lock,
+            forced_route_reason=_forced_route_reason,
+            network_cooldown_triggered=_network_cooldown_triggered,
+            subtype_policy_stage=_subtype_policy_stage,
         )
 
         # 6. Record decision
@@ -2747,9 +3122,13 @@ def run_agent8_loop(
             "action": action,
             "target_theorem": decision.get("target_theorem"),
             "error_signature": error_sig,
+            "canonical_error_signature": _canonical_sig,
             "hypothesis": hypothesis,
             "evidence_hash": _evidence_hash(evidence),
+            "investigation_tools": list(_investigation_tools_this_tick),
             "error_subtype": _error_subtype,
+            "verify_backend_used": _fresh_backend_used,
+            "verify_backend_reason": _fresh_backend_reason,
             "route_effective": _route_effective,
             "api_shape_verified": _api_shape_verified,
             "main_error_signature_changed": _main_sig_changed,
@@ -2760,6 +3139,10 @@ def run_agent8_loop(
             "error_count_delta": _error_count_delta,
             "action_cooldowns": dict(_action_cooldowns),
             "sorry_delta": _sorry_delta,
+            "forced_route_lock": _forced_route_lock,
+            "forced_route_reason": _forced_route_reason,
+            "network_cooldown_triggered": _network_cooldown_triggered,
+            "subtype_policy_stage": _subtype_policy_stage,
             "lemma_status": dict(_pending_lemma_status),  # snapshot at this tick
             "subproblem_node_id": (
                 str(_active_subproblem_node.get("id", ""))
@@ -2859,11 +3242,34 @@ def run_agent8_midcheck(
     """
     algo_name = Path(target_file).stem
     _decision_history: list[dict] = decision_history or []
+    from orchestrator.tools import run_lean_verify as _midcheck_verify
 
     console.print(
         f"\n[bold magenta][Agent8 MidCheck] Soft-gate at turn {turns_elapsed} "
         f"for {algo_name}"
     )
+
+    _fresh = _midcheck_verify(target_file)
+    current_errors = _coerce_errors_text(_fresh.get("errors", current_errors))
+    _fresh_backend_used = str(_fresh.get("verify_backend_used", ""))
+    _fresh_backend_reason = str(_fresh.get("verify_backend_reason", ""))
+    _structured_errors = _parse_lean_errors(current_errors)
+    _current_error_line = _extract_first_error_line(current_errors)
+    _prioritized_current_errors = _prioritize_error_text(
+        _structured_errors,
+        current_errors,
+        _current_error_line,
+        target_file,
+    )
+    _baseline_structured_errors = _parse_lean_errors(baseline_errors)
+    _baseline_error_line = _extract_first_error_line(baseline_errors)
+    _prioritized_baseline_errors = _prioritize_error_text(
+        _baseline_structured_errors,
+        baseline_errors,
+        _baseline_error_line,
+        target_file,
+    )
+    _canonical_sig = _canonical_error_signature(current_errors)
 
     # Classify error subtype for mid-check (same logic as main loop).
     _mc_error_subtype = _classify_error_subtype(
@@ -2873,17 +3279,41 @@ def run_agent8_midcheck(
     console.print(f"  [Agent8 MidCheck] error_subtype={_mc_error_subtype}")
 
     # Build context — reuse existing helper, no plan-update banner needed here.
+    _same_sig_streak = 1
+    for _entry in reversed(_decision_history):
+        if str(_entry.get("canonical_error_signature", "")) == _canonical_sig:
+            _same_sig_streak += 1
+        else:
+            break
+    _stale_hint = ""
+    if _same_sig_streak >= 3:
+        try:
+            _ctx_registry = ToolRegistry()
+            _ctx_registry.register_readonly_tools()
+            _stale_hint = _build_stale_error_hint(
+                _ctx_registry,
+                target_file,
+                current_errors,
+                _current_error_line,
+                _same_sig_streak,
+            )
+        except Exception:  # noqa: BLE001
+            _stale_hint = ""
     ctx = _build_agent8_tick_context(
         target_file,
-        current_errors,
+        _prioritized_current_errors,
         current_plan,
         _decision_history,
         agent9_plan=agent9_plan,
         plan_updated_tick=0,
         midcheck_mode=True,
         midcheck_turns_elapsed=turns_elapsed,
-        baseline_errors=baseline_errors,
+        baseline_errors=_prioritized_baseline_errors,
         error_subtype=_mc_error_subtype,
+        canonical_error_signature=_canonical_sig,
+        stale_error_hint=_stale_hint,
+        verify_backend_used=_fresh_backend_used,
+        verify_backend_reason=_fresh_backend_reason,
     )
 
     # Call Agent8 (single round, reduced investigation budget for speed).
@@ -2891,6 +3321,7 @@ def run_agent8_midcheck(
     _inv_registry = ToolRegistry()
     _inv_registry.register_investigation_tools()
     _max_inv = min(RETRY_LIMITS.get("AGENT8_INVESTIGATION_TURNS", 3), 2)
+    _investigation_tools_this_tick: list[str] = []
     raw_reply = _safe_llm_call(agent8, ctx, idempotent=True, max_attempts=3)
 
     for _inv_round in range(_max_inv):
@@ -2914,6 +3345,7 @@ def run_agent8_midcheck(
             except Exception as _exc:
                 _tr = {"error": str(_exc)}
             _inv_results.append({"tool": _tn, "result": _tr})
+            _investigation_tools_this_tick.append(str(_tn))
         raw_reply = _safe_llm_call(
             agent8,
             "Investigation results:\n"
@@ -2946,22 +3378,41 @@ def run_agent8_midcheck(
             "action": "agent3_tactical",
             "reason": "Mid-check parse failure — letting Agent3 continue",
             "targeted_prompt": "",
-            "error_signature": _extract_error_signature(current_errors),
+            "error_signature": _canonical_sig,
             "priority_level": "P3",
             "hypothesis": "Keep local tactical iteration when mid-check response is malformed.",
             "evidence": [
                 {"source": "midcheck", "snippet": "decision parse failed"},
-                {"source": "lean_verify", "snippet": _extract_error_signature(current_errors)},
+                {"source": "lean_verify", "snippet": _canonical_sig},
             ],
             "confidence": 0.2,
             "counterfactual": "Do not escalate based on malformed routing response.",
         }
+
+    if _is_structural_error(_canonical_sig, current_errors) and not _has_informative_investigation(
+        _investigation_tools_this_tick
+    ):
+        console.print(
+            "  [Agent8 MidCheck] Mandatory lookup gate: structural error requires "
+            "a real read/search/check_lean_expr investigation."
+        )
+        decision["action"] = "agent3_tactical"
+        decision["reason"] = (
+            "Mid-check blocked: structural error without informative investigation."
+        )
+        decision["targeted_prompt"] = (
+            "Perform read_file/search_in_file/search_codebase/check_lean_expr on the "
+            "current failing declaration before deciding whether to escalate."
+        )
 
     # Anti-loop check using the shared history.
     action, _antiloop_reason = _check_anti_loop(decision, _decision_history)
     if _antiloop_reason:
         console.print(f"  [AntiLoop/MidCheck] {action} ← {_antiloop_reason}")
         decision["action"] = action
+
+    _mc_forced_route_lock = False
+    _mc_forced_route_reason = ""
 
     # Consistent compile-first subtype routing (mirrors main loop).
     # derive from context if the decision carries the subtype
@@ -2998,6 +3449,8 @@ def run_agent8_midcheck(
     if _mc_delta_reason:
         console.print(f"  [DeltaForceFallback/MidCheck] {action} ← {_mc_delta_reason}")
         decision["action"] = action
+        _mc_forced_route_lock = True
+        _mc_forced_route_reason = _mc_delta_reason
 
     # Hard gate + cooldown in mid-check, reusing latest cooldown snapshot.
     action, _mc_hard_reason = _apply_hard_route_gate(
@@ -3011,6 +3464,46 @@ def run_agent8_midcheck(
     if _mc_hard_reason:
         console.print(f"  [HardRouteGate/MidCheck] {action} ← {_mc_hard_reason}")
         decision["action"] = action
+        _mc_forced_route_lock = True
+        _mc_forced_route_reason = _mc_hard_reason
+
+    action, _mc_net_reason, _ = _apply_network_cooldown_fallback(
+        action,
+        _mc_subtype,
+        _decision_history,
+        _mc_cooldowns,
+        cooldown_ticks=RETRY_LIMITS.get("AGENT8_ROUTE_COOLDOWN_TICKS", 2),
+    )
+    if _mc_net_reason:
+        console.print(f"  [NetworkCooldown/MidCheck] {action} ← {_mc_net_reason}")
+        decision["action"] = action
+        _mc_forced_route_lock = True
+        if not _mc_forced_route_reason:
+            _mc_forced_route_reason = _mc_net_reason
+    decision["error_signature"] = _canonical_sig
+    decision["canonical_error_signature"] = _canonical_sig
+    decision["investigation_tools"] = list(_investigation_tools_this_tick)
+    decision["verify_backend_used"] = _fresh_backend_used
+    decision["verify_backend_reason"] = _fresh_backend_reason
+
+    # Compile-first guard in mid-check must respect forced-route lock.
+    _action_before_cf = action
+    action, _unused_prompt, _mc_cf_reason = _apply_compile_first_subtype_gate(
+        action,
+        _mc_subtype,
+        "",
+        forced_route_lock=_mc_forced_route_lock,
+    )
+    if _mc_cf_reason:
+        decision["action"] = action
+        console.print(f"  [CompileFirst/MidCheck] {action} ← {_mc_cf_reason}")
+    elif _mc_forced_route_lock and _action_before_cf != action:
+        action = _action_before_cf
+        decision["action"] = action
+        console.print(
+            "  [CompileFirst/MidCheck] skipped due to forced route lock: "
+            f"{_mc_forced_route_reason}"
+        )
 
     _prev_errors = (
         str(_decision_history[-1].get("errors_after", ""))

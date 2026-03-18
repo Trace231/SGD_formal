@@ -22,31 +22,102 @@ class Gate4Error(RuntimeError):
 
 
 def _parse_persister_json(raw: str) -> list:
-    """Robustly parse Agent4 JSON output. Strips markdown blocks, tolerates trailing text.
-    Coerces a bare JSON object into a single-element list for forward compatibility."""
-    text = raw.strip()
-    # Step 1: Strip markdown code block if present.
-    match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
-    if match:
-        text = match.group(1).strip()
-    text = text.strip()
+    """Robustly parse Agent4 JSON output.
+
+    Tolerates:
+    - prose before/after JSON
+    - markdown fences
+    - multiple candidate JSON snippets in one reply
+    """
+    text = (raw or "").strip()
     if not text:
         raise ValueError("Persister output is empty")
-    # Step 2: If text doesn't start with { or [, find first occurrence (Agent4 may return prose before JSON)
-    start_idx = 0
-    for i, c in enumerate(text):
-        if c in ('{', '['):
-            start_idx = i
-            break
-    else:
-        raise ValueError("No JSON object or array found in persister output")
-    # Step 3: Parse from the first { or [
+
+    # Candidate pools: full text + fenced blocks.
+    candidates: list[str] = [text]
+    for m in re.finditer(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL):
+        block = (m.group(1) or "").strip()
+        if block:
+            candidates.append(block)
+
     decoder = json.JSONDecoder()
-    obj, _ = decoder.raw_decode(text, start_idx)
-    # Step 4: Coerce bare object to list (Agent4 sometimes returns a single op as an object)
-    if isinstance(obj, dict):
-        obj = [obj]
-    return obj
+    parse_errors: list[str] = []
+
+    def _coerce_ops(obj: object) -> list | None:
+        if isinstance(obj, dict):
+            return [obj]
+        if isinstance(obj, list):
+            return obj
+        return None
+
+    # Pass 1: raw_decode from every { or [ start index.
+    for cand in candidates:
+        for i, c in enumerate(cand):
+            if c not in ("{", "["):
+                continue
+            try:
+                obj, _end = decoder.raw_decode(cand, i)
+            except json.JSONDecodeError as exc:
+                parse_errors.append(f"raw_decode@{i}: line={exc.lineno}, col={exc.colno}, {exc.msg}")
+                continue
+            coerced = _coerce_ops(obj)
+            if coerced is not None:
+                return coerced
+
+    # Pass 2: bracket-balanced extraction fallback.
+    def _extract_balanced_snippets(s: str) -> list[str]:
+        snippets: list[str] = []
+        for start in range(len(s)):
+            ch = s[start]
+            if ch not in ("{", "["):
+                continue
+            close = "}" if ch == "{" else "]"
+            depth = 0
+            in_str = False
+            escape = False
+            for idx in range(start, len(s)):
+                cur = s[idx]
+                if in_str:
+                    if escape:
+                        escape = False
+                        continue
+                    if cur == "\\":
+                        escape = True
+                        continue
+                    if cur == '"':
+                        in_str = False
+                    continue
+                if cur == '"':
+                    in_str = True
+                    continue
+                if cur == ch:
+                    depth += 1
+                elif cur == close:
+                    depth -= 1
+                    if depth == 0:
+                        snippets.append(s[start : idx + 1])
+                        break
+        return snippets
+
+    for cand in candidates:
+        for snippet in _extract_balanced_snippets(cand):
+            try:
+                obj = json.loads(snippet)
+            except json.JSONDecodeError as exc:
+                parse_errors.append(
+                    f"json_loads snippet: line={exc.lineno}, col={exc.colno}, {exc.msg}"
+                )
+                continue
+            coerced = _coerce_ops(obj)
+            if coerced is not None:
+                return coerced
+
+    preview = text[:300].replace("\n", "\\n")
+    detail = "; ".join(parse_errors[:3]) if parse_errors else "no parse candidates"
+    raise ValueError(
+        "Persister output has no parseable JSON object/array. "
+        f"preview='{preview}' details={detail}"
+    )
 
 
 # ---------------------------------------------------------------------------

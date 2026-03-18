@@ -7,17 +7,23 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from orchestrator.repl_adapter import verify_with_repl
+from orchestrator.config import PROJECT_ROOT
 
-def _format_apollo_message(msg: dict[str, Any]) -> str:
+
+def _format_apollo_message(msg: dict[str, Any], target_rel: str) -> str:
     """Convert APOLLO Lean message objects to stable single-line diagnostics."""
     pos = msg.get("pos") or {}
     line = int(pos.get("line", 0) or 0)
     col = int(pos.get("column", 0) or 0)
     data = str(msg.get("data", "")).strip()
+    severity = str(msg.get("severity", "error") or "error").lower()
+    level = "warning" if severity == "warning" else "info" if severity == "info" else "error"
+    prefix = f"{target_rel}:" if target_rel else ""
     if line > 0 and col > 0:
-        return f"{line}:{col}: {data}"
+        return f"{prefix}{line}:{col}: {level}: {data}"
     if line > 0:
-        return f"{line}: {data}"
+        return f"{prefix}{line}: {level}: {data}"
     return data
 
 
@@ -37,6 +43,37 @@ def _count_source_sorrys(source_text: str) -> int:
     return count
 
 
+def _count_sorry_declarations(warnings_raw: list[Any]) -> int:
+    return sum(
+        1
+        for warning in warnings_raw
+        if isinstance(warning, dict)
+        and "declaration uses 'sorry'" in str(warning.get("data", ""))
+    )
+
+
+def _validate_repl_binding(*, project_root: Path, repl_workspace: Path) -> None:
+    execution_root = Path(project_root).resolve()
+    workspace = Path(repl_workspace).resolve()
+    if not execution_root.exists():
+        raise RuntimeError(f"repl_project_root_missing: {execution_root}")
+    if not (
+        (execution_root / "lakefile.lean").exists()
+        or (execution_root / "lakefile.toml").exists()
+    ):
+        raise RuntimeError(
+            f"repl_project_root_invalid: missing lakefile in {execution_root}"
+        )
+    if not workspace.exists():
+        raise RuntimeError(f"repl_workspace_missing: {workspace}")
+    repl_binary = workspace / ".lake" / "build" / "bin" / "repl"
+    if not repl_binary.exists():
+        raise RuntimeError(
+            f"repl_binary_missing: {repl_binary} "
+            f"(build the REPL workspace at {workspace})"
+        )
+
+
 def normalize_apollo_result(
     *,
     target_rel: str,
@@ -48,16 +85,18 @@ def normalize_apollo_result(
     warnings_raw = apollo_result.get("warnings", []) or []
     sorries = apollo_result.get("sorries", []) or []
 
-    errors = [
-        _format_apollo_message(m) for m in errors_raw if isinstance(m, dict)
-    ]
-    warnings = [
-        _format_apollo_message(m) for m in warnings_raw if isinstance(m, dict)
-    ]
+    if errors_raw and isinstance(errors_raw[0], str):
+        errors = [str(m).strip() for m in errors_raw if str(m).strip()]
+    else:
+        errors = [_format_apollo_message(m, target_rel) for m in errors_raw if isinstance(m, dict)]
+    if warnings_raw and isinstance(warnings_raw[0], str):
+        warnings = [str(m).strip() for m in warnings_raw if str(m).strip()]
+    else:
+        warnings = [_format_apollo_message(m, target_rel) for m in warnings_raw if isinstance(m, dict)]
     sorry_count = len(sorries)
     # Keep sorry accounting compatible with current consumers:
     # "sorry_declarations" ~= compiler-observed sorry declarations.
-    sorry_declarations = sorry_count
+    sorry_declarations = _count_sorry_declarations(warnings_raw)
     source_sorry_count = _count_source_sorrys(source_text)
     blocked_sorry_count = max(0, source_sorry_count - sorry_declarations)
 
@@ -76,6 +115,8 @@ def normalize_apollo_result(
         "errors": errors,
         "warnings": warnings,
         "verify_time": float(apollo_result.get("verify_time", 0.0) or 0.0),
+        "verify_backend_used": str(apollo_result.get("backend_used", "apollo_python")),
+        "verify_backend_reason": str(apollo_result.get("backend_reason", "apollo_python_success")),
     }
 
 
@@ -86,14 +127,38 @@ def verify_with_apollo(
     apollo_project_path: Path,
     repl_workspace: Path,
     lake_path: str,
+    project_root: Path = PROJECT_ROOT,
 ) -> dict[str, Any]:
-    """Run APOLLO's verify_lean4_file with explicit environment wiring."""
+    """Run APOLLO verification with REPL-first routing.
+
+    Route order:
+    1) Native REPL adapter (preferred, no APOLLO Python dependency)
+    2) APOLLO Python verifier fallback
+    """
     apollo_root = Path(apollo_project_path).resolve()
     workspace = Path(repl_workspace).resolve()
+    execution_root = Path(project_root).resolve()
+    _validate_repl_binding(project_root=execution_root, repl_workspace=workspace)
+
+    # Path A: native REPL adapter
+    repl_error: Exception | None = None
+    try:
+        return verify_with_repl(
+            code=code,
+            timeout=timeout,
+            repl_workspace=workspace,
+            project_root=execution_root,
+            lake_path=lake_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        repl_error = exc
+
+    # Path B: APOLLO Python verifier fallback
     if not apollo_root.exists():
-        raise RuntimeError(f"APOLLO project path does not exist: {apollo_root}")
-    if not workspace.exists():
-        raise RuntimeError(f"APOLLO repl workspace does not exist: {workspace}")
+        raise RuntimeError(
+            "apollo_import_error: APOLLO project path does not exist "
+            f"({apollo_root}); prior_repl_error={repl_error}"
+        ) from repl_error
 
     # Add APOLLO root to sys.path lazily so default lake flow has no import side effects.
     apollo_root_str = str(apollo_root)
@@ -104,21 +169,27 @@ def verify_with_apollo(
         from prover.lean.verifier import verify_lean4_file
     except Exception as exc:  # pragma: no cover - import failures are environment-specific
         raise RuntimeError(
-            "Failed to import APOLLO verifier. "
-            f"APOLLO root: {apollo_root}. Error: {exc}"
+            "apollo_import_error: failed to import APOLLO verifier. "
+            f"APOLLO root: {apollo_root}. Error: {exc}; prior_repl_error={repl_error}"
         ) from exc
 
     try:
-        return verify_lean4_file(
+        out = verify_lean4_file(
             code=code,
             timeout=timeout,
             lean_workspace=str(workspace),
             lake_path=lake_path,
+            repl_binary_path=str(workspace / ".lake" / "build" / "bin" / "repl"),
+            execution_root=str(execution_root),
         )
+        if isinstance(out, dict):
+            out.setdefault("backend_used", "apollo_python")
+            out.setdefault("backend_reason", "apollo_python_success")
+        return out
     except Exception as exc:
         # Bubble up with traceback in message so callers can surface actionable diagnostics.
         raise RuntimeError(
-            "APOLLO verification failed: "
-            f"{exc}\n{traceback.format_exc(limit=2)}"
+            "apollo_runtime_error: APOLLO verification failed: "
+            f"{exc}; prior_repl_error={repl_error}\n{traceback.format_exc(limit=2)}"
         ) from exc
 

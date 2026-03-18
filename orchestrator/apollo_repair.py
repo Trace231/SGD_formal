@@ -97,6 +97,7 @@ def build_subproblem_graph(
     current_errors: str,
     error_subtype: str = "",
     lemma_count: int = 0,
+    sublemma_statements: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Build an APOLLO-aligned serial subproblem graph for Agent8."""
     errors_text = str(current_errors or "")
@@ -123,7 +124,15 @@ def build_subproblem_graph(
     if error_subtype == "proof_api_mismatch":
         _push("proof_api_shape", 20, "proof callsites", snippet or "proof API markers")
 
-    # Glue blockers next.
+    # Glue/proof-state blockers next.
+    if sublemma_statements:
+        for idx2, stmt in enumerate(sublemma_statements[:5], start=1):
+            _push(
+                "proof_state_sublemma",
+                25 + idx2,
+                f"sublemma_{idx2}",
+                stmt or f"extracted sublemma #{idx2}",
+            )
     if kind == "glue_failure" or lemma_count > 0:
         _push("missing_glue", 30, f"bridge_lemmas(count={lemma_count})", snippet or "glue markers")
 
@@ -157,6 +166,7 @@ def run_apollo_decompose_repair(
             current_errors=current_errors,
             error_subtype=error_subtype,
             lemma_count=0,
+            sublemma_statements=[],
         )
         return {
             "status": "failed",
@@ -185,6 +195,7 @@ def run_apollo_decompose_repair(
             current_errors=str(exc) or current_errors,
             error_subtype=error_subtype,
             lemma_count=0,
+            sublemma_statements=[],
         )
         return {
             "status": "failed",
@@ -234,6 +245,7 @@ def run_apollo_decompose_repair(
             current_errors=str(exc) or current_errors,
             error_subtype=error_subtype,
             lemma_count=0,
+            sublemma_statements=[],
         )
         return {
             "status": "failed",
@@ -277,6 +289,7 @@ def run_apollo_decompose_repair(
         current_errors=inferred_error,
         error_subtype=error_subtype,
         lemma_count=int(lemma_meta.get("count", 0)),
+        sublemma_statements=list(lemma_meta.get("statements", []) or []),
     )
     return {
         "status": "failed",
@@ -288,6 +301,7 @@ def run_apollo_decompose_repair(
             "APOLLO decomposition did not reach complete proof; "
             f"failure_kind={kind}, lemmas={int(lemma_meta.get('count', 0))}."
         ),
+        "extracted_sublemmas": list(lemma_meta.get("statements", []) or []),
         "metrics": metrics,
         "subproblem_graph": graph,
     }

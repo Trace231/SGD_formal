@@ -22,6 +22,46 @@ from orchestrator.verify import check_glue_tricks_gate, check_used_in_tags
 
 console = Console()
 
+
+def _is_missing_doc_target_error(exc: Exception) -> bool:
+    """Return True when a doc patch should be skipped instead of failing Phase 4."""
+    if isinstance(exc, FileNotFoundError):
+        return True
+    return isinstance(exc, ValueError) and "Anchor not found" in str(exc)
+
+
+def _apply_doc_patch_with_fallback(
+    registry: ToolRegistry,
+    *,
+    path: str,
+    anchor: str,
+    new_content: str,
+    anchor_id: str,
+) -> dict[str, object]:
+    """Apply a doc patch, but skip missing files/anchors in reduced-doc setups."""
+    try:
+        result = registry.call(
+            "apply_doc_patch",
+            path=path,
+            anchor=anchor,
+            new_content=new_content,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if not _is_missing_doc_target_error(exc):
+            raise
+        console.print(
+            f"[yellow]\\[Agent4] Skipping {path} via {anchor_id}: {exc}"
+        )
+        return {
+            "path": path,
+            "anchor": anchor_id,
+            "changed": False,
+            "skipped": True,
+            "reason": str(exc),
+        }
+    result.setdefault("skipped", False)
+    return result
+
 def phase4_persist(
     algorithm: str,
     target_file: str,
@@ -83,11 +123,26 @@ def phase4_persist(
 
     try:
         patch_ops = _parse_persister_json(persistence_output)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            "[Phase 4] Persister returned invalid JSON. "
-            f"line={exc.lineno}, col={exc.colno}, msg={exc.msg}"
-        ) from exc
+    except Exception as first_exc:  # noqa: BLE001
+        console.print(
+            "[yellow]\\[Phase 4] Persister JSON parse failed; retrying once with strict JSON-only request..."
+        )
+        retry_output = agent4.call(
+            "Your previous output was not parseable JSON for patch_ops.\n"
+            "Return ONLY valid JSON now, no prose, no markdown fences.\n"
+            "Schema: JSON array of operations; each op object must include `op`.\n"
+            "Allowed op values: doc_patch, lib_write, algorithm_refactor.\n"
+            "Do not include comments or trailing text."
+        )
+        try:
+            patch_ops = _parse_persister_json(retry_output)
+            persistence_output = retry_output
+            console.print("[green]\\[Phase 4] Persister retry produced parseable JSON.")
+        except Exception as second_exc:  # noqa: BLE001
+            raise RuntimeError(
+                "[Phase 4] Persister returned invalid JSON after retry. "
+                f"first_error={first_exc}; second_error={second_exc}"
+            ) from second_exc
 
     if not isinstance(patch_ops, list):
         raise RuntimeError("[Phase 4] Persister output must be a JSON array.")
@@ -125,21 +180,24 @@ def phase4_persist(
                 continue
             # Guard B: for CATALOG_ALGO_LAYER, skip if algorithm section already exists.
             if anchor_id == "CATALOG_ALGO_LAYER":
-                catalog_text = (PROJECT_ROOT / "docs/CATALOG.md").read_text(encoding="utf-8")
-                algo_pat = (
-                    rf"^## Algorithm Layer \(Layer 2\)\s+—\s+`Algorithms/{re.escape(algorithm)}\.lean`"
-                )
-                if re.search(algo_pat, catalog_text, re.MULTILINE):
-                    console.print(
-                        f"[cyan]\\[Agent4] Algorithm section already exists in CATALOG.md — skipping"
+                catalog_path = PROJECT_ROOT / "docs/CATALOG.md"
+                if catalog_path.exists():
+                    catalog_text = catalog_path.read_text(encoding="utf-8")
+                    algo_pat = (
+                        rf"^## Algorithm Layer \(Layer 2\)\s+—\s+`Algorithms/{re.escape(algorithm)}\.lean`"
                     )
-                    continue
+                    if re.search(algo_pat, catalog_text, re.MULTILINE):
+                        console.print(
+                            f"[cyan]\\[Agent4] Algorithm section already exists in CATALOG.md — skipping"
+                        )
+                        continue
             cfg = allowed_anchors[anchor_id]
-            patch_result = registry.call(
-                "apply_doc_patch",
+            patch_result = _apply_doc_patch_with_fallback(
+                registry,
                 path=cfg["path"],
                 anchor=cfg["regex"],
                 new_content=content,
+                anchor_id=anchor_id,
             )
             changed = bool(patch_result.get("changed", False))
             patch_ops_summary.append({
@@ -147,6 +205,7 @@ def phase4_persist(
                 "anchor": anchor_id,
                 "path": cfg["path"],
                 "changed": changed,
+                "skipped": bool(patch_result.get("skipped", False)),
             })
             if changed:
                 patched_anchors.add(anchor_id)
@@ -162,9 +221,10 @@ def phase4_persist(
                 if cfg["path"] == "docs/CATALOG.md":
                     catalog_patch_fragments.append(content)
             else:
-                console.print(
-                    f"[cyan]\\[Agent4] Skipped duplicate content for {cfg['path']} ({anchor_id})"
-                )
+                if not bool(patch_result.get("skipped", False)):
+                    console.print(
+                        f"[cyan]\\[Agent4] Skipped duplicate content for {cfg['path']} ({anchor_id})"
+                    )
         elif op_type == "lib_write":
             lib_write_ops.append(op)
         elif op_type == "algorithm_refactor":

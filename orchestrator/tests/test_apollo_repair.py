@@ -41,6 +41,21 @@ def test_build_subproblem_graph_prioritizes_compile_then_glue_then_strategy():
     assert "missing_glue" in kinds
 
 
+def test_build_subproblem_graph_includes_extracted_sublemma_nodes():
+    graph = apollo_repair.build_subproblem_graph(
+        current_errors="unsolved goals",
+        error_subtype="proof_api_mismatch",
+        lemma_count=2,
+        sublemma_statements=[
+            "lemma subgradient_convergence_convex_1 : Foo := by sorry",
+            "lemma subgradient_convergence_convex_2 : Bar := by sorry",
+        ],
+    )
+    kinds = [n["kind"] for n in graph]
+    assert "proof_state_sublemma" in kinds
+    assert kinds.index("proof_state_sublemma") < kinds.index("missing_glue")
+
+
 def test_run_apollo_decompose_repair_reports_bootstrap_failure(tmp_path, monkeypatch):
     target = tmp_path / "T.lean"
     target.write_text("theorem t : True := by\n  sorry\n", encoding="utf-8")

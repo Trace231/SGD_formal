@@ -7,6 +7,7 @@ and the full phase3_prove implementation without behavior changes.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 from collections import Counter
 import time
 from datetime import datetime, timezone
@@ -37,11 +38,20 @@ from orchestrator.assumption_repair import (
     goals_to_patch_list,
 )
 from orchestrator.config import (
+    AGENT3_CANDIDATE_COUNT,
+    AGENT3_NO_IMPROVEMENT_WINDOW,
+    AGENT3_RECURSION_DEPTH,
+    AGENT3_SEARCH_ENABLED,
+    AGENT3_TACTIC_PROBE_ENABLED,
+    AGENT3_TACTIC_PROBE_STR,
+    AGENT3_TACTIC_STRATEGIES,
     AGENT6_AUTO_ROUTE_ENABLED,
     AGENT8_MIDCHECK_ENABLED,
     AGENT8_MIDCHECK_INTERVAL_TURNS,
     AGENT8_MIDCHECK_MIN_TURN,
     AGENT_CONFIGS,
+    APOLLO_LAKE_PATH,
+    APOLLO_REPL_WORKSPACE,
     AUDIT_FLUSH_INTERVAL_SECONDS,
     ALGORITHM_REFERENCES,
     DOC_ANCHORS,
@@ -49,6 +59,7 @@ from orchestrator.config import (
     MAX_PHASE3_RETRIES,
     PROJECT_ROOT,
     REFERENCE_FILES_WITH_DESCRIPTIONS,
+    REPL_VERIFY_TIMEOUT,
     RETRY_LIMITS,
     ROUTING_PARAMS,
     UNKNOWN_IDENTIFIER_RENAME_MAP,
@@ -184,6 +195,442 @@ console = Console()
 # Agent3 single-step interactive loop: maximum tool turns per attempt.
 # Archetype B gets a 1.5× multiplier applied in phase3_prove.
 MAX_AGENT3_TOOL_TURNS = 20
+_A3_SORRY_RE = re.compile(r"\bsorry\b")
+
+
+def _agent3_error_count(payload: dict[str, Any]) -> int:
+    try:
+        if "error_count" in payload:
+            return max(0, int(payload.get("error_count", 0)))
+    except Exception:
+        pass
+    errs = payload.get("errors", [])
+    if isinstance(errs, list):
+        return len(errs)
+    if isinstance(errs, str):
+        return len([ln for ln in errs.splitlines() if ln.strip()])
+    return 0
+
+
+def _agent3_score_verify(payload: dict[str, Any]) -> tuple[int, int, int, int, int]:
+    """Lower is better: compile > blocked_sorry > sorry > errors > verify_time."""
+    exit_code = int(payload.get("exit_code", 1))
+    blocked_sorry = int(payload.get("blocked_sorry_count", 0))
+    sorry_count = int(payload.get("sorry_count", 10**6))
+    error_count = _agent3_error_count(payload)
+    verify_ms = int(float(payload.get("verify_time", 0.0) or 0.0) * 1000.0)
+    return (int(exit_code != 0), max(0, blocked_sorry), max(0, sorry_count), error_count, verify_ms)
+
+
+def _agent3_score_result(payload: dict[str, Any]) -> tuple[int, int, int, int, int]:
+    exit_code = int(payload.get("exit_code", 1))
+    blocked_sorry = int(payload.get("blocked_sorry_count", payload.get("sorry_count", 0)))
+    sorry_count = int(payload.get("sorry_count", 10**6))
+    errors = payload.get("errors", [])
+    if isinstance(errors, list):
+        error_count = len(errors)
+    else:
+        error_count = len([ln for ln in str(errors).splitlines() if ln.strip()])
+    verify_ms = int(float(payload.get("verify_time", 0.0) or 0.0) * 1000.0)
+    return (int(exit_code != 0), max(0, blocked_sorry), max(0, sorry_count), error_count, verify_ms)
+
+
+def _run_tactic_probe(
+    *,
+    baseline_content: str,
+    session,
+    header_env_id: int | None,
+    tactic_str: str,
+) -> tuple[dict[str, Any], str] | None:
+    """APOLLO-style probe: replace `sorry` with a deterministic tactic chain."""
+    if session is None or header_env_id is None:
+        return None
+    probe_content = _A3_SORRY_RE.sub(tactic_str, baseline_content)
+    try:
+        try:
+            probe_verify = session.verify(
+                probe_content,
+                env=header_env_id,
+                target_label="probe",
+            )
+        except TypeError:
+            probe_verify = session.verify(probe_content, env=header_env_id)
+    except Exception:
+        return None
+    return probe_verify, probe_content
+
+
+def run_agent3_search_kernel(
+    target_file: str,
+    agent2_plan: str,
+    targeted_prompt: str,
+    allowed_edit_lines: str | None,
+    *,
+    max_turns: int | None = None,
+    compile_first_mode: bool = False,
+    transactional_mode: bool = False,
+    error_subtype: str = "",
+    run_single_candidate=None,
+) -> dict[str, Any]:
+    """APOLLO-style bounded search kernel for Agent3 execution.
+
+    Agent8 should only provide budget/routing context. Search/selection happens here.
+    """
+    if run_single_candidate is None:
+        raise ValueError("run_single_candidate callback is required")
+
+    from orchestrator.apollo_repair import build_subproblem_graph, classify_failure_kind
+    from orchestrator.apollo_sorrify import (
+        apply_hint_repair,
+        apply_sorrify,
+        apply_syntax_correction,
+        build_apollo_verify_callable,
+        extract_sublemmas,
+    )
+    from orchestrator.repl_adapter import ReplSession, _extract_header_lines
+    from orchestrator.tools import run_lean_verify
+
+    max_turns = max_turns or RETRY_LIMITS.get("AGENT8_AGENT3_MAX_TURNS", 15)
+    candidate_count = max(1, int(AGENT3_CANDIDATE_COUNT))
+    max_depth = max(0, int(AGENT3_RECURSION_DEPTH))
+    no_improve_window = max(1, int(AGENT3_NO_IMPROVEMENT_WINDOW))
+    search_enabled = bool(AGENT3_SEARCH_ENABLED) and not transactional_mode
+
+    target_path = Path(target_file)
+    if not target_path.is_absolute():
+        target_path = (PROJECT_ROOT / target_path).resolve()
+    baseline_content = target_path.read_text(encoding="utf-8")
+
+    baseline_verify = run_lean_verify(str(target_path))
+    baseline_score = _agent3_score_verify(baseline_verify)
+
+    repl_session: ReplSession | None = None
+    header_env_id: int | None = None
+    repl_session_error = ""
+    try:
+        repl_session = ReplSession(
+            repl_workspace=Path(APOLLO_REPL_WORKSPACE),
+            lake_path=APOLLO_LAKE_PATH,
+            timeout=REPL_VERIFY_TIMEOUT,
+            project_root=PROJECT_ROOT,
+        )
+        header_code = _extract_header_lines(baseline_content)
+        if header_code.strip():
+            header_env_id = repl_session.prime_header(header_code)
+    except Exception as exc:  # noqa: BLE001
+        repl_session = None
+        header_env_id = None
+        repl_session_error = str(exc)
+
+    prepass_meta: dict[str, Any] = {"applied": False, "changed": False}
+    # Keep APOLLO preprocess in main path before candidate search.
+    try:
+        try:
+            verifier = build_apollo_verify_callable(
+                session=repl_session,
+                header_env_id=header_env_id,
+            )
+        except TypeError:
+            verifier = build_apollo_verify_callable()
+        working = baseline_content
+        working, syntax_meta = apply_syntax_correction(working)
+        working, sorrify_meta = apply_sorrify(working, verifier)
+        working, hint_meta = apply_hint_repair(working, verifier)
+        prepass_meta = {
+            "applied": True,
+            "changed": working != baseline_content,
+            "syntax": syntax_meta,
+            "sorrify": sorrify_meta,
+            "hint": hint_meta,
+        }
+        if working != baseline_content:
+            target_path.write_text(working, encoding="utf-8")
+            pre_verify = run_lean_verify(str(target_path))
+            pre_score = _agent3_score_verify(pre_verify)
+            if pre_score <= baseline_score:
+                baseline_content = working
+                baseline_verify = pre_verify
+                baseline_score = pre_score
+            else:
+                target_path.write_text(baseline_content, encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        prepass_meta = {"applied": False, "error": str(exc), "changed": False}
+        try:
+            verifier = build_apollo_verify_callable()
+        except Exception:  # noqa: BLE001
+            verifier = lambda _code: {"pass": False, "complete": False, "errors": []}
+    prepass_meta["repl_session_active"] = repl_session is not None
+    prepass_meta["repl_header_env_id"] = header_env_id
+    if repl_session_error:
+        prepass_meta["repl_session_error"] = repl_session_error
+
+    probe_budget_per_round = 1 if AGENT3_TACTIC_PROBE_ENABLED else 0
+    total_candidate_budget = (candidate_count + probe_budget_per_round) * (max_depth + 1)
+    consumed_candidates = 0
+    no_improve_rounds = 0
+    depth = 0
+    search_prompt = targeted_prompt
+    best_failed_summary: dict[str, Any] = {}
+    strategy_hints = list(AGENT3_TACTIC_STRATEGIES) or ["general (no tactic preference)"]
+
+    try:
+        if not search_enabled:
+            out = run_single_candidate(
+                target_file,
+                agent2_plan,
+                targeted_prompt,
+                allowed_edit_lines,
+                max_turns=max_turns,
+                compile_first_mode=compile_first_mode,
+                transactional_mode=transactional_mode,
+                candidate_index=1,
+                candidate_total=1,
+            )
+            out.setdefault("candidate_id", "c1")
+            out.setdefault("candidate_score", list(_agent3_score_result(out)))
+            out.setdefault("recursion_depth", 0)
+            out.setdefault(
+                "budget_remaining",
+                {"depth": max_depth, "candidates": candidate_count * (max_depth + 1)},
+            )
+            out.setdefault("best_candidate_reason", "search_disabled_or_transactional")
+            out.setdefault("apollo_prepass_meta", prepass_meta)
+            return out
+
+        while depth <= max_depth:
+            best_result: dict[str, Any] | None = None
+            best_score: tuple[int, int, int, int, int] | None = None
+            best_content = baseline_content
+            candidate_artifacts: list[tuple[int, dict[str, Any], str, Path]] = []
+            candidate_paths: list[Path] = []
+            probe_path: Path | None = None
+
+            # APOLLO-aligned deterministic tactic probe candidate.
+            if AGENT3_TACTIC_PROBE_ENABLED:
+                probe = _run_tactic_probe(
+                    baseline_content=baseline_content,
+                    session=repl_session,
+                    header_env_id=header_env_id,
+                    tactic_str=AGENT3_TACTIC_PROBE_STR,
+                )
+                if probe is not None:
+                    probe_verify, probe_content = probe
+                    probe_norm: dict[str, Any] = {
+                        "exit_code": 0 if bool(probe_verify.get("pass", False)) else 1,
+                        "sorry_count": int(probe_verify.get("source_sorry_count", 0)),
+                        "sorry_declarations": int(probe_verify.get("sorry_declarations", 0)),
+                        "blocked_sorry_count": int(probe_verify.get("blocked_sorry_count", 0)),
+                        "error_count": len(probe_verify.get("errors", []) or []),
+                        "errors": probe_verify.get("errors_text", []),
+                        "warnings": probe_verify.get("warnings_text", []),
+                        "verify_time": float(probe_verify.get("verify_time", 0.0) or 0.0),
+                        "_probe_candidate": True,
+                    }
+                    probe_score = _agent3_score_result(probe_norm)
+                    probe_path = target_path.parent / f"{target_path.stem}__a3_d{depth + 1}_probe.lean"
+                    probe_path.write_text(probe_content, encoding="utf-8")
+                    candidate_artifacts.append((0, probe_norm, probe_content, probe_path))
+                    consumed_candidates += 1
+                    if probe_norm["exit_code"] == 0 and probe_norm["sorry_count"] == 0:
+                        target_path.write_text(probe_content, encoding="utf-8")
+                        probe_path.unlink(missing_ok=True)
+                        return {
+                            **probe_norm,
+                            "candidate_id": f"d{depth + 1}.probe",
+                            "candidate_score": list(probe_score),
+                            "recursion_depth": depth,
+                            "budget_remaining": {
+                                "depth": max(0, max_depth - depth),
+                                "candidates": max(0, total_candidate_budget - consumed_candidates),
+                            },
+                            "best_candidate_reason": "tactic_probe_clean",
+                            "apollo_prepass_meta": prepass_meta,
+                        }
+
+            def _run_parallel_candidate(idx0: int) -> tuple[int, dict[str, Any], str, Path]:
+                cand_idx = idx0 + 1
+                cand_path = target_path.parent / (
+                    f"{target_path.stem}__a3_d{depth + 1}_c{cand_idx}.lean"
+                )
+                cand_path.write_text(baseline_content, encoding="utf-8")
+                strategy_idx = idx0 % len(strategy_hints)
+                strategy_hint = strategy_hints[strategy_idx]
+                cand_prompt = (
+                    f"{search_prompt}\n\n"
+                    f"[Parallel Candidate Isolation]\n"
+                    f"- candidate_id: d{depth + 1}.c{cand_idx}\n"
+                    f"- operate only on target file: {cand_path}\n"
+                    f"- this candidate is isolated from other candidates.\n\n"
+                    f"[Tactic Strategy for This Candidate]\n"
+                    f"- preferred_strategy: {strategy_hint}\n"
+                    f"- Prefer tactics in this family when multiple options exist.\n"
+                    f"- Do NOT force this strategy if it does not fit the goal.\n"
+                )
+                result = run_single_candidate(
+                    str(cand_path),
+                    agent2_plan,
+                    cand_prompt,
+                    allowed_edit_lines,
+                    max_turns=max_turns,
+                    compile_first_mode=compile_first_mode,
+                    transactional_mode=transactional_mode,
+                    candidate_index=cand_idx,
+                    candidate_total=candidate_count,
+                )
+                content = cand_path.read_text(encoding="utf-8")
+                return cand_idx, result, content, cand_path
+
+            if candidate_count == 1:
+                candidate_artifacts.append(_run_parallel_candidate(0))
+            else:
+                with cf.ThreadPoolExecutor(max_workers=candidate_count) as ex:
+                    futs = [ex.submit(_run_parallel_candidate, i) for i in range(candidate_count)]
+                    for fut in cf.as_completed(futs):
+                        candidate_artifacts.append(fut.result())
+
+            candidate_artifacts.sort(key=lambda x: x[0])
+            candidate_paths = [it[3] for it in candidate_artifacts]
+            consumed_candidates += candidate_count
+
+            for cand_idx, candidate_result, candidate_content, _cand_path in candidate_artifacts:
+                candidate_score = _agent3_score_result(candidate_result)
+                if best_result is None or best_score is None or candidate_score < best_score:
+                    best_result = dict(candidate_result)
+                    best_score = candidate_score
+                    best_content = candidate_content
+                if int(candidate_result.get("exit_code", 1)) == 0 and int(
+                    candidate_result.get("sorry_count", -1)
+                ) == 0:
+                    target_path.write_text(candidate_content, encoding="utf-8")
+                    for p in candidate_paths:
+                        p.unlink(missing_ok=True)
+                    clean = dict(candidate_result)
+                    candidate_label = (
+                        f"d{depth + 1}.probe"
+                        if bool(candidate_result.get("_probe_candidate", False))
+                        else f"d{depth + 1}.c{cand_idx}"
+                    )
+                    clean.update(
+                        {
+                            "candidate_id": candidate_label,
+                            "candidate_score": list(candidate_score),
+                            "recursion_depth": depth,
+                            "budget_remaining": {
+                                "depth": max(0, max_depth - depth),
+                                "candidates": max(0, total_candidate_budget - consumed_candidates),
+                            },
+                            "best_candidate_reason": "clean_candidate_early_stop",
+                            "apollo_prepass_meta": prepass_meta,
+                        }
+                    )
+                    return clean
+
+            for p in candidate_paths:
+                p.unlink(missing_ok=True)
+            if probe_path is not None:
+                probe_path.unlink(missing_ok=True)
+
+            if best_result is None or best_score is None:
+                break
+
+            target_path.write_text(best_content, encoding="utf-8")
+            best_result = dict(best_result)
+            best_result.update(
+                {
+                    "candidate_id": f"d{depth + 1}.best",
+                    "candidate_score": list(best_score),
+                    "recursion_depth": depth,
+                    "budget_remaining": {
+                        "depth": max(0, max_depth - depth - 1),
+                        "candidates": max(0, total_candidate_budget - consumed_candidates),
+                    },
+                    "apollo_prepass_meta": prepass_meta,
+                }
+            )
+
+            # Improvement gate against current baseline.
+            if best_score < baseline_score:
+                no_improve_rounds = 0
+                best_result["best_candidate_reason"] = "best_candidate_improved_baseline"
+                return best_result
+            no_improve_rounds += 1
+
+            # No improvement: recurse to next subproblem if budget allows.
+            best_errors = str(best_result.get("errors", "") or "")
+            failure_kind, _, _ = classify_failure_kind(best_errors)
+            extracted_sublemmas: list[str] = []
+            try:
+                _lemmas, _lemma_meta = extract_sublemmas(best_content, verifier)
+                extracted_sublemmas = list(_lemma_meta.get("statements", []) or [])
+            except Exception:  # noqa: BLE001
+                extracted_sublemmas = []
+            graph = build_subproblem_graph(
+                current_errors=best_errors,
+                error_subtype=error_subtype,
+                lemma_count=len(extracted_sublemmas),
+                sublemma_statements=extracted_sublemmas,
+            )
+            best_failed_summary = {
+                "failure_kind": failure_kind,
+                "observed_signature": best_errors.splitlines()[0][:200] if best_errors else "",
+                "best_candidate_score": list(best_score),
+                "extracted_sublemmas": extracted_sublemmas[:5],
+                "subproblem_graph_head": graph[:2],
+            }
+            best_result["failure_kind"] = failure_kind
+            best_result["observed_signature"] = best_failed_summary["observed_signature"]
+            best_result["best_failed_candidate_summary"] = best_failed_summary
+
+            if no_improve_rounds >= no_improve_window:
+                best_result["best_candidate_reason"] = "no_improvement_window_reached"
+                return best_result
+
+            if depth >= max_depth:
+                best_result["best_candidate_reason"] = "max_recursion_depth_reached"
+                return best_result
+
+            if graph:
+                node = graph[0]
+                search_prompt = (
+                    f"{targeted_prompt}\n\n[APOLLO Subproblem Depth {depth + 1}]\n"
+                    f"- node_id: {node.get('id', '')}\n"
+                    f"- node_kind: {node.get('kind', '')}\n"
+                    f"- target: {node.get('target', '')}\n"
+                    f"- evidence: {node.get('evidence', '')}\n"
+                    "- Focus only this subproblem and produce minimal verified patch."
+                )
+            else:
+                search_prompt = (
+                    f"{targeted_prompt}\n\n[APOLLO Subproblem Depth {depth + 1}]\n"
+                    "- Focus top error signature only and avoid broad rewrites."
+                )
+
+            baseline_content = best_content
+            baseline_score = best_score
+            depth += 1
+
+        # Fallback failure envelope.
+        fallback = {
+            "exit_code": 1,
+            "sorry_count": int(baseline_verify.get("sorry_count", -1)),
+            "errors": str(baseline_verify.get("errors", "")),
+            "candidate_id": "none",
+            "candidate_score": list(baseline_score),
+            "recursion_depth": depth,
+            "budget_remaining": {
+                "depth": max(0, max_depth - depth),
+                "candidates": max(0, total_candidate_budget - consumed_candidates),
+            },
+            "best_candidate_reason": "no_candidate_or_budget_exhausted",
+            "apollo_prepass_meta": prepass_meta,
+            "failure_kind": best_failed_summary.get("failure_kind", "strategy_failure"),
+            "observed_signature": best_failed_summary.get("observed_signature", ""),
+            "best_failed_candidate_summary": best_failed_summary,
+        }
+        return fallback
+    finally:
+        if repl_session is not None:
+            repl_session.close()
 
 
 def phase3_prove(
@@ -859,6 +1306,11 @@ def phase3_prove(
             _direct_applied_patches: list[dict] = []
             _agent7_last_step_id: str | None = None
             _agent7_prev_sorry = last_sorry_count
+            _agent7_prev_error_count = len([ln for ln in str(last_errors or "").splitlines() if ln.strip()])
+            _agent7_prev_error_signature = next(
+                (ln.strip()[:240] for ln in str(last_errors or "").splitlines() if ln.strip()),
+                "",
+            )
             _agent7_no_progress_count = 0
             _agent7_force_stale_threshold = RETRY_LIMITS.get("AGENT7_FORCE_STALE_LINE_THRESHOLD", 3)
             _agent7_force_no_progress_turns_threshold = RETRY_LIMITS.get("AGENT7_FORCE_NO_PROGRESS_TURNS", 3)
@@ -1229,6 +1681,11 @@ def phase3_prove(
                     _agent7_pending_verify = False
                     _agent7_last_step_id = None
                     _agent7_prev_sorry = last_sorry_in_attempt
+                    _agent7_prev_error_count = len([ln for ln in str(last_verify_text or "").splitlines() if ln.strip()])
+                    _agent7_prev_error_signature = next(
+                        (ln.strip()[:240] for ln in str(last_verify_text or "").splitlines() if ln.strip()),
+                        "",
+                    )
                     _agent7_no_progress_count = 0
                     # Agent7 gatekeeper: allow Agent6 only when Agent7 says infra is missing.
                     _ft = plan_obj.get("fallback_trigger") or {}
@@ -1337,6 +1794,16 @@ def phase3_prove(
                                     last_exit_code = int(_da_verify.get("exit_code", 1))
                                     last_sorry_in_attempt = int(_da_verify.get("sorry_count", 0))
                                     last_verify_text = str(_da_verify.get("errors", ""))
+                                    _agent7_prev_error_count = int(
+                                        _da_verify.get(
+                                            "error_count",
+                                            len([ln for ln in last_verify_text.splitlines() if ln.strip()]),
+                                        )
+                                    )
+                                    _agent7_prev_error_signature = next(
+                                        (ln.strip()[:240] for ln in last_verify_text.splitlines() if ln.strip()),
+                                        "",
+                                    )
                                     _next_step_hint = ""
                                     if _agent7_current_step_idx < len(_steps):
                                         _ns = _steps[_agent7_current_step_idx]
@@ -1739,36 +2206,43 @@ def phase3_prove(
                 # Patch symbol pre-check: warn Agent3 about unverified identifiers
                 # before applying the patch (P1 - symbol existence gate).
                 if tool_name == "edit_file_patch":
-                    # Runtime trajectory check (P2): warn if Agent3 patches without
-                    # any preceding lookup in this attempt.
+                    _patch_warning = _check_patch_symbols(arguments, registry)
+                    # Hard gate: if a patch introduces unverifiable external symbols,
+                    # Agent3 must perform lookup first even on the first patch turn.
+                    if not _lookup_done_since_last_edit and _patch_warning:
+                        console.print(
+                            f"  [PatchSymbolGate] attempt {attempt} turn {tool_turn + 1} — "
+                            "blocking patch until lookup evidence exists"
+                        )
+                        _gate_msg = (
+                            "## BLOCKED — LOOKUP EVIDENCE REQUIRED BEFORE PATCH\n"
+                            "Your patch introduces external identifiers that are not backed by "
+                            "lookup evidence from this attempt.\n\n"
+                            f"{_patch_warning}\n\n"
+                            "Do NOT patch again yet. First call search_codebase, search_in_file, "
+                            "read_file, or check_lean_expr to verify the exact current API, then "
+                            "re-issue a minimal edit_file_patch."
+                        )
+                        raw_reply = agent3.call(_gate_msg)
+                        token_char_budget += len(_gate_msg) + len(raw_reply)
+                        continue
+
+                    # Runtime trajectory check (kept for pure local/syntax patches):
+                    # if no lookup occurred, remind Agent3 to verify before broader edits.
                     if not _lookup_done_since_last_edit and tool_turn > 0:
                         _patch_without_lookup_count += 1
                         if _patch_without_lookup_count <= 2:
                             _traj_warning = (
                                 "## ⚠ TRAJECTORY VIOLATION — PATCH WITHOUT LOOKUP\n"
-                                "You are about to apply a patch without having called "
-                                "search_codebase, search_in_file, or read_file since the "
-                                "last edit in this attempt.\n\n"
-                                "We STRONGLY RECOMMEND verifying identifiers before patching.\n\n"
-                                "Call search_codebase or search_in_file for the identifiers in "
-                                "your REPLACE block NOW, then re-issue your edit_file_patch.\n\n"
-                                "Exception: if these are Lean built-in tactics (simp, ring, etc.) "
-                                "or local binders, you may ignore this warning."
+                                "You are patching without having called search_codebase, "
+                                "search_in_file, or read_file since the last edit.\n\n"
+                                "This is only acceptable for purely local syntax/binder fixes. "
+                                "If the patch touches any external API, verify it first.\n"
                             )
                             raw_reply = agent3.call(_traj_warning)
                             token_char_budget += len(_traj_warning) + len(raw_reply)
-                            continue  # let Agent3 do a lookup before patching
+                            continue
                     _lookup_done_since_last_edit = False  # reset after edit
-
-                    _patch_warning = _check_patch_symbols(arguments, registry)
-                    if _patch_warning:
-                        console.print(
-                            f"  [PatchSymbolCheck] attempt {attempt} turn {tool_turn + 1} — "
-                            "unverified identifiers detected, feeding back to Agent3"
-                        )
-                        raw_reply = agent3.call(_patch_warning)
-                        token_char_budget += len(_patch_warning) + len(raw_reply)
-                        continue  # let Agent3 self-correct before applying patch
 
                 # Pre-edit snapshot: capture file content before Agent3's patch so
                 # we can rollback if protected content (from DirectApply) is removed.
@@ -1893,9 +2367,26 @@ def phase3_prove(
                     # Agent7 execution gate: evaluate current step only on verify.
                     if _active_agent7_plan is not None and _agent7_pending_verify:
                         _current_line = _extract_first_error_line(last_verify_text)
+                        _current_error_count = int(
+                            verify_result.get(
+                                "error_count",
+                                len([ln for ln in last_verify_text.splitlines() if ln.strip()]),
+                            )
+                        )
+                        _current_error_signature = next(
+                            (ln.strip()[:240] for ln in last_verify_text.splitlines() if ln.strip()),
+                            "",
+                        )
+                        _error_count_improved = _current_error_count < int(_agent7_prev_error_count)
+                        _main_sig_changed = (
+                            bool(_current_error_signature)
+                            and _current_error_signature != str(_agent7_prev_error_signature)
+                        )
                         _progress = (
                             last_sorry_in_attempt < _agent7_prev_sorry
                             or (last_exit_code == 0 and last_sorry_in_attempt == 0)
+                            or _error_count_improved
+                            or _main_sig_changed
                         )
                         _regress = last_sorry_in_attempt > _agent7_prev_sorry
                         if _regress:
@@ -1911,6 +2402,9 @@ def phase3_prove(
                             "exit_code": last_exit_code,
                             "sorry_before": _agent7_prev_sorry,
                             "sorry_after": last_sorry_in_attempt,
+                            "error_count_before": _agent7_prev_error_count,
+                            "error_count_after": _current_error_count,
+                            "main_error_signature_changed": _main_sig_changed,
                             "error_line": _current_line,
                             "accepted": bool(_progress and not _regress),
                         })
@@ -1926,6 +2420,8 @@ def phase3_prove(
                                     _agent7_current_step_idx + 1, max(0, len(_steps) - 1)
                                 )
                             _agent7_pending_verify = False
+                            _agent7_prev_error_count = _current_error_count
+                            _agent7_prev_error_signature = _current_error_signature
                         elif _agent7_no_progress_count >= _agent7_no_progress_threshold:
                             exec_results.append(ExecutionResult(
                                 status_code="BLOCKED",
@@ -1963,6 +2459,8 @@ def phase3_prove(
                                 _agent7_current_step_idx = 0
                                 _agent7_last_step_id = None
                                 _agent7_prev_sorry = last_sorry_in_attempt
+                                _agent7_prev_error_count = _current_error_count
+                                _agent7_prev_error_signature = _current_error_signature
                                 agent7_plan_revisions.append({
                                     "attempt": attempt,
                                     "turn": tool_turn + 1,

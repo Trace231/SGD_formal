@@ -500,7 +500,7 @@ def _check_patch_symbols(
     missing: list[str] = []
     for name in candidates[:8]:  # limit to first 8 to avoid excessive API calls
         try:
-            result = registry.call("search_codebase", query=name)
+            result = registry.call("search_codebase", pattern=name)
             result_text = str(result)
             if not result_text or result_text.strip() in ("", "[]", "null", "{}"):
                 missing.append(name)

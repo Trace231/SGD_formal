@@ -77,10 +77,10 @@ variable (setup : SubgradientSetup E S Ω)
 
 @[simp]
 theorem process_zero : process setup 0 = fun _ => setup.w₀ := by
-  rfl
+  sorry
 @[simp]
 theorem process_succ (t : ℕ) : process setup (t + 1) = fun ω => process setup t ω - setup.η t • setup.gradL (process setup t ω) (setup.ξ t ω) := by
-  rfl
+  sorry
 
 end SubgradientSetup
 
@@ -106,13 +106,4 @@ theorem subgradient_convergence_convex
     (1 / (T : ℝ)) * ∑ t ∈ Finset.range T,
         (∫ ω, f (setup.process t ω) ∂setup.P - f wStar) ≤
       ‖setup.w₀ - wStar‖ ^ 2 / (2 * η * T) + η * G ^ 2 / 2 := by
-  have hη_const : ∀ t, setup.η t = η := hη
-  have h_pointwise : ∀ t ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ≤ ‖setup.process t ω - wStar‖ ^ 2 - 2 * η * ⟪setup.process t ω - wStar, setup.gradL (setup.process t ω) (setup.ξ t ω)⟫_ℝ + η ^ 2 * ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 := by
-    intro t ω
-    have hη_t : setup.η t = η := hη_const t
-    rw [SubgradientSetup.process_succ, hη_t]
-    have := norm_sq_sgd_step (setup.process t ω) (setup.gradL (setup.process t ω) (setup.ξ t ω)) wStar η
-    rw [this]
-    <;> ring_nf
   sorry
-

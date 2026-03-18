@@ -50,6 +50,7 @@ AGENT8_REQUIRED_DECISION_FIELDS = frozenset(
 )
 AGENT8_VALID_ERROR_SUBTYPES = frozenset(
     {
+        "declaration_syntax_failure",
         "declaration_api_mismatch",
         "proof_api_mismatch",
         "proof_tactic_failure",
@@ -72,6 +73,7 @@ Agent8Action = Literal[
     "human_missing_assumption",
 ]
 Agent8ErrorSubtype = Literal[
+    "declaration_syntax_failure",
     "declaration_api_mismatch",
     "proof_api_mismatch",
     "proof_tactic_failure",

@@ -4,7 +4,14 @@ including API-mismatch precision (subtype classifier, route downweight)."""
 import orchestrator.phase3_agent8 as a8
 
 from orchestrator.phase3_agent8 import (
+    _SUBTYPE_DECLARATION_SYNTAX_FAILURE,
+    _compute_post_dispatch_observability,
+    _coerce_prompt_text,
+    _resolve_decision_prompt,
     _apply_delta_force_fallback,
+    _apply_subtype_route_policy,
+    _apply_network_cooldown_fallback,
+    _apply_compile_first_subtype_gate,
     _SUBTYPE_DECLARATION_API_MISMATCH,
     _SUBTYPE_PROOF_API_MISMATCH,
     _SUBTYPE_PROOF_TACTIC_FAILURE,
@@ -144,6 +151,12 @@ def test_classify_unknown_identifier_is_declaration():
     errors = "Foo.lean:10:0: error: unknown identifier 'myLemma'"
     result = _classify_error_subtype(errors)
     assert result == _SUBTYPE_DECLARATION_API_MISMATCH, f"got {result!r}"
+
+
+def test_classify_unexpected_token_is_declaration_syntax_failure():
+    errors = "Foo.lean:7:18: error: unexpected token '*'; expected '}'"
+    result = _classify_error_subtype(errors)
+    assert result == _SUBTYPE_DECLARATION_SYNTAX_FAILURE, f"got {result!r}"
 
 
 def test_classify_tactic_failure_no_api():
@@ -461,6 +474,71 @@ def test_schema_invalid_error_subtype_rejected():
     assert "error_subtype" in msg
 
 
+def test_subtype_policy_first_tick_prefers_agent7_for_declaration_syntax():
+    action, stage, reason, forced = _apply_subtype_route_policy(
+        "agent3_tactical",
+        _SUBTYPE_DECLARATION_SYNTAX_FAILURE,
+        [],
+    )
+    assert action == "agent7_signature"
+    assert stage == "first_try_agent7"
+    assert not forced
+    assert "first attempt" in reason
+
+
+def test_subtype_policy_forces_agent3_after_first_agent7_try():
+    history = [
+        {
+            "error_subtype": _SUBTYPE_DECLARATION_SYNTAX_FAILURE,
+            "action": "agent7_signature",
+            "outcome": "failed",
+        }
+    ]
+    action, stage, reason, forced = _apply_subtype_route_policy(
+        "agent7_signature",
+        _SUBTYPE_DECLARATION_SYNTAX_FAILURE,
+        history,
+    )
+    assert action == "agent3_tactical"
+    assert stage == "forced_to_agent3"
+    assert forced
+    assert "persisted" in reason
+
+
+def test_compile_first_respects_forced_route_lock():
+    action, prompt, reason = _apply_compile_first_subtype_gate(
+        "agent9_replan",
+        _SUBTYPE_DECLARATION_API_MISMATCH,
+        "base prompt",
+        forced_route_lock=True,
+    )
+    assert action == "agent9_replan"
+    assert prompt == "base prompt"
+    assert reason == ""
+
+
+def test_network_cooldown_moves_agent7_to_agent3():
+    history = [
+        {
+            "action": "agent7_signature",
+            "outcome": "network_failure",
+            "error_subtype": _SUBTYPE_DECLARATION_SYNTAX_FAILURE,
+        }
+    ]
+    cooldowns = {}
+    action, reason, triggered = _apply_network_cooldown_fallback(
+        "agent7_signature",
+        _SUBTYPE_DECLARATION_SYNTAX_FAILURE,
+        history,
+        cooldowns,
+        cooldown_ticks=2,
+    )
+    assert triggered is True
+    assert action == "agent3_tactical"
+    assert cooldowns.get("agent7_signature") == 2
+    assert "forcing agent3_tactical" in reason
+
+
 def test_agent9_hints_are_reference_only_context():
     plan = {
         "theorems": [
@@ -482,3 +560,76 @@ def test_agent9_hints_are_reference_only_context():
     assert "NON-BINDING" in ctx
     assert "first_action_patch_hint" in ctx
     assert "expected_lean_shape" in ctx
+
+
+def test_prompt_resolution_is_none_safe_for_apollo_fallback():
+    decision = {"agent7_targeted_prompt": None}
+    prompt = _resolve_decision_prompt(decision, "agent7_targeted_prompt", "fallback")
+    assert prompt == "fallback"
+    assembled = "[APOLLO fallback] " + prompt
+    assert assembled.endswith("fallback")
+    assert _coerce_prompt_text("", "fallback") == "fallback"
+
+
+def test_dispatch_error_metrics_are_frozen_without_verify_after_state():
+    obs = _compute_post_dispatch_observability(
+        outcome={"outcome": "dispatch_error", "error_count": 1, "sorry_count": 0},
+        has_verified_after_state=False,
+        errors_before="E_before",
+        errors_after_candidate="E_after_should_not_apply",
+        top_error_count_before=13,
+        sorry_before=7,
+        current_sorry_count=3,
+    )
+    assert obs["has_verified_after_state"] is False
+    assert obs["errors_after"] == "E_before"
+    assert obs["top_error_count_after"] == 13
+    assert obs["error_count_delta"] == 0
+    assert obs["main_error_signature_changed"] is False
+    assert obs["route_effective"] is False
+    assert obs["sorry_after"] == 7
+    assert obs["sorry_delta"] == 0
+
+
+def test_route_effective_requires_verify_backed_after_state():
+    verified_obs = _compute_post_dispatch_observability(
+        outcome={"outcome": "failed", "error_count": 2, "sorry_count": 4},
+        has_verified_after_state=True,
+        errors_before="Foo.lean:1:1: error: old",
+        errors_after_candidate="Foo.lean:2:2: error: new",
+        top_error_count_before=5,
+        sorry_before=6,
+        current_sorry_count=6,
+    )
+    assert verified_obs["has_verified_after_state"] is True
+    assert verified_obs["top_error_count_after"] == 2
+    assert verified_obs["error_count_delta"] == -3
+    assert verified_obs["route_effective"] is True
+
+    non_verified_obs = _compute_post_dispatch_observability(
+        outcome={"outcome": "failed", "error_count": 1, "sorry_count": 0},
+        has_verified_after_state=False,
+        errors_before="Foo.lean:1:1: error: old",
+        errors_after_candidate="Foo.lean:2:2: error: new",
+        top_error_count_before=5,
+        sorry_before=6,
+        current_sorry_count=2,
+    )
+    assert non_verified_obs["has_verified_after_state"] is False
+    assert non_verified_obs["top_error_count_after"] == 5
+    assert non_verified_obs["error_count_delta"] == 0
+    assert non_verified_obs["route_effective"] is False
+
+
+def test_route_effective_accepts_primary_signature_change():
+    obs = _compute_post_dispatch_observability(
+        outcome={"outcome": "failed", "error_count": 5, "sorry_count": 6},
+        has_verified_after_state=True,
+        errors_before="Foo.lean:1:1: error: old",
+        errors_after_candidate="Foo.lean:2:2: error: new",
+        top_error_count_before=5,
+        sorry_before=6,
+        current_sorry_count=6,
+    )
+    assert obs["main_error_signature_changed"] is True
+    assert obs["route_effective"] is True

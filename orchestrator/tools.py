@@ -18,12 +18,14 @@ from orchestrator.config import (
     APOLLO_LAKE_PATH,
     APOLLO_PROJECT_PATH,
     APOLLO_REPL_WORKSPACE,
+    REPL_VERIFY_TIMEOUT,
     APOLLO_VERIFY_TIMEOUT,
     LEAN_BUILD_TIMEOUT,
     LEAN_VERIFY_BACKEND,
     LEAN_VERIFY_PATHS,
     PROJECT_ROOT,
     READ_ONLY_PATHS,
+    VERIFY_BACKEND_STRICT,
     WHITELIST_PATHS,
 )
 from orchestrator.verify import count_sorrys, lake_build
@@ -34,6 +36,9 @@ _DOC_ALLOWLIST = tuple(p for p in _READ_WRITE_ALLOWLIST if p == "docs")
 # Extended read-only allowlist — includes root infrastructure files (Main.lean, lakefile.lean)
 # so agents can inspect the import graph without write access.
 _READ_ONLY_ALLOWLIST = tuple(p.rstrip("/") for p in READ_ONLY_PATHS)
+_REQUIRED_IMPORTS_BY_FILE: dict[str, set[str]] = {
+    "Algorithms/SubgradientMethod.lean": {"import Main"},
+}
 
 
 def _to_rel(path: Path) -> str:
@@ -331,6 +336,109 @@ def search_in_file_readonly(
     return result
 
 
+def _extract_new_mathlib_imports(old_text: str, new_text: str) -> list[str]:
+    """Return Mathlib module names that are newly added in new_text vs old_text."""
+    _IMPORT_RE = re.compile(r"^\s*import\s+(Mathlib(?:\.\w+)+)", re.MULTILINE)
+    before = set(_IMPORT_RE.findall(old_text))
+    after = set(_IMPORT_RE.findall(new_text))
+    return sorted(after - before)
+
+
+def _extract_import_lines(text: str) -> list[str]:
+    """Return normalized import lines in source order."""
+    imports: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("import "):
+            imports.append(line)
+    return imports
+
+
+def _required_imports_for_rel_path(rel_path: str) -> set[str]:
+    return set(_REQUIRED_IMPORTS_BY_FILE.get(rel_path, set()))
+
+
+def validate_required_imports(
+    *,
+    rel_path: str,
+    old_text: str,
+    new_text: str,
+) -> list[str]:
+    """Return errors when a protected file loses required import lines."""
+    required = _required_imports_for_rel_path(rel_path)
+    if not required:
+        return []
+    before = set(_extract_import_lines(old_text))
+    after = set(_extract_import_lines(new_text))
+    missing = sorted((required & before) - after)
+    if not missing:
+        return []
+    return [
+        (
+            f"required import removed in {rel_path}: `{imp}`. "
+            "This import is protected and cannot be deleted by tactical patches."
+        )
+        for imp in missing
+    ]
+
+
+def validate_required_import_presence(*, rel_path: str, new_text: str) -> list[str]:
+    """Return errors when a protected file does not include required imports."""
+    required = _required_imports_for_rel_path(rel_path)
+    if not required:
+        return []
+    present = set(_extract_import_lines(new_text))
+    missing = sorted(required - present)
+    return [
+        (
+            f"required import missing in {rel_path}: `{imp}`. "
+            "This file must keep this import."
+        )
+        for imp in missing
+    ]
+
+
+def _mathlib_import_path(module: str) -> Path:
+    """Convert a Lean module name like Mathlib.A.B.C to its .lean file path."""
+    rel = module.replace(".", "/") + ".lean"
+    return PROJECT_ROOT / ".lake" / "packages" / "mathlib" / rel
+
+
+def validate_mathlib_imports(old_text: str, new_text: str) -> list[str]:
+    """Return error strings for newly added Mathlib imports whose files do not exist.
+
+    Returns an empty list when all new imports are valid.
+    Callers should raise ValueError on non-empty results to block the patch.
+    """
+    errors: list[str] = []
+    for module in _extract_new_mathlib_imports(old_text, new_text):
+        lean_file = _mathlib_import_path(module)
+        if not lean_file.exists():
+            # Try to find the closest real path to help the agent self-correct.
+            parts = module.split(".")
+            suggestion = ""
+            # Walk up the hierarchy looking for an existing directory.
+            for depth in range(len(parts), 0, -1):
+                candidate_dir = PROJECT_ROOT / ".lake" / "packages" / "mathlib" / Path(*parts[:depth])
+                if candidate_dir.is_dir():
+                    # List first-level children as hints.
+                    children = sorted(
+                        p.stem for p in candidate_dir.iterdir()
+                        if p.suffix == ".lean" or p.is_dir()
+                    )[:8]
+                    suggestion = (
+                        f" Nearest existing path: {'/'.join(parts[:depth])}/ "
+                        f"(contains: {', '.join(children)})"
+                    )
+                    break
+            errors.append(
+                f"import {module}: file not found in mathlib package "
+                f"({lean_file.relative_to(PROJECT_ROOT)}).{suggestion} "
+                f"Use search_codebase to find the correct module path before importing."
+            )
+    return errors
+
+
 def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, Any]:
     """Apply an exact single-string replacement instead of full overwrite.
 
@@ -345,6 +453,7 @@ def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, A
     write_path = resolved
     if not write_path.exists():
         raise FileNotFoundError(f"Target file does not exist: {path}")
+    rel_path = _to_rel(write_path)
 
     original = write_path.read_text(encoding="utf-8")
     occurrences = original.count(old_str)
@@ -373,12 +482,96 @@ def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, A
         )
 
     updated = original.replace(old_str, new_str, 1)
+    _imports_before = _extract_import_lines(original)
+    _imports_after = _extract_import_lines(updated)
+    _imports_changed = _imports_before != _imports_after
+    _is_lean_file = str(write_path).endswith(".lean")
+
+    _required_errors = validate_required_imports(
+        rel_path=rel_path,
+        old_text=original,
+        new_text=updated,
+    )
+    if _required_errors:
+        raise ValueError(
+            "Patch blocked: required import guard triggered. Fix the patch and retry:\n"
+            + "\n".join(f"  • {e}" for e in _required_errors)
+        )
+
+    # Validate any newly added Mathlib imports before writing.
+    _import_errors = validate_mathlib_imports(original, updated)
+    if _import_errors:
+        raise ValueError(
+            "Patch blocked: newly added Mathlib import(s) do not exist in the "
+            "pinned mathlib package. Fix the import path(s) first:\n"
+            + "\n".join(f"  • {e}" for e in _import_errors)
+        )
+
+    _verify_before: dict[str, Any] | None = None
+    if _is_lean_file and _imports_changed:
+        try:
+            _verify_before = run_lean_verify(rel_path)
+        except Exception:
+            _verify_before = None
+
     _atomic_write(write_path, updated)
+    _rolled_back = False
+    _rollback_reason = ""
+
+    if _is_lean_file and _imports_changed:
+        def _verify_error_count(payload: dict[str, Any] | None) -> int:
+            if not isinstance(payload, dict):
+                return 0
+            try:
+                if "error_count" in payload:
+                    return max(0, int(payload.get("error_count", 0)))
+            except Exception:
+                pass
+            errs = payload.get("errors", [])
+            if isinstance(errs, list):
+                return len(errs)
+            if isinstance(errs, str):
+                return len([ln for ln in errs.splitlines() if ln.strip()])
+            return 0
+
+        try:
+            _verify_after = run_lean_verify(rel_path)
+        except Exception as _exc:
+            _verify_after = {
+                "exit_code": 1,
+                "error_count": 999,
+                "errors": f"post_patch_verify_exception: {_exc}",
+            }
+
+        _before_exit = int((_verify_before or {}).get("exit_code", 0))
+        _after_exit = int((_verify_after or {}).get("exit_code", 0))
+        _before_err = _verify_error_count(_verify_before)
+        _after_err = _verify_error_count(_verify_after)
+        _regressed = (
+            (_before_exit == 0 and _after_exit != 0)
+            or (_after_exit != 0 and _before_err >= 0 and _after_err > _before_err + 1)
+        )
+
+        if _regressed:
+            _atomic_write(write_path, original)
+            _rolled_back = True
+            _rollback_reason = (
+                "import_change_regressed_verify "
+                f"(exit { _before_exit } -> { _after_exit }, "
+                f"errors { _before_err } -> { _after_err })"
+            )
+            raise ValueError(
+                "Patch rolled back: import-touching edit caused verify regression. "
+                f"Reason: {_rollback_reason}"
+            )
 
     return {
-        "path": str(resolved.relative_to(PROJECT_ROOT)),
+        "path": rel_path,
         "replacements": 1,
         "changed": original != updated,
+        "imports_changed": _imports_changed,
+        "patch_rolled_back": _rolled_back,
+        "rollback_reason": _rollback_reason,
         # For full-audit, callers can log before/after/patch based on these.
         "before": original,
         "after": updated,
@@ -397,9 +590,29 @@ def write_new_file(path: str | Path, content: str) -> dict[str, Any]:
         raise FileExistsError(
             f"File already exists: {path}. Use edit_file_patch to modify it."
         )
+    rel_path = _to_rel(write_path)
+    _required_errors = validate_required_import_presence(
+        rel_path=rel_path,
+        new_text=content,
+    )
+    if _required_errors:
+        raise ValueError(
+            "File creation blocked: required import guard triggered. "
+            "Fix the file imports first:\n"
+            + "\n".join(f"  • {e}" for e in _required_errors)
+        )
+    # Validate any Mathlib imports in the new file before writing.
+    _import_errors = validate_mathlib_imports("", content)
+    if _import_errors:
+        raise ValueError(
+            "File creation blocked: Mathlib import(s) do not exist in the "
+            "pinned mathlib package. Fix the import path(s) first:\n"
+            + "\n".join(f"  • {e}" for e in _import_errors)
+        )
+
     _atomic_write(write_path, content)
     return {
-        "path": str(resolved.relative_to(PROJECT_ROOT)),
+        "path": rel_path,
         "created": True,
         "size_bytes": len(content.encode("utf-8")),
         "after": content,
@@ -792,6 +1005,8 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
 
     rel = str(resolved.relative_to(PROJECT_ROOT))
     _apollo_degrade_warning = ""
+    _verify_backend_used = "lake"
+    _verify_backend_reason = "lake_default"
 
     # Backend gate: keep lake as the default path to preserve current semantics.
     backend = str(LEAN_VERIFY_BACKEND).strip().lower()
@@ -805,12 +1020,29 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
         try:
             raw = verify_with_apollo(
                 code=source_text,
-                timeout=APOLLO_VERIFY_TIMEOUT,
+                timeout=REPL_VERIFY_TIMEOUT or APOLLO_VERIFY_TIMEOUT,
                 apollo_project_path=APOLLO_PROJECT_PATH,
                 repl_workspace=APOLLO_REPL_WORKSPACE,
                 lake_path=APOLLO_LAKE_PATH,
+                project_root=PROJECT_ROOT,
             )
         except Exception as exc:
+            _verify_backend_used = "apollo"
+            _verify_backend_reason = f"apollo_failure:{exc}"
+            if VERIFY_BACKEND_STRICT:
+                return {
+                    "target": rel,
+                    "success": False,
+                    "exit_code": 1,
+                    "sorry_count": count_sorrys(rel),
+                    "sorry_declarations": 0,
+                    "blocked_sorry_count": 0,
+                    "error_count": 1,
+                    "errors": [f"APOLLO backend strict failure: {exc}"],
+                    "warnings": [],
+                    "verify_backend_used": "apollo",
+                    "verify_backend_reason": f"strict_failure:{exc}",
+                }
             if not APOLLO_FALLBACK_TO_LAKE_ON_FAILURE:
                 return {
                     "target": rel,
@@ -822,14 +1054,29 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
                     "error_count": 1,
                     "errors": [f"APOLLO backend failure: {exc}"],
                     "warnings": [],
+                    "verify_backend_used": "apollo",
+                    "verify_backend_reason": f"backend_failure:{exc}",
                 }
             _apollo_degrade_warning = f"APOLLO backend failure; degraded to lake: {exc}"
         else:
-            return normalize_apollo_result(
+            normalized = normalize_apollo_result(
                 target_rel=rel,
                 source_text=source_text,
                 apollo_result=raw,
             )
+            normalized.setdefault(
+                "verify_backend_used",
+                str(raw.get("backend_used", "apollo_python"))
+                if isinstance(raw, dict)
+                else "apollo_python",
+            )
+            normalized.setdefault(
+                "verify_backend_reason",
+                str(raw.get("backend_reason", "apollo_success"))
+                if isinstance(raw, dict)
+                else "apollo_success",
+            )
+            return normalized
 
     # Invalidate Lake cache for this target so errors are re-emitted with
     # file:line:col locations instead of being silently replayed.
@@ -845,25 +1092,37 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     raw_output = build.errors
     build_errors_for_parsing = build.errors
     compiler_sorry_count = build.sorry_count
+    if build_returncode == 124:
+        _verify_backend_reason = "lake_timeout"
 
     # Fallback: freshly-created modules can temporarily miss lake target
     # registration; elaborate the file directly instead of failing hard.
     if build_returncode != 0 and re.search(r"unknown target", build.errors, re.IGNORECASE):
         import subprocess
 
-        proc = subprocess.run(
-            ["lake", "env", "lean", rel],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=LEAN_BUILD_TIMEOUT,
-        )
-        build_returncode = int(proc.returncode)
-        raw_output = (proc.stdout or "") + (proc.stderr or "")
-        build_errors_for_parsing = raw_output if build_returncode != 0 else ""
-        # Re-count compiler sorry warnings from the direct-elaboration output.
-        from orchestrator.verify import _count_sorry_in_output as _cso
-        compiler_sorry_count = _cso(raw_output)
+        try:
+            proc = subprocess.run(
+                ["lake", "env", "lean", rel],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=LEAN_BUILD_TIMEOUT,
+            )
+            build_returncode = int(proc.returncode)
+            raw_output = (proc.stdout or "") + (proc.stderr or "")
+            build_errors_for_parsing = raw_output if build_returncode != 0 else ""
+            # Re-count compiler sorry warnings from the direct-elaboration output.
+            from orchestrator.verify import _count_sorry_in_output as _cso
+
+            compiler_sorry_count = _cso(raw_output)
+        except subprocess.TimeoutExpired as exc:
+            build_returncode = 124
+            raw_output = (
+                f"lake env lean timeout on {rel}: exceeded {LEAN_BUILD_TIMEOUT}s\n{exc}"
+            )
+            build_errors_for_parsing = raw_output
+            compiler_sorry_count = 0
+            _verify_backend_reason = "lake_timeout"
 
     sorry_count = count_sorrys(rel)
 
@@ -892,6 +1151,10 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     blocked_sorry_count = max(0, sorry_count - compiler_sorry_count)
     if _apollo_degrade_warning:
         warning_lines = [_apollo_degrade_warning] + warning_lines
+        _verify_backend_used = "lake"
+        _verify_backend_reason = "degraded_to_lake"
+    if not _apollo_degrade_warning and _verify_backend_reason == "lake_default":
+        _verify_backend_reason = "lake_default"
     return {
         "target": rel,
         "success": build_returncode == 0 and sorry_count == 0,
@@ -902,6 +1165,8 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
         "error_count": len(error_lines),
         "errors": error_lines,
         "warnings": warning_lines,
+        "verify_backend_used": _verify_backend_used,
+        "verify_backend_reason": _verify_backend_reason,
     }
 
 

@@ -31,6 +31,9 @@ def test_key_prompt_phrases_still_present():
 
 def test_prompt_tool_signature_examples_match_tools():
     a3_raw = AGENT3_PROMPT_TEXT
+    a8_raw = AGENT8_PROMPT_TEXT
     assert "search_codebase(query=" not in a3_raw
     assert 'search_codebase(pattern="<identifier>")' in a3_raw
+    assert "current-file evidence" in a3_raw
+    assert "canonical error signature" in a8_raw
 
