@@ -47,10 +47,6 @@ from orchestrator.assumption_repair import (
     goals_to_patch_list,
 )
 from orchestrator.config import (
-    AGENT6_AUTO_ROUTE_ENABLED,
-    AGENT8_MIDCHECK_ENABLED,
-    AGENT8_MIDCHECK_INTERVAL_TURNS,
-    AGENT8_MIDCHECK_MIN_TURN,
     AGENT_CONFIGS,
     AUDIT_FLUSH_INTERVAL_SECONDS,
     ALGORITHM_REFERENCES,
@@ -164,7 +160,6 @@ from orchestrator.context_builders import (
     _format_agent3_tool_feedback,
     _check_patch_symbols,
     _prioritize_error_text,
-    _should_route_to_agent6_for_infra,
     _get_reference_files_with_descriptions,
     _format_ref_and_classification_blocks,
     _format_failed_approaches,
@@ -186,6 +181,51 @@ from orchestrator.context_builders import (
 )
 
 console = Console()
+
+
+def _resolve_workspace_path(path_str: str) -> Path:
+    path = Path(path_str)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _build_skip_to_agent9_guidance(
+    algorithm: str,
+    update_rule: str,
+    proof_sketch: str,
+    archetype: str,
+    *,
+    spec_file: str | None = None,
+) -> str:
+    if spec_file:
+        spec_text = load_file(spec_file)
+        try:
+            spec = json.loads(spec_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Cannot parse --spec-file '{spec_file}' as JSON: {exc}"
+            ) from exc
+        spec_algorithm = str(spec.get("algorithm", algorithm)).strip() or algorithm
+        spec_archetype = str(spec.get("archetype", archetype)).upper()
+        return (
+            "[STRICT SKIP-TO-AGENT9 GUIDANCE]\n"
+            "Operator requested a direct jump to Agent9. "
+            "Phase 1, Phase 2, and Phase 3 scaffold work were intentionally skipped.\n"
+            f"Algorithm: {spec_algorithm}\n"
+            f"Archetype: {spec_archetype}\n"
+            f"Spec file: {spec_file}\n"
+            "Treat the structured JSON below as the approved mathematical plan.\n\n"
+            f"```json\n{spec_text}\n```"
+        )
+    return (
+        "[STRICT SKIP-TO-AGENT9 GUIDANCE]\n"
+        "Operator requested a direct jump to Agent9. "
+        "Phase 1, Phase 2, and Phase 3 scaffold work were intentionally skipped.\n"
+        f"Algorithm: {algorithm}\n"
+        f"Archetype: {archetype.upper()}\n"
+        f"Update rule: {update_rule}\n"
+        f"Proof sketch: {proof_sketch}\n"
+        "Treat this operator-supplied summary as the approved mathematical plan."
+    )
 
 # Agent3 single-step interactive loop: maximum tool turns per attempt.
 # Archetype B gets a 1.5× multiplier applied in phase3_prove.
@@ -301,6 +341,21 @@ def run(
 
     if target_file is None:
         target_file = f"Algorithms/{algorithm}.lean"
+    skip_guidance: str | None = None
+    if skip_to_agent9:
+        target_path = _resolve_workspace_path(target_file)
+        if not target_path.exists():
+            raise FileNotFoundError(
+                "--skip-to-agent9 requires an existing target file; "
+                f"missing: {target_file}"
+            )
+        skip_guidance = _build_skip_to_agent9_guidance(
+            algorithm,
+            update_rule,
+            proof_sketch,
+            archetype,
+            spec_file=spec_file,
+        )
 
     baseline_tracked, baseline_untracked = _capture_lean_baseline()
     audit = AuditLogger.get()
@@ -347,7 +402,13 @@ def run(
 
             # Phase 1
             audit.set_phase(1)
-            if spec_file:
+            if skip_to_agent9:
+                prover_prompt = skip_guidance or proof_sketch
+                progress.update(
+                    task,
+                    description="Phase 1/7: Prover prompt generation skipped  [--skip-to-agent9]...",
+                )
+            elif spec_file:
                 progress.update(task, description="Phase 1/7: Generating prover prompt  [Agent1B / spec]...")
                 prover_prompt, algorithm, archetype = phase1_generate_prompt_from_spec(spec_file)
             else:
@@ -370,13 +431,12 @@ def run(
             while not success:
                 audit.set_phase(2)
                 if skip_to_agent9:
-                    # Skip Phase 1/2 — no Agent2 planning needed.
-                    # Use raw proof-sketch as lightweight guidance for Agent9.
-                    from orchestrator.agents import Agent as _Agent
-                    agent1 = _Agent("orchestrator")
-                    agent2 = _Agent("planner")
-                    plan = proof_sketch
-                    progress.update(task, description="Phase 2/7: Planning  [Skipped — skip-to-agent9]...")
+                    plan = skip_guidance or proof_sketch
+                    agent2 = None
+                    progress.update(
+                        task,
+                        description="Phase 2/7: Agent2 planning skipped  [--skip-to-agent9]...",
+                    )
                     progress.advance(task)
                 else:
                     progress.update(task, description="Phase 2/7: Planning & approval  [Agent1 ↔ Agent2]...")
@@ -388,7 +448,13 @@ def run(
                 # Phases 3-5 (scaffold → strategy → proof fill) all run inside
                 # phase3_prove; it advances the progress bar for 3/7 and 4/7 itself.
                 audit.set_phase(3)
-                progress.update(task, description="Phase 3/7: Scaffold writing  [Agent2]...")
+                if skip_to_agent9:
+                    progress.update(
+                        task,
+                        description="Phase 3/7: Direct jump to Agent9  [--skip-to-agent9]...",
+                    )
+                else:
+                    progress.update(task, description="Phase 3/7: Scaffold writing  [Agent2]...")
                 success, attempts, _, phase3_audit = phase3_prove(
                     agent2, target_file, plan,
                     max_retries=max_retries,

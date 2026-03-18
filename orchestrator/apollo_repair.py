@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any
 
 from orchestrator.apollo_sorrify import (
@@ -118,21 +119,24 @@ def build_subproblem_graph(
         )
         idx += 1
 
-    # Compile blockers first.
+    proof_body_failure = error_subtype in {"proof_api_mismatch", "proof_tactic_failure"}
+
+    # Compile blockers first when the verifier points to declaration/interface drift.
     if error_subtype == "declaration_api_mismatch" or kind in {"interface_failure", "instance_failure"}:
         _push("interface_signature", 10, "declaration/proof header", snippet or "interface markers")
-    if error_subtype == "proof_api_mismatch":
-        _push("proof_api_shape", 20, "proof callsites", snippet or "proof API markers")
 
-    # Glue/proof-state blockers next.
+    # For proof-body failures, prefer Lean-visible sublemma units before raw callsite patching.
     if sublemma_statements:
+        base_priority = 18 if proof_body_failure else 25
         for idx2, stmt in enumerate(sublemma_statements[:5], start=1):
             _push(
                 "proof_state_sublemma",
-                25 + idx2,
+                base_priority + idx2,
                 f"sublemma_{idx2}",
                 stmt or f"extracted sublemma #{idx2}",
             )
+    if error_subtype == "proof_api_mismatch":
+        _push("proof_api_shape", 24 if sublemma_statements else 20, "proof callsites", snippet or "proof API markers")
     if kind == "glue_failure" or lemma_count > 0:
         _push("missing_glue", 30, f"bridge_lemmas(count={lemma_count})", snippet or "glue markers")
 
@@ -179,6 +183,7 @@ def run_apollo_decompose_repair(
         }
 
     source = path.read_text(encoding="utf-8")
+    total_started = time.perf_counter()
     verifier = build_apollo_verify_callable()
     metrics: dict[str, Any] = {
         "source_chars": len(source),
@@ -188,7 +193,9 @@ def run_apollo_decompose_repair(
 
     # Step 0: quick baseline verify
     try:
+        base_started = time.perf_counter()
         base_verify = verifier(source)
+        metrics["baseline_verify_ms"] = int((time.perf_counter() - base_started) * 1000.0)
     except Exception as exc:
         kind, reason, snippet = classify_failure_kind(str(exc) or current_errors)
         graph = build_subproblem_graph(
@@ -197,6 +204,7 @@ def run_apollo_decompose_repair(
             lemma_count=0,
             sublemma_statements=[],
         )
+        metrics["total_ms"] = int((time.perf_counter() - total_started) * 1000.0)
         return {
             "status": "failed",
             "failure_kind": kind,
@@ -213,6 +221,7 @@ def run_apollo_decompose_repair(
     metrics["base_complete"] = bool(base_verify.get("complete", False))
 
     if bool(base_verify.get("complete", False)):
+        metrics["total_ms"] = int((time.perf_counter() - total_started) * 1000.0)
         return {
             "status": "success",
             "failure_kind": "",
@@ -225,20 +234,28 @@ def run_apollo_decompose_repair(
         }
 
     # Step 1: syntax correction
+    syntax_started = time.perf_counter()
     working, syntax_meta = apply_syntax_correction(working)
     metrics["syntax"] = syntax_meta
+    metrics["syntax_ms"] = int((time.perf_counter() - syntax_started) * 1000.0)
 
     # Step 2: sorrify isolation
+    sorrify_started = time.perf_counter()
     working, sorrify_meta = apply_sorrify(working, verifier)
     metrics["sorrify"] = sorrify_meta
+    metrics["sorrify_ms"] = int((time.perf_counter() - sorrify_started) * 1000.0)
 
     # Step 3: hint-based repair
+    hint_started = time.perf_counter()
     working, hint_meta = apply_hint_repair(working, verifier)
     metrics["hint_repair"] = hint_meta
+    metrics["hint_repair_ms"] = int((time.perf_counter() - hint_started) * 1000.0)
 
     # Step 4: final verify
     try:
+        final_started = time.perf_counter()
         final_verify = verifier(working)
+        metrics["final_verify_ms"] = int((time.perf_counter() - final_started) * 1000.0)
     except Exception as exc:
         kind, reason, snippet = classify_failure_kind(str(exc) or current_errors)
         graph = build_subproblem_graph(
@@ -247,6 +264,7 @@ def run_apollo_decompose_repair(
             lemma_count=0,
             sublemma_statements=[],
         )
+        metrics["total_ms"] = int((time.perf_counter() - total_started) * 1000.0)
         return {
             "status": "failed",
             "failure_kind": kind,
@@ -266,6 +284,7 @@ def run_apollo_decompose_repair(
     if bool(final_verify.get("complete", False)):
         if working != source:
             path.write_text(working, encoding="utf-8")
+        metrics["total_ms"] = int((time.perf_counter() - total_started) * 1000.0)
         return {
             "status": "success",
             "failure_kind": "",
@@ -278,8 +297,10 @@ def run_apollo_decompose_repair(
         }
 
     # Step 5: failure typing + optional sublemma extraction signal.
+    lemma_started = time.perf_counter()
     lemmas, lemma_meta = extract_sublemmas(working, verifier)
     metrics["lemma_extraction"] = lemma_meta
+    metrics["lemma_extraction_ms"] = int((time.perf_counter() - lemma_started) * 1000.0)
     if lemma_meta.get("ok") and int(lemma_meta.get("count", 0)) > 0:
         inferred_error = f"{flattened}\nmissing glue bridge candidates: {lemma_meta.get('count')}"
     else:
@@ -291,6 +312,8 @@ def run_apollo_decompose_repair(
         lemma_count=int(lemma_meta.get("count", 0)),
         sublemma_statements=list(lemma_meta.get("statements", []) or []),
     )
+    metrics["graph_build_ms"] = int((time.perf_counter() - lemma_started) * 1000.0) - int(metrics["lemma_extraction_ms"])
+    metrics["total_ms"] = int((time.perf_counter() - total_started) * 1000.0)
     return {
         "status": "failed",
         "failure_kind": kind,

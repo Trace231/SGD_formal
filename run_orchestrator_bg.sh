@@ -13,8 +13,10 @@ LOG_FILE="$SCRIPT_DIR/orchestrator.log"
 PID_FILE="$SCRIPT_DIR/orchestrator.pid"
 STATUS_FILE="$SCRIPT_DIR/orchestrator_status.json"
 
-# Build command from arguments
-CMD="python -m orchestrator.main $@"
+# Build command from arguments without collapsing quoted arguments.
+CMD=(python -m orchestrator.main "$@")
+printf -v CMD_DISPLAY '%q ' "${CMD[@]}"
+CMD_DISPLAY="${CMD_DISPLAY% }"
 
 echo "Starting orchestrator in background..."
 echo "Log file: $LOG_FILE"
@@ -24,8 +26,12 @@ echo "PID file: $PID_FILE"
 rm -f "$STATUS_FILE"
 
 # Run in background with nohup
-nohup bash -c "cd '$SCRIPT_DIR' && $CMD" > "$LOG_FILE" 2>&1 &
-PID=$!
+(
+  cd "$SCRIPT_DIR" || exit 1
+  nohup "${CMD[@]}" > "$LOG_FILE" 2>&1 &
+  echo $! > "$PID_FILE"
+)
+PID="$(cat "$PID_FILE")"
 
 # Save PID
 echo $PID > "$PID_FILE"
@@ -37,7 +43,7 @@ cat > "$STATUS_FILE" << EOF
   "start_time": "$(date -Iseconds)",
   "status": "running",
   "log_file": "$LOG_FILE",
-  "command": "$CMD"
+  "command": "$CMD_DISPLAY"
 }
 EOF
 

@@ -153,9 +153,22 @@ def _execute_single_tool_and_format(
         result_msg = "\n".join(parts)
     elif tool_name in ("edit_file_patch", "write_new_file"):
         edited = True
+        extra = ""
+        if isinstance(result, dict) and tool_name == "edit_file_patch":
+            _matched = str(result.get("matched_line_range", "")).strip()
+            _allowed = str(result.get("allowed_line_range", "")).strip()
+            _hash_before = str(result.get("file_hash_before", ""))[:12]
+            _hash_after = str(result.get("file_hash_after", ""))[:12]
+            if _matched or _allowed or _hash_before or _hash_after:
+                extra = (
+                    f"\nmatched_line_range: {_matched or '(unknown)'}"
+                    f"\nallowed_line_range: {_allowed or '(none)'}"
+                    f"\nfile_hash_before: {_hash_before or '(unknown)'}"
+                    f"\nfile_hash_after: {_hash_after or '(unknown)'}"
+                )
         result_msg = (
             f"## {tool_name} result\n"
-            f"SUCCESS. File updated.\n"
+            f"SUCCESS. File updated.{extra}\n"
             "Call run_lean_verify to check the build."
         )
     else:

@@ -269,14 +269,6 @@ def _get_default_references(target_file: str) -> list[str]:
     return refs
 
 
-# Agent6 auto-route: when False, system never auto-routes to Agent6 from pattern detection.
-# Agent6 is invoked only when Agent7's protocol explicitly indicates a missing glue lemma.
-AGENT6_AUTO_ROUTE_ENABLED = False
-
-# If True, after the first 3 attempts without any Agent7 call, system triggers Agent7 and
-# Agent6 once before continuing to attempt 4.
-FORCE_AGENT7_AGENT6_AFTER_3_ATTEMPTS = os.getenv("ORCHESTRATOR_FORCE_AGENT7_AGENT6_AFTER_3", "1") != "0"
-
 # Known Mathlib name corrections: wrong identifier -> correct replacement.
 # Applied before escalation to avoid routing trivial fixes to Agent6/Agent7.
 UNKNOWN_IDENTIFIER_RENAME_MAP: dict[str, str] = {
@@ -347,8 +339,6 @@ RETRY_LIMITS: dict[str, int] = {
     "MAX_AGENT6_ESCALATIONS_PER_ATTEMPT": 3,
     "AGENT6_SECOND_ESCALATION_MIN_PROGRESS": 1,
     "AGENT6_SECOND_ESCALATION_REQUIRE_SAME_GOAL": 1,
-    "AGENT6_AUTO_ROUTE_REPEAT_THRESHOLD": 2,
-    "AGENT6_AUTO_ROUTE_MIN_TURN": 3,
     # Agent3 autonomy: Agent7 can be called up to 4 times per sorry
     "MAX_AGENT7_INVOCATIONS_PER_ATTEMPT": 4,
     "AGENT7_STEP_NO_PROGRESS_THRESHOLD": 2,
@@ -368,11 +358,11 @@ RETRY_LIMITS: dict[str, int] = {
     # Agent8 Decision Hub: maximum decision ticks before escalating to Agent5.
     "AGENT8_MAX_STEPS": 15,
     # Agent8: maximum Agent3 tool turns per dispatch (simplified loop).
-    "AGENT8_AGENT3_MAX_TURNS": 15,
+    "AGENT8_AGENT3_MAX_TURNS": 25,
     # Agent3 APOLLO-aligned sampling/search controls.
-    "AGENT8_AGENT3_SAMPLE_CANDIDATES": 3,
-    "AGENT8_AGENT3_SAMPLE_MAX_CANDIDATES": 3,
-    "AGENT8_AGENT3_SAMPLE_MAX_TURNS_PER_CANDIDATE": 8,
+    "AGENT8_AGENT3_SAMPLE_CANDIDATES": 5,
+    "AGENT8_AGENT3_SAMPLE_MAX_CANDIDATES": 5,
+    "AGENT8_AGENT3_SAMPLE_MAX_TURNS_PER_CANDIDATE": 4,
     "AGENT8_AGENT3_SAMPLE_DEGRADE_TICKS": 2,
     # Agent8 delta-based forced fallback: two consecutive no-progress ticks.
     "AGENT8_FORCE_FALLBACK_WINDOW": 2,
@@ -431,6 +421,23 @@ RETRY_LIMITS: dict[str, int] = {
     "AGENT8_APOLLO_ROUTE_COOLDOWN_TICKS": 2,
     # APOLLO serial subproblem queue: retries per node before fallback route.
     "AGENT8_SUBPROBLEM_MAX_ATTEMPTS": 2,
+    # Compile-first proof_api_mismatch should get at most one strict local patch
+    # tick before structural proof-body failures are promoted to broader search.
+    "AGENT8_PROOF_API_LOCAL_PATCH_MAX_TICKS": 1,
+    # Promote proof_api_mismatch into APOLLO-style sampled search after repeated
+    # same-region observations even when the normalized top signature shifts.
+    "AGENT8_PROOF_API_SAMPLING_TRIGGER": 2,
+    # Region-local no-progress streak threshold for promoting proof_api_mismatch
+    # from transactional patching to block_restructure / sampled search.
+    "AGENT8_PROOF_API_REGION_STREAK_TRIGGER": 2,
+    # Promote proof-body failures from local patching to block-restructure mode
+    # after repeated same-region/no-progress observations.
+    "AGENT8_BLOCK_RESTRUCTURE_TRIGGER": 2,
+    # Larger patch budget is allowed only in explicit block-restructure mode.
+    "AGENT8_BLOCK_RESTRUCTURE_MAX_PATCH_LINES": 160,
+    # When the same proof region has exhausted multiple repair families, certify
+    # a statement/assumption gap instead of looping indefinitely.
+    "AGENT8_STATEMENT_GAP_REGION_THRESHOLD": 4,
 }
 
 TIMEOUTS: dict[str, int] = {
@@ -495,15 +502,10 @@ AGENT8_MIDCHECK_INTERVAL_TURNS: int = int(
 # Prevents interrupting Agent3 before it has had time to start.
 AGENT8_MIDCHECK_MIN_TURN: int = int(os.getenv("AGENT8_MIDCHECK_MIN_TURN", "8"))
 
-# Agent8 tactical sampling toggle.  Disabled by default for safe rollout.
-AGENT8_AGENT3_SAMPLING_ENABLED: bool = (
-    os.getenv("AGENT8_AGENT3_SAMPLING_ENABLED", "0") != "0"
-)
-
 # Agent3 search-kernel controls (APOLLO core parity, MVP).
 AGENT3_SEARCH_ENABLED: bool = os.getenv("AGENT3_SEARCH_ENABLED", "1") != "0"
-AGENT3_CANDIDATE_COUNT: int = max(1, int(os.getenv("AGENT3_CANDIDATE_COUNT", "2")))
-AGENT3_RECURSION_DEPTH: int = max(0, int(os.getenv("AGENT3_RECURSION_DEPTH", "1")))
+AGENT3_CANDIDATE_COUNT: int = max(1, int(os.getenv("AGENT3_CANDIDATE_COUNT", "1")))
+AGENT3_RECURSION_DEPTH: int = max(0, int(os.getenv("AGENT3_RECURSION_DEPTH", "0")))
 AGENT3_NO_IMPROVEMENT_WINDOW: int = max(
     1, int(os.getenv("AGENT3_NO_IMPROVEMENT_WINDOW", "2"))
 )

@@ -49,7 +49,7 @@ def _validate_agent9_plan(obj: Any) -> tuple[bool, str]:
     - Each theorem has: name, proof_strategy, key_lib_lemmas, dependencies.
     - Each theorem has a line-number field (lean_statement_line OR line_number).
     - missing_glue_lemmas entries are dicts with name + proposed_lean_type.
-    Optional fields:
+    Optional legacy fields:
     - first_action_patch_hint: string
     - expected_lean_shape: string
     """
@@ -297,6 +297,13 @@ def run_agent9_plan(
     The caller (``phase3_prove`` in ``main.py``) should log a warning when ``{}``
     is returned but must NOT abort Phase 3.
     """
+    try:
+        load_file(target_file)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "Agent9 requires an existing target file; "
+            f"missing: {target_file}"
+        ) from exc
     max_rounds = RETRY_LIMITS.get("AGENT9_MAX_ROUNDS", 3)
     guidance_chars = RETRY_LIMITS.get("AGENT9_GUIDANCE_CHARS", 4000)
     guidance_snippet = guidance[:guidance_chars]

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +31,7 @@ class BuildResult:
     errors: str
     sorry_count: int
     returncode: int
+    elapsed_ms: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +47,7 @@ def lake_build(target: str | None = None) -> BuildResult:
     cmd = ["lake", "build"]
     if target:
         cmd.append(target)
+    start = time.perf_counter()
 
     try:
         result = subprocess.run(
@@ -67,6 +70,7 @@ def lake_build(target: str | None = None) -> BuildResult:
             errors=timeout_msg + f"\n{exc}",
             sorry_count=0,
             returncode=124,
+            elapsed_ms=int((time.perf_counter() - start) * 1000.0),
         )
     errors = (result.stderr + result.stdout) if result.returncode != 0 else ""
     sorry_count = _count_sorry_in_output(result.stderr + result.stdout)
@@ -75,6 +79,7 @@ def lake_build(target: str | None = None) -> BuildResult:
         errors=errors,
         sorry_count=sorry_count,
         returncode=result.returncode,
+        elapsed_ms=int((time.perf_counter() - start) * 1000.0),
     )
 
 

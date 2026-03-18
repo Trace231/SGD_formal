@@ -71,8 +71,6 @@ Output ONLY a single JSON object of this exact schema after all lookups are comp
       "dependency_map": {
         "<local_have_name_or_step>": "<source file and lemma, e.g. Lib/Glue/Algebra.lean:norm_sq_expand>"
       },
-      "first_action_patch_hint": "<optional: first concrete edit to try (line range + expression class)>",
-      "expected_lean_shape": "<optional: expected post-fix expression/lemma-call shape>",
       "estimated_difficulty": "low|medium|high"
     }
   ],
@@ -101,9 +99,9 @@ Rules:
   needs to be created.  Paths referencing files not imported by the target are FORBIDDEN.
 - Missing glue lemmas will be inserted directly into the target algorithm file
   before the main theorem by Agent6/7. Do NOT specify staging file paths.
-- `first_action_patch_hint` and `expected_lean_shape` are optional but strongly
-  encouraged. They should be executable hints for Agent3/Agent8; if unknown,
-  set to "".
+- Keep the plan high-level. Do NOT optimize for low-level patch hints; theorem
+  skeleton, dependencies, key lemmas, and missing-glue information are the
+  primary outputs consumed downstream.
 - `proof_technique` MUST be one of the values from the Proof Technique Reference.
 - `recommended_order` must be a permutation of all theorem names in `theorems`.
 - **Rule S — `proof_strategy` MUST be EXECUTABLE, not descriptive:**

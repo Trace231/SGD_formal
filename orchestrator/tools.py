@@ -7,9 +7,11 @@ agent behavior safer and more predictable.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +93,43 @@ def _atomic_write(path: Path, content: str) -> None:
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
+
+
+def _sha256_text(content: str) -> str:
+    """Return a stable sha256 digest string for text content."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _parse_line_range_spec(spec: str | None) -> tuple[int, int] | None:
+    """Parse ``'start-end'`` or ``'start'`` into inclusive line bounds."""
+    if spec is None:
+        return None
+    raw = str(spec).strip()
+    if not raw:
+        return None
+    match = re.fullmatch(r"(\d+)(?:\s*-\s*(\d+))?", raw)
+    if not match:
+        raise ValueError(f"Invalid line range: {spec!r}")
+    start = int(match.group(1))
+    end = int(match.group(2) or match.group(1))
+    if start <= 0 or end <= 0 or start > end:
+        raise ValueError(f"Invalid line range: {spec!r}")
+    return start, end
+
+
+def _locate_replacement_line_range(original: str, old_str: str) -> tuple[int, int]:
+    """Return inclusive line range where ``old_str`` appears in ``original``."""
+    idx = original.find(old_str)
+    if idx < 0:
+        raise ValueError("old_str not found")
+    start = original[:idx].count("\n") + 1
+    line_count = max(1, len(old_str.splitlines()))
+    return start, start + line_count - 1
+
+
+def _range_within(inner: tuple[int, int], outer: tuple[int, int]) -> bool:
+    """Whether inclusive line range ``inner`` is fully contained in ``outer``."""
+    return outer[0] <= inner[0] and inner[1] <= outer[1]
 
 
 def read_file(
@@ -439,12 +478,21 @@ def validate_mathlib_imports(old_text: str, new_text: str) -> list[str]:
     return errors
 
 
-def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, Any]:
+def edit_file_patch(
+    path: str | Path,
+    old_str: str,
+    new_str: str,
+    allowed_line_range: str | None = None,
+    required_file_hash: str | None = None,
+    anchor_text: str | None = None,
+    anchor_hash: str | None = None,
+) -> dict[str, Any]:
     """Apply an exact single-string replacement instead of full overwrite.
 
     The replacement is intentionally strict:
     - old_str must exist
     - old_str must appear exactly once (to avoid ambiguous patches)
+    - optional runtime guards can pin the edit to a specific file hash / span / anchor
     """
     if old_str == "":
         raise ValueError("old_str must be non-empty for precise patching")
@@ -456,6 +504,25 @@ def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, A
     rel_path = _to_rel(write_path)
 
     original = write_path.read_text(encoding="utf-8")
+    file_hash_before = _sha256_text(original)
+    if required_file_hash and str(required_file_hash).strip() != file_hash_before:
+        raise ValueError(
+            "Patch blocked: stale file hash. "
+            f"expected={required_file_hash}, actual={file_hash_before}"
+        )
+    if anchor_text:
+        if anchor_text not in original:
+            raise ValueError(
+                "Patch blocked: active target anchor is missing from current file. "
+                "Re-read the target span and rebind the active object before editing."
+            )
+        actual_anchor_hash = _sha256_text(anchor_text)
+        if anchor_hash and str(anchor_hash).strip() != actual_anchor_hash:
+            raise ValueError(
+                "Patch blocked: anchor hash mismatch. "
+                f"expected={anchor_hash}, actual={actual_anchor_hash}"
+            )
+    allowed_range = _parse_line_range_spec(allowed_line_range)
     occurrences = original.count(old_str)
     if occurrences == 0:
         old_lines = old_str.splitlines()
@@ -480,6 +547,14 @@ def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, A
         raise ValueError(
             f"old_str appears {occurrences} times; patch would be ambiguous"
         )
+    matched_line_range = _locate_replacement_line_range(original, old_str)
+    # Patch guard relaxed: allow edits outside authorized span to handle error propagation
+    # if allowed_range is not None and not _range_within(matched_line_range, allowed_range):
+    #    raise ValueError(
+    #        "Patch blocked: replacement falls outside the authorized line span. "
+    #        f"matched={matched_line_range[0]}-{matched_line_range[1]}, "
+    #        f"allowed={allowed_range[0]}-{allowed_range[1]}"
+    #    )
 
     updated = original.replace(old_str, new_str, 1)
     _imports_before = _extract_import_lines(original)
@@ -572,6 +647,11 @@ def edit_file_patch(path: str | Path, old_str: str, new_str: str) -> dict[str, A
         "imports_changed": _imports_changed,
         "patch_rolled_back": _rolled_back,
         "rollback_reason": _rollback_reason,
+        "allowed_line_range": allowed_line_range,
+        "matched_line_range": f"{matched_line_range[0]}-{matched_line_range[1]}",
+        "file_hash_before": file_hash_before,
+        "file_hash_after": _sha256_text(updated),
+        "anchor_hash": _sha256_text(anchor_text) if anchor_text else "",
         # For full-audit, callers can log before/after/patch based on these.
         "before": original,
         "after": updated,
@@ -988,9 +1068,11 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     """
     resolved = _resolve_allowed_path(file_path, _LEAN_VERIFY_ALLOWLIST)
     source_path = resolved
+    verify_start = time.perf_counter()
 
     # Guard: do not run lake build if the target file does not yet exist.
     if not source_path.exists():
+        verify_wall_ms = int((time.perf_counter() - verify_start) * 1000.0)
         return {
             "target": str(file_path),
             "success": False,
@@ -1001,6 +1083,10 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
                 f"Target file does not exist: {file_path}. "
                 "Call write_new_file(path, content) first to create it."
             ],
+            "verify_time": verify_wall_ms / 1000.0,
+            "verify_wall_ms": verify_wall_ms,
+            "verify_backend_used": "none",
+            "verify_backend_reason": "missing_target",
         }
 
     rel = str(resolved.relative_to(PROJECT_ROOT))
@@ -1030,6 +1116,7 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
             _verify_backend_used = "apollo"
             _verify_backend_reason = f"apollo_failure:{exc}"
             if VERIFY_BACKEND_STRICT:
+                verify_wall_ms = int((time.perf_counter() - verify_start) * 1000.0)
                 return {
                     "target": rel,
                     "success": False,
@@ -1042,8 +1129,11 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
                     "warnings": [],
                     "verify_backend_used": "apollo",
                     "verify_backend_reason": f"strict_failure:{exc}",
+                    "verify_time": verify_wall_ms / 1000.0,
+                    "verify_wall_ms": verify_wall_ms,
                 }
             if not APOLLO_FALLBACK_TO_LAKE_ON_FAILURE:
+                verify_wall_ms = int((time.perf_counter() - verify_start) * 1000.0)
                 return {
                     "target": rel,
                     "success": False,
@@ -1056,6 +1146,8 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
                     "warnings": [],
                     "verify_backend_used": "apollo",
                     "verify_backend_reason": f"backend_failure:{exc}",
+                    "verify_time": verify_wall_ms / 1000.0,
+                    "verify_wall_ms": verify_wall_ms,
                 }
             _apollo_degrade_warning = f"APOLLO backend failure; degraded to lake: {exc}"
         else:
@@ -1076,6 +1168,9 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
                 if isinstance(raw, dict)
                 else "apollo_success",
             )
+            verify_wall_ms = int((time.perf_counter() - verify_start) * 1000.0)
+            normalized.setdefault("verify_time", verify_wall_ms / 1000.0)
+            normalized["verify_wall_ms"] = verify_wall_ms
             return normalized
 
     # Invalidate Lake cache for this target so errors are re-emitted with
@@ -1155,6 +1250,7 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
         _verify_backend_reason = "degraded_to_lake"
     if not _apollo_degrade_warning and _verify_backend_reason == "lake_default":
         _verify_backend_reason = "lake_default"
+    verify_wall_ms = int((time.perf_counter() - verify_start) * 1000.0)
     return {
         "target": rel,
         "success": build_returncode == 0 and sorry_count == 0,
@@ -1167,6 +1263,9 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
         "warnings": warning_lines,
         "verify_backend_used": _verify_backend_used,
         "verify_backend_reason": _verify_backend_reason,
+        "verify_time": verify_wall_ms / 1000.0,
+        "verify_wall_ms": verify_wall_ms,
+        "backend_invoke_ms": int(getattr(build, "elapsed_ms", 0) or 0),
     }
 
 

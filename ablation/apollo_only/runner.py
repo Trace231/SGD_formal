@@ -79,6 +79,19 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _collect_success_metrics(log_dir: Path) -> tuple[int, int]:
+    sample_total = 0
+    success_total = 0
+    for p in log_dir.glob("**/summary.json"):
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        sample_total += int(obj.get("sample_count", 0))
+        success_total += int(obj.get("success_count", 0))
+    return sample_total, success_total
+
+
 def _build_isolation_meta(*, runtime_cfg: dict[str, Any], first_entry: dict[str, Any]) -> dict[str, Any]:
     workspace_root = _resolve_workspace_root(runtime_cfg)
     execution_root = _resolve_execution_root(runtime_cfg, workspace_root)
@@ -170,6 +183,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--monitor-interval-sec", type=float, default=None)
     parser.add_argument("--monitor-stall-sec", type=float, default=None)
     parser.add_argument("--request-timeout-sec", type=float, default=None)
+    parser.add_argument("--apply-best-candidate", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     return parser
 
@@ -193,6 +207,8 @@ def main() -> int:
         runtime_cfg["monitor_stall_sec"] = float(args.monitor_stall_sec)
     if args.request_timeout_sec is not None:
         runtime_cfg["request_timeout_sec"] = float(args.request_timeout_sec)
+    if bool(args.apply_best_candidate):
+        runtime_cfg["apply_best_candidate"] = True
     if bool(args.quiet):
         runtime_cfg["quiet"] = True
 
@@ -326,13 +342,19 @@ def main() -> int:
         scheduler.close()
         for p in gen_workers:
             p.join(timeout=5.0)
+    sample_total, success_total = _collect_success_metrics(log_dir)
+    if status == 0 and sample_total > 0 and success_total == 0:
+        status = 2
+    status_label = "ok" if status == 0 else ("no_solution" if status == 2 else "failed")
     print(
         json.dumps(
             {
-                "status": "ok" if status == 0 else "failed",
+                "status": status_label,
                 "log_dir": str(log_dir),
                 "search_processes": len(search_processes),
                 "generator_workers": len(gen_workers),
+                "sample_count": sample_total,
+                "success_count": success_total,
             },
             ensure_ascii=False,
             indent=2,

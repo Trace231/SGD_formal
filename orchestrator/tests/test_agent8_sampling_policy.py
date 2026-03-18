@@ -36,17 +36,51 @@ def test_agent8_wrapper_passes_error_subtype_to_kernel(monkeypatch, tmp_path):
 
     def _fake_kernel(*args, **kwargs):
         seen["error_subtype"] = kwargs.get("error_subtype")
+        seen["patch_guard_mode"] = kwargs.get("patch_guard_mode")
+        seen["search_allowed"] = kwargs.get("search_allowed")
+        seen["max_turns"] = kwargs.get("max_turns")
         return {"exit_code": 1, "sorry_count": 1, "errors": "e"}
 
     monkeypatch.setattr(a3, "run_agent3_search_kernel", _fake_kernel)
+    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_AGENT3_MAX_TURNS", 15)
     _ = a8._agent8_run_agent3(
         _mk_target(tmp_path),
         "plan",
         "prompt",
         None,
+        patch_guard_mode=True,
+        search_allowed=True,
         error_subtype="proof_api_mismatch",
     )
     assert seen["error_subtype"] == "proof_api_mismatch"
+    assert seen["patch_guard_mode"] is True
+    assert seen["search_allowed"] is True
+    assert seen["max_turns"] == 15
+
+
+def test_agent8_wrapper_caps_turns_for_block_restructure_sampling(monkeypatch, tmp_path):
+    seen = {}
+
+    def _fake_kernel(*args, **kwargs):
+        seen["max_turns"] = kwargs.get("max_turns")
+        seen["repair_unit"] = kwargs.get("repair_unit")
+        seen["transactional_mode"] = kwargs.get("transactional_mode")
+        return {"exit_code": 1, "sorry_count": 1, "errors": "e"}
+
+    monkeypatch.setattr(a3, "run_agent3_search_kernel", _fake_kernel)
+    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_AGENT3_SAMPLE_MAX_TURNS_PER_CANDIDATE", 8)
+    _ = a8._agent8_run_agent3(
+        _mk_target(tmp_path),
+        "plan",
+        "prompt",
+        None,
+        max_turns=15,
+        transactional_mode=False,
+        repair_unit="block_restructure",
+    )
+    assert seen["repair_unit"] == "block_restructure"
+    assert seen["transactional_mode"] is False
+    assert seen["max_turns"] == 8
 
 
 def test_patch_line_span_estimator_and_limit_guard():

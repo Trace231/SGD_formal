@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 
 _LEAN_BLOCK_RE = re.compile(r"```lean4?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+_GENERIC_BLOCK_RE = re.compile(r"```\s*(.*?)\s*```", re.DOTALL)
 _BY_SPLIT_RE = re.compile(r":=\s*by(.*)$", re.DOTALL)
 
 
@@ -26,18 +27,56 @@ def _extract_last_lean_block(text: str) -> str | None:
     return blocks[-1].strip()
 
 
+def _extract_last_generic_block(text: str) -> str | None:
+    blocks = _GENERIC_BLOCK_RE.findall(text)
+    if not blocks:
+        return None
+    return blocks[-1].strip()
+
+
+def _sanitize_common_wrappers(text: str) -> str:
+    cleaned = (text or "").strip()
+    cleaned = cleaned.replace("\r\n", "\n")
+    # Remove common markdown wrappers if model still emits them.
+    if cleaned.startswith("```") and cleaned.endswith("```"):
+        generic = _extract_last_generic_block(cleaned)
+        if generic:
+            cleaned = generic
+    # Handle unmatched fenced output (common when model truncates).
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].lstrip().startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    # Remove any remaining fence markers line-by-line.
+    cleaned = "\n".join(ln for ln in cleaned.splitlines() if not ln.lstrip().startswith("```")).strip()
+    # Drop harmless leading labels.
+    cleaned = re.sub(r"^\s*(Lean code|Here is.*?|Answer)\s*:\s*", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
 def parse_model_output(raw_text: str) -> ParsedCandidate:
     """Parse model output into proof-body or full-file candidate."""
-    text = (raw_text or "").strip()
+    text = _sanitize_common_wrappers(raw_text or "")
     if not text:
         return ParsedCandidate(payload="", kind="invalid", reason="empty_output")
 
     block = _extract_last_lean_block(text)
     if block:
         text = block
+    else:
+        generic = _extract_last_generic_block(text)
+        if generic and ("theorem " in generic or ":= by" in generic or "intro " in generic):
+            text = generic.strip()
+
+    # Hard reject if control token still survives sanitization.
+    if "```" in text:
+        return ParsedCandidate(payload="", kind="invalid", reason="contains_backticks_after_sanitize")
 
     # Full-file candidate: contains imports + theorem and appears complete.
-    if "import " in text and ("theorem " in text or "lemma " in text):
+    if text.lstrip().startswith("import ") and ("theorem " in text or "lemma " in text):
         return ParsedCandidate(payload=text, kind="full_file", reason="full_file_block")
 
     # Extract body from ":= by".

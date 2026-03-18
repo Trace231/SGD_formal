@@ -113,6 +113,8 @@ class AuditLogger:
         reply: str,
         prompt_full: str | None = None,
         reply_full: str | None = None,
+        *,
+        elapsed_ms: int | None = None,
     ) -> None:
         """Log an agent call (prompt + reply metadata)."""
         if not self.enabled:
@@ -128,6 +130,8 @@ class AuditLogger:
             "reply_len": len(reply),
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
+        if elapsed_ms is not None:
+            event["elapsed_ms"] = int(elapsed_ms)
 
         if self.full_prompts_enabled:
             # Guard against unbounded growth; mark when truncated.
@@ -153,6 +157,8 @@ class AuditLogger:
         tool_name: str,
         arguments: dict[str, Any],
         result: Any,
+        *,
+        elapsed_ms: int | None = None,
     ) -> None:
         """Log a tool invocation with path and changed/created from result."""
         if not self.enabled:
@@ -175,10 +181,30 @@ class AuditLogger:
             "path": str(path),
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
+        if elapsed_ms is not None:
+            evt["elapsed_ms"] = int(elapsed_ms)
         if changed is not None:
             evt["changed"] = changed
         if created is not None:
             evt["created"] = created
+        if isinstance(result, dict):
+            for key in (
+                "matched_line_range",
+                "allowed_line_range",
+                "file_hash_before",
+                "file_hash_after",
+                "anchor_hash",
+                "candidate_id",
+                "active_target",
+                "investigation_success",
+                "investigation_failures",
+                "route_locked",
+                "forced_route_lock",
+                "forced_route_reason",
+                "patch_signature",
+            ):
+                if key in result:
+                    evt[key] = result.get(key)
         if self.code_patch_enabled and (before is not None or after is not None):
             # Store snapshots with length guards to avoid pathological growth.
             max_chars = 100000

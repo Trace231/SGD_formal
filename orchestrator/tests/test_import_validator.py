@@ -231,3 +231,57 @@ def test_import_change_regression_rolls_back(tmp_path, monkeypatch):
         tools_mod.edit_file_patch("Test.lean", original, updated)
 
     assert lean_file.read_text(encoding="utf-8") == original
+
+
+def test_edit_file_patch_blocks_out_of_span(tmp_path, monkeypatch):
+    import orchestrator.tools as tools_mod
+
+    lean_file = tmp_path / "Test.lean"
+    original = "line1\nline2\nline3\nline4\n"
+    lean_file.write_text(original, encoding="utf-8")
+
+    monkeypatch.setattr(tools_mod, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(tools_mod, "_READ_WRITE_ALLOWLIST", ("",))
+    monkeypatch.setattr(tools_mod, "run_lean_verify", lambda _path: {"exit_code": 0, "error_count": 0, "errors": []})
+    monkeypatch.setattr(tools_mod, "validate_required_imports", lambda **_kwargs: [])
+    monkeypatch.setattr(tools_mod, "validate_mathlib_imports", lambda *_args, **_kwargs: [])
+
+    def _fake_resolve(path, allowlist):
+        return tmp_path / Path(path).name
+
+    monkeypatch.setattr(tools_mod, "_resolve_allowed_path", _fake_resolve)
+
+    with pytest.raises(ValueError, match="authorized line span"):
+        tools_mod.edit_file_patch(
+            "Test.lean",
+            "line3\n",
+            "line3_changed\n",
+            allowed_line_range="1-2",
+        )
+
+
+def test_edit_file_patch_blocks_stale_hash(tmp_path, monkeypatch):
+    import orchestrator.tools as tools_mod
+
+    lean_file = tmp_path / "Test.lean"
+    original = "alpha\nbeta\n"
+    lean_file.write_text(original, encoding="utf-8")
+
+    monkeypatch.setattr(tools_mod, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(tools_mod, "_READ_WRITE_ALLOWLIST", ("",))
+    monkeypatch.setattr(tools_mod, "run_lean_verify", lambda _path: {"exit_code": 0, "error_count": 0, "errors": []})
+    monkeypatch.setattr(tools_mod, "validate_required_imports", lambda **_kwargs: [])
+    monkeypatch.setattr(tools_mod, "validate_mathlib_imports", lambda *_args, **_kwargs: [])
+
+    def _fake_resolve(path, allowlist):
+        return tmp_path / Path(path).name
+
+    monkeypatch.setattr(tools_mod, "_resolve_allowed_path", _fake_resolve)
+
+    with pytest.raises(ValueError, match="stale file hash"):
+        tools_mod.edit_file_patch(
+            "Test.lean",
+            "alpha\n",
+            "alpha2\n",
+            required_file_hash="deadbeef",
+        )

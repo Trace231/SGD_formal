@@ -40,7 +40,6 @@ AGENT8_REQUIRED_DECISION_FIELDS = frozenset(
         "action",
         "priority_level",
         "reason",
-        "targeted_prompt",
         "error_signature",
         "hypothesis",
         "evidence",
@@ -55,6 +54,24 @@ AGENT8_VALID_ERROR_SUBTYPES = frozenset(
         "proof_api_mismatch",
         "proof_tactic_failure",
         "strategy_mismatch",
+    }
+)
+AGENT8_VALID_REPAIR_UNITS = frozenset(
+    {
+        "local_patch",
+        "block_restructure",
+        "glue",
+        "global_replan",
+        "statement_gap",
+    }
+)
+AGENT8_VALID_BLOCKER_STATUSES = frozenset(
+    {
+        "resolved",
+        "escalated_subproblem",
+        "certified_statement_gap",
+        "certified_structural_block",
+        "infra_failure",
     }
 )
 
@@ -78,6 +95,20 @@ Agent8ErrorSubtype = Literal[
     "proof_api_mismatch",
     "proof_tactic_failure",
     "strategy_mismatch",
+]
+Agent8RepairUnit = Literal[
+    "local_patch",
+    "block_restructure",
+    "glue",
+    "global_replan",
+    "statement_gap",
+]
+Agent8BlockerStatus = Literal[
+    "resolved",
+    "escalated_subproblem",
+    "certified_statement_gap",
+    "certified_structural_block",
+    "infra_failure",
 ]
 
 
@@ -132,4 +163,13 @@ class Agent8Decision(TypedDict, total=False):
     agent6_targeted_prompt: str
     trigger_reason: str
     expected_fallback: str
+    investigation_success: bool
+    investigation_failures: list[dict]
+    route_locked: bool
+    candidate_id: str
+    allowed_span: str
+    repair_unit: Agent8RepairUnit
+    target_region: str
+    blocker_status: Agent8BlockerStatus
+    blocker_report: dict
 

@@ -52,8 +52,10 @@ class Phase3State:
     last_sorry_count: int = 0
     attempts: int = 0
     execution_history: list[Any] = field(default_factory=list)
+    decision_history: list[dict] = field(default_factory=list)
     attempt_failures: list[dict] = field(default_factory=list)
     agent3_turns: list[dict] = field(default_factory=list)
+    blocker_reports: list[dict] = field(default_factory=list)
     diag_log: list[str] = field(default_factory=list)
 
     # Agent7 telemetry
@@ -74,6 +76,7 @@ class Phase3State:
     last_dep_error_sig: str | None = None
     assumption_patch_tried: set[str] = field(default_factory=set)
     failed_approaches: list[dict] = field(default_factory=list)
+    failure_ledger: list[dict] = field(default_factory=list)
     goal_cache: dict[tuple[str, int, str], dict] = field(default_factory=dict)
 
     # File/checkpoint state

@@ -25,8 +25,6 @@ def test_validate_agent9_plan_accepts_strict_required_fields():
                 "key_lib_lemmas": ["simp"],
                 "missing_glue_lemmas": [],
                 "dependency_map": {},
-                "first_action_patch_hint": "",
-                "expected_lean_shape": "",
                 "estimated_difficulty": "low",
             }
         ],
@@ -49,8 +47,6 @@ def test_validate_agent9_plan_rejects_bad_recommended_order():
                 "key_lib_lemmas": ["simp"],
                 "missing_glue_lemmas": [],
                 "dependency_map": {},
-                "first_action_patch_hint": "",
-                "expected_lean_shape": "",
                 "estimated_difficulty": "low",
             }
         ],
@@ -81,4 +77,11 @@ def test_agent8_theorem_context_supports_legacy_fields():
     assert "lean_statement_line: 81" in ctx
     assert "estimated_difficulty: medium" in ctx
     assert "depends_on: ['process_zero']" in ctx
+
+
+def test_agent8_contract_supports_repair_units_and_blocker_statuses():
+    assert "local_patch" in contracts.AGENT8_VALID_REPAIR_UNITS
+    assert "block_restructure" in contracts.AGENT8_VALID_REPAIR_UNITS
+    assert "statement_gap" in contracts.AGENT8_VALID_REPAIR_UNITS
+    assert "certified_structural_block" in contracts.AGENT8_VALID_BLOCKER_STATUSES
 

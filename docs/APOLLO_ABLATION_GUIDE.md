@@ -161,6 +161,7 @@ python -m ablation.apollo_only.reports.parity_report \
 - `--monitor-interval-sec`: verifier monitor polling interval
 - `--monitor-stall-sec`: verifier stall threshold before worker restart
 - `--request-timeout-sec`: per-request verifier timeout
+- `--apply-best-candidate`: continuously write best verified candidate back to target Lean file
 - `--log-dir`: parity log root
 - `--quiet`: reduce launcher-level logs
 

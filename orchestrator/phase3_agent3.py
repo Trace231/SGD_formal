@@ -19,6 +19,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
@@ -45,7 +46,6 @@ from orchestrator.config import (
     AGENT3_TACTIC_PROBE_ENABLED,
     AGENT3_TACTIC_PROBE_STR,
     AGENT3_TACTIC_STRATEGIES,
-    AGENT6_AUTO_ROUTE_ENABLED,
     AGENT8_MIDCHECK_ENABLED,
     AGENT8_MIDCHECK_INTERVAL_TURNS,
     AGENT8_MIDCHECK_MIN_TURN,
@@ -165,7 +165,6 @@ from orchestrator.context_builders import (
     _format_agent3_tool_feedback,
     _check_patch_symbols,
     _prioritize_error_text,
-    _should_route_to_agent6_for_infra,
     _get_reference_files_with_descriptions,
     _format_ref_and_classification_blocks,
     _format_failed_approaches,
@@ -210,6 +209,22 @@ def _agent3_error_count(payload: dict[str, Any]) -> int:
     if isinstance(errs, str):
         return len([ln for ln in errs.splitlines() if ln.strip()])
     return 0
+
+
+def _agent3_errors_text(payload: dict[str, Any]) -> str:
+    """Normalize verify/candidate errors to stable multi-line text."""
+    errs = payload.get("errors", [])
+    if isinstance(errs, str):
+        return errs
+    if isinstance(errs, list):
+        lines: list[str] = []
+        for item in errs:
+            if isinstance(item, dict):
+                lines.append(str(item.get("data", "")).strip())
+            else:
+                lines.append(str(item).strip())
+        return "\n".join([ln for ln in lines if ln])
+    return str(errs or "")
 
 
 def _agent3_score_verify(payload: dict[str, Any]) -> tuple[int, int, int, int, int]:
@@ -260,6 +275,216 @@ def _run_tactic_probe(
     return probe_verify, probe_content
 
 
+@dataclass(frozen=True)
+class Agent3ExecutionProfile:
+    name: str
+    patch_guard_mode: bool
+    search_allowed: bool
+    prefer_lean_decomposition: bool
+    candidate_count: int
+    strategy_hints: list[str]
+    guidance: str
+
+
+def _midcheck_should_handoff_to_search(decision: dict[str, Any]) -> bool:
+    """Whether an Agent8 tactical midcheck should jump into the search kernel."""
+    if str(decision.get("action", "")) != "agent3_tactical":
+        return False
+    exec_mode = str(decision.get("agent3_execution_mode", "") or "")
+    repair_unit = str(decision.get("repair_unit", "") or "")
+    if exec_mode == "sampled_search":
+        return True
+    return repair_unit == "block_restructure"
+
+
+def _build_agent3_execution_profile(
+    *,
+    base_candidate_count: int,
+    patch_guard_mode: bool,
+    search_allowed: bool,
+    error_subtype: str,
+    repair_unit: str,
+    compile_first_mode: bool,
+) -> Agent3ExecutionProfile:
+    """Map Agent8 routing metadata to an Agent3-owned execution profile.
+    
+    Simplified version: always use 1 candidate to avoid redundant work.
+    """
+    base_strategies = list(AGENT3_TACTIC_STRATEGIES) or ["general (no tactic preference)"]
+    profile_name = "local_patch"
+    guidance = (
+        "Keep changes local, respect verifier feedback, and prefer verified progress "
+        "over broad rewrites."
+    )
+    strategy_hints = list(base_strategies)
+    prefer_lean_decomposition = repair_unit == "block_restructure"
+    candidate_count = 1
+
+    if repair_unit == "glue":
+        profile_name = "proof_state_sublemma"
+        prefer_lean_decomposition = True
+        strategy_hints = [
+            "focus an extracted sublemma or missing bridge obligation",
+            "stabilize one local proof-state fragment before broader edits",
+            *base_strategies,
+        ]
+        guidance = (
+            "Treat Lean-visible sublemma obligations as the primary work queue. "
+            "Prefer solving or simplifying one extracted obligation at a time."
+        )
+    elif repair_unit == "block_restructure":
+        profile_name = "block_restructure"
+        prefer_lean_decomposition = True
+        strategy_hints = [
+            "split long calc/have chains into explicit intermediate steps",
+            "rewrite one local block before touching adjacent proof code",
+            "prefer local goal-shape normalization before changing lemmas",
+            *base_strategies,
+        ]
+        guidance = (
+            "This is a local proof-block rewrite. Decompose the target block into "
+            "smaller verified steps and keep theorem headers stable."
+        )
+    elif error_subtype == "proof_api_mismatch":
+        profile_name = "api_shape"
+        prefer_lean_decomposition = True
+        strategy_hints = [
+            "lookup current signature before patching callsites",
+            "change argument shape only before changing proof logic",
+            "fix one or two failing callsites, then verify",
+            *base_strategies,
+        ]
+        guidance = (
+            "Focus on API-shape repair. Use Lean-visible failing callsites and "
+            "subproblems to bound the search, but keep patches minimal."
+        )
+    elif error_subtype == "proof_tactic_failure":
+        profile_name = "block_restructure"
+        prefer_lean_decomposition = True
+        guidance = (
+            "Treat the failing proof body as a decomposition target. Prefer local "
+            "block rewrites or extracted subgoals before line-by-line patching."
+        )
+
+    if compile_first_mode and profile_name == "local_patch":
+        guidance += " Compile-first mode: repair only the top compiler/type blockers."
+
+    return Agent3ExecutionProfile(
+        name=profile_name,
+        patch_guard_mode=bool(patch_guard_mode),
+        search_allowed=bool(search_allowed),
+        prefer_lean_decomposition=bool(prefer_lean_decomposition),
+        candidate_count=candidate_count,
+        strategy_hints=strategy_hints,
+        guidance=guidance,
+    )
+
+
+def _build_agent3_decomposition_plan(
+    *,
+    content: str,
+    current_errors: str,
+    error_subtype: str,
+    repair_unit: str,
+    verifier,
+    extract_sublemmas_fn,
+    build_subproblem_graph_fn,
+) -> dict[str, Any]:
+    """Build Lean-driven subproblem hints before broad candidate search."""
+    extracted_sublemmas: list[str] = []
+    lemma_meta: dict[str, Any] = {"ok": False, "count": 0}
+    try:
+        _lemmas, lemma_meta = extract_sublemmas_fn(content, verifier)
+        extracted_sublemmas = list(lemma_meta.get("statements", []) or [])
+    except Exception as exc:  # noqa: BLE001
+        lemma_meta = {"ok": False, "count": 0, "error": str(exc)}
+        extracted_sublemmas = []
+
+    try:
+        graph = build_subproblem_graph_fn(
+            current_errors=current_errors,
+            error_subtype=error_subtype,
+            lemma_count=len(extracted_sublemmas),
+            sublemma_statements=extracted_sublemmas,
+        )
+    except Exception as exc:  # noqa: BLE001
+        graph = [{
+            "id": "sp-fallback-global",
+            "kind": "global_strategy",
+            "priority": 99,
+            "target": repair_unit or "proof body",
+            "evidence": f"graph build failed: {exc}",
+        }]
+
+    preferred_kinds = {
+        "proof_state_sublemma",
+        "proof_api_shape",
+        "local_tactic_repair",
+    }
+    if repair_unit == "glue":
+        preferred_kinds = {"proof_state_sublemma", "missing_glue"}
+    elif repair_unit == "block_restructure":
+        preferred_kinds = {"proof_state_sublemma", "local_tactic_repair", "proof_api_shape"}
+    elif error_subtype == "proof_api_mismatch":
+        preferred_kinds = {"proof_api_shape", "proof_state_sublemma"}
+
+    preferred_nodes = [node for node in graph if str(node.get("kind", "")) in preferred_kinds]
+    if not preferred_nodes:
+        preferred_nodes = list(graph)
+
+    return {
+        "lemma_meta": lemma_meta,
+        "extracted_sublemmas": extracted_sublemmas,
+        "graph": list(graph),
+        "preferred_nodes": preferred_nodes[: max(1, len(preferred_nodes))],
+    }
+
+
+def _build_agent3_search_prompt(
+    *,
+    base_prompt: str,
+    profile: Agent3ExecutionProfile,
+    decomposition_plan: dict[str, Any],
+    target_region: str,
+    allowed_edit_lines: str | None,
+) -> str:
+    """Compose Agent3-owned tactical guidance from routing metadata."""
+    lines = [
+        base_prompt.strip(),
+        "",
+        "[AGENT3 EXECUTION PROFILE]",
+        f"- profile: {profile.name}",
+        f"- patch_guard_mode: {str(profile.patch_guard_mode).lower()}",
+        f"- search_allowed: {str(profile.search_allowed).lower()}",
+        f"- target_region: {target_region or allowed_edit_lines or 'unknown'}",
+        f"- guidance: {profile.guidance}",
+    ]
+    sublemmas = list(decomposition_plan.get("extracted_sublemmas", []) or [])
+    nodes = list(decomposition_plan.get("preferred_nodes", []) or [])
+    if sublemmas:
+        lines.append("- lean_sublemmas:")
+        for stmt in sublemmas[:3]:
+            lines.append(f"  - {stmt[:200]}")
+    if nodes:
+        lines.append("- preferred_subproblems:")
+        for node in nodes[:3]:
+            lines.append(
+                f"  - {node.get('id', '')}: {node.get('kind', '')} -> "
+                f"{node.get('target', '')} :: {str(node.get('evidence', ''))[:120]}"
+            )
+    lines.append(
+        "- Agent3 owns tactical search, local decomposition, and verification order within this mode."
+    )
+    return "\n".join([ln for ln in lines if ln is not None])
+
+
+def _select_agent3_focus_node(nodes: list[dict[str, Any]], index0: int) -> dict[str, Any] | None:
+    """Round-robin assignment of bounded subproblem focus across candidates."""
+    if not nodes:
+        return None
+    return nodes[index0 % len(nodes)]
+
+
 def run_agent3_search_kernel(
     target_file: str,
     agent2_plan: str,
@@ -268,8 +493,12 @@ def run_agent3_search_kernel(
     *,
     max_turns: int | None = None,
     compile_first_mode: bool = False,
+    patch_guard_mode: bool = False,
+    search_allowed: bool | None = None,
     transactional_mode: bool = False,
     error_subtype: str = "",
+    repair_unit: str = "local_patch",
+    target_region: str = "",
     run_single_candidate=None,
 ) -> dict[str, Any]:
     """APOLLO-style bounded search kernel for Agent3 execution.
@@ -291,10 +520,36 @@ def run_agent3_search_kernel(
     from orchestrator.tools import run_lean_verify
 
     max_turns = max_turns or RETRY_LIMITS.get("AGENT8_AGENT3_MAX_TURNS", 15)
-    candidate_count = max(1, int(AGENT3_CANDIDATE_COUNT))
+    base_candidate_count = max(1, int(AGENT3_CANDIDATE_COUNT))
     max_depth = max(0, int(AGENT3_RECURSION_DEPTH))
     no_improve_window = max(1, int(AGENT3_NO_IMPROVEMENT_WINDOW))
-    search_enabled = bool(AGENT3_SEARCH_ENABLED) and not transactional_mode
+    search_started = time.perf_counter()
+    search_timing: dict[str, int] = {
+        "baseline_verify_ms": 0,
+        "repl_start_ms": 0,
+        "repl_prime_ms": 0,
+        "apollo_prepass_ms": 0,
+        "decomposition_ms": 0,
+        "probe_ms": 0,
+        "candidate_batch_ms": 0,
+        "selection_ms": 0,
+        "search_kernel_total_ms": 0,
+    }
+    candidate_timings: list[dict[str, Any]] = []
+    if transactional_mode and not patch_guard_mode:
+        patch_guard_mode = True
+    if search_allowed is None:
+        search_allowed = not transactional_mode
+    profile = _build_agent3_execution_profile(
+        base_candidate_count=base_candidate_count,
+        patch_guard_mode=patch_guard_mode,
+        search_allowed=bool(search_allowed),
+        error_subtype=error_subtype,
+        repair_unit=repair_unit,
+        compile_first_mode=compile_first_mode,
+    )
+    candidate_count = max(1, int(profile.candidate_count))
+    search_enabled = bool(AGENT3_SEARCH_ENABLED) and bool(profile.search_allowed)
 
     target_path = Path(target_file)
     if not target_path.is_absolute():
@@ -302,28 +557,40 @@ def run_agent3_search_kernel(
     baseline_content = target_path.read_text(encoding="utf-8")
 
     baseline_verify = run_lean_verify(str(target_path))
+    search_timing["baseline_verify_ms"] = int(float(baseline_verify.get("verify_wall_ms", 0) or 0))
     baseline_score = _agent3_score_verify(baseline_verify)
 
     repl_session: ReplSession | None = None
     header_env_id: int | None = None
     repl_session_error = ""
     try:
+        repl_started = time.perf_counter()
         repl_session = ReplSession(
             repl_workspace=Path(APOLLO_REPL_WORKSPACE),
             lake_path=APOLLO_LAKE_PATH,
             timeout=REPL_VERIFY_TIMEOUT,
             project_root=PROJECT_ROOT,
         )
+        search_timing["repl_start_ms"] = int((time.perf_counter() - repl_started) * 1000.0)
         header_code = _extract_header_lines(baseline_content)
         if header_code.strip():
+            prime_started = time.perf_counter()
             header_env_id = repl_session.prime_header(header_code)
+            search_timing["repl_prime_ms"] = int((time.perf_counter() - prime_started) * 1000.0)
     except Exception as exc:  # noqa: BLE001
         repl_session = None
         header_env_id = None
         repl_session_error = str(exc)
 
     prepass_meta: dict[str, Any] = {"applied": False, "changed": False}
+    decomposition_plan: dict[str, Any] = {
+        "lemma_meta": {"ok": False, "count": 0},
+        "extracted_sublemmas": [],
+        "graph": [],
+        "preferred_nodes": [],
+    }
     # Keep APOLLO preprocess in main path before candidate search.
+    prepass_started = time.perf_counter()
     try:
         try:
             verifier = build_apollo_verify_callable(
@@ -359,32 +626,63 @@ def run_agent3_search_kernel(
             verifier = build_apollo_verify_callable()
         except Exception:  # noqa: BLE001
             verifier = lambda _code: {"pass": False, "complete": False, "errors": []}
+    search_timing["apollo_prepass_ms"] = int((time.perf_counter() - prepass_started) * 1000.0)
     prepass_meta["repl_session_active"] = repl_session is not None
     prepass_meta["repl_header_env_id"] = header_env_id
     if repl_session_error:
         prepass_meta["repl_session_error"] = repl_session_error
+
+    baseline_errors_text = _agent3_errors_text(baseline_verify)
+    if profile.prefer_lean_decomposition:
+        decomp_started = time.perf_counter()
+        decomposition_plan = _build_agent3_decomposition_plan(
+            content=baseline_content,
+            current_errors=baseline_errors_text,
+            error_subtype=error_subtype,
+            repair_unit=repair_unit,
+            verifier=verifier,
+            extract_sublemmas_fn=extract_sublemmas,
+            build_subproblem_graph_fn=build_subproblem_graph,
+        )
+        search_timing["decomposition_ms"] = int((time.perf_counter() - decomp_started) * 1000.0)
+    prepass_meta["execution_profile"] = profile.name
+    prepass_meta["initial_decomposition"] = {
+        "sublemma_count": len(decomposition_plan.get("extracted_sublemmas", []) or []),
+        "subproblem_count": len(decomposition_plan.get("preferred_nodes", []) or []),
+    }
 
     probe_budget_per_round = 1 if AGENT3_TACTIC_PROBE_ENABLED else 0
     total_candidate_budget = (candidate_count + probe_budget_per_round) * (max_depth + 1)
     consumed_candidates = 0
     no_improve_rounds = 0
     depth = 0
-    search_prompt = targeted_prompt
+    search_prompt = _build_agent3_search_prompt(
+        base_prompt=targeted_prompt,
+        profile=profile,
+        decomposition_plan=decomposition_plan,
+        target_region=target_region,
+        allowed_edit_lines=allowed_edit_lines,
+    )
     best_failed_summary: dict[str, Any] = {}
-    strategy_hints = list(AGENT3_TACTIC_STRATEGIES) or ["general (no tactic preference)"]
+    strategy_hints = list(profile.strategy_hints)
 
     try:
         if not search_enabled:
             out = run_single_candidate(
                 target_file,
                 agent2_plan,
-                targeted_prompt,
+                search_prompt,
                 allowed_edit_lines,
                 max_turns=max_turns,
                 compile_first_mode=compile_first_mode,
+                patch_guard_mode=profile.patch_guard_mode,
+                search_allowed=profile.search_allowed,
                 transactional_mode=transactional_mode,
+                repair_unit=repair_unit,
+                target_region=target_region,
                 candidate_index=1,
                 candidate_total=1,
+                candidate_id="d1.c1",
             )
             out.setdefault("candidate_id", "c1")
             out.setdefault("candidate_score", list(_agent3_score_result(out)))
@@ -393,8 +691,20 @@ def run_agent3_search_kernel(
                 "budget_remaining",
                 {"depth": max_depth, "candidates": candidate_count * (max_depth + 1)},
             )
-            out.setdefault("best_candidate_reason", "search_disabled_or_transactional")
+            out.setdefault(
+                "best_candidate_reason",
+                "search_disabled_by_policy" if not profile.search_allowed else "search_disabled_config",
+            )
             out.setdefault("apollo_prepass_meta", prepass_meta)
+            out.setdefault("execution_profile", profile.name)
+            out.setdefault("candidate_timings", candidate_timings)
+            out.setdefault(
+                "search_timing",
+                {
+                    **search_timing,
+                    "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
+                },
+            )
             return out
 
         while depth <= max_depth:
@@ -407,12 +717,14 @@ def run_agent3_search_kernel(
 
             # APOLLO-aligned deterministic tactic probe candidate.
             if AGENT3_TACTIC_PROBE_ENABLED:
+                probe_started = time.perf_counter()
                 probe = _run_tactic_probe(
                     baseline_content=baseline_content,
                     session=repl_session,
                     header_env_id=header_env_id,
                     tactic_str=AGENT3_TACTIC_PROBE_STR,
                 )
+                search_timing["probe_ms"] += int((time.perf_counter() - probe_started) * 1000.0)
                 if probe is not None:
                     probe_verify, probe_content = probe
                     probe_norm: dict[str, Any] = {
@@ -445,6 +757,12 @@ def run_agent3_search_kernel(
                             },
                             "best_candidate_reason": "tactic_probe_clean",
                             "apollo_prepass_meta": prepass_meta,
+                            "execution_profile": profile.name,
+                            "candidate_timings": candidate_timings,
+                            "search_timing": {
+                                **search_timing,
+                                "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
+                            },
                         }
 
             def _run_parallel_candidate(idx0: int) -> tuple[int, dict[str, Any], str, Path]:
@@ -455,12 +773,35 @@ def run_agent3_search_kernel(
                 cand_path.write_text(baseline_content, encoding="utf-8")
                 strategy_idx = idx0 % len(strategy_hints)
                 strategy_hint = strategy_hints[strategy_idx]
+                focus_node = _select_agent3_focus_node(
+                    list(decomposition_plan.get("preferred_nodes", []) or []),
+                    idx0,
+                )
+                focus_block = ""
+                if focus_node:
+                    focus_block = (
+                        "\n\n[Bounded Subproblem Focus]\n"
+                        f"- node_id: {focus_node.get('id', '')}\n"
+                        f"- node_kind: {focus_node.get('kind', '')}\n"
+                        f"- target: {focus_node.get('target', '')}\n"
+                        f"- evidence: {str(focus_node.get('evidence', ''))[:180]}\n"
+                    )
                 cand_prompt = (
                     f"{search_prompt}\n\n"
                     f"[Parallel Candidate Isolation]\n"
                     f"- candidate_id: d{depth + 1}.c{cand_idx}\n"
                     f"- operate only on target file: {cand_path}\n"
                     f"- this candidate is isolated from other candidates.\n\n"
+                    f"[Repair Unit]\n"
+                    f"- repair_unit: {repair_unit}\n"
+                    f"- target_region: {target_region or allowed_edit_lines or 'unknown'}\n"
+                    f"- keep declaration headers stable unless compile evidence demands otherwise.\n\n"
+                    f"[Execution Profile]\n"
+                    f"- profile: {profile.name}\n"
+                    f"- patch_guard_mode: {str(profile.patch_guard_mode).lower()}\n"
+                    f"- prefer_lean_decomposition: {str(profile.prefer_lean_decomposition).lower()}\n"
+                    f"- guidance: {profile.guidance}\n"
+                    f"{focus_block}\n"
                     f"[Tactic Strategy for This Candidate]\n"
                     f"- preferred_strategy: {strategy_hint}\n"
                     f"- Prefer tactics in this family when multiple options exist.\n"
@@ -473,13 +814,19 @@ def run_agent3_search_kernel(
                     allowed_edit_lines,
                     max_turns=max_turns,
                     compile_first_mode=compile_first_mode,
+                    patch_guard_mode=profile.patch_guard_mode,
+                    search_allowed=profile.search_allowed,
                     transactional_mode=transactional_mode,
+                    repair_unit=repair_unit,
+                    target_region=target_region,
                     candidate_index=cand_idx,
                     candidate_total=candidate_count,
+                    candidate_id=f"d{depth + 1}.c{cand_idx}",
                 )
                 content = cand_path.read_text(encoding="utf-8")
                 return cand_idx, result, content, cand_path
 
+            batch_started = time.perf_counter()
             if candidate_count == 1:
                 candidate_artifacts.append(_run_parallel_candidate(0))
             else:
@@ -487,13 +834,29 @@ def run_agent3_search_kernel(
                     futs = [ex.submit(_run_parallel_candidate, i) for i in range(candidate_count)]
                     for fut in cf.as_completed(futs):
                         candidate_artifacts.append(fut.result())
+            search_timing["candidate_batch_ms"] += int((time.perf_counter() - batch_started) * 1000.0)
 
             candidate_artifacts.sort(key=lambda x: x[0])
             candidate_paths = [it[3] for it in candidate_artifacts]
             consumed_candidates += candidate_count
 
+            selection_started = time.perf_counter()
             for cand_idx, candidate_result, candidate_content, _cand_path in candidate_artifacts:
                 candidate_score = _agent3_score_result(candidate_result)
+                _candidate_metrics = dict(candidate_result.get("candidate_metrics", {}) or {})
+                _candidate_metrics.setdefault(
+                    "candidate_total_ms",
+                    int(_candidate_metrics.get("llm_ms", 0) or 0)
+                    + int(_candidate_metrics.get("tool_ms", 0) or 0),
+                )
+                candidate_timings.append(
+                    {
+                        "candidate_id": str(candidate_result.get("candidate_id", f"d{depth + 1}.c{cand_idx}")),
+                        "depth": depth,
+                        "score": list(candidate_score),
+                        **_candidate_metrics,
+                    }
+                )
                 if best_result is None or best_score is None or candidate_score < best_score:
                     best_result = dict(candidate_result)
                     best_score = candidate_score
@@ -521,9 +884,17 @@ def run_agent3_search_kernel(
                             },
                             "best_candidate_reason": "clean_candidate_early_stop",
                             "apollo_prepass_meta": prepass_meta,
+                            "execution_profile": profile.name,
+                            "candidate_timings": candidate_timings,
+                            "search_timing": {
+                                **search_timing,
+                                "selection_ms": search_timing["selection_ms"] + int((time.perf_counter() - selection_started) * 1000.0),
+                                "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
+                            },
                         }
                     )
                     return clean
+            search_timing["selection_ms"] += int((time.perf_counter() - selection_started) * 1000.0)
 
             for p in candidate_paths:
                 p.unlink(missing_ok=True)
@@ -545,6 +916,8 @@ def run_agent3_search_kernel(
                         "candidates": max(0, total_candidate_budget - consumed_candidates),
                     },
                     "apollo_prepass_meta": prepass_meta,
+                    "execution_profile": profile.name,
+                    "candidate_timings": candidate_timings,
                 }
             )
 
@@ -552,6 +925,10 @@ def run_agent3_search_kernel(
             if best_score < baseline_score:
                 no_improve_rounds = 0
                 best_result["best_candidate_reason"] = "best_candidate_improved_baseline"
+                best_result["search_timing"] = {
+                    **search_timing,
+                    "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
+                }
                 return best_result
             no_improve_rounds += 1
 
@@ -570,38 +947,68 @@ def run_agent3_search_kernel(
                 lemma_count=len(extracted_sublemmas),
                 sublemma_statements=extracted_sublemmas,
             )
+            decomposition_plan = {
+                "lemma_meta": {
+                    "ok": bool(extracted_sublemmas),
+                    "count": len(extracted_sublemmas),
+                    "statements": extracted_sublemmas[:5],
+                },
+                "extracted_sublemmas": extracted_sublemmas,
+                "graph": list(graph),
+                "preferred_nodes": list(graph[: max(1, candidate_count)]),
+            }
             best_failed_summary = {
                 "failure_kind": failure_kind,
                 "observed_signature": best_errors.splitlines()[0][:200] if best_errors else "",
                 "best_candidate_score": list(best_score),
                 "extracted_sublemmas": extracted_sublemmas[:5],
                 "subproblem_graph_head": graph[:2],
+                "execution_profile": profile.name,
             }
             best_result["failure_kind"] = failure_kind
             best_result["observed_signature"] = best_failed_summary["observed_signature"]
             best_result["best_failed_candidate_summary"] = best_failed_summary
+            best_result["blocked_state"] = {
+                **dict(best_result.get("blocked_state", {}) or {}),
+                "failure_kind": failure_kind,
+                "observed_signature": best_failed_summary["observed_signature"],
+                "target_region": target_region or allowed_edit_lines or "unknown",
+                "candidate_budget_consumed": consumed_candidates,
+                "candidate_budget_total": total_candidate_budget,
+                "execution_profile": profile.name,
+            }
 
             if no_improve_rounds >= no_improve_window:
                 best_result["best_candidate_reason"] = "no_improvement_window_reached"
+                best_result["search_timing"] = {
+                    **search_timing,
+                    "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
+                }
                 return best_result
 
             if depth >= max_depth:
                 best_result["best_candidate_reason"] = "max_recursion_depth_reached"
+                best_result["search_timing"] = {
+                    **search_timing,
+                    "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
+                }
                 return best_result
 
             if graph:
                 node = graph[0]
                 search_prompt = (
-                    f"{targeted_prompt}\n\n[APOLLO Subproblem Depth {depth + 1}]\n"
+                    f"{_build_agent3_search_prompt(base_prompt=targeted_prompt, profile=profile, decomposition_plan=decomposition_plan, target_region=target_region, allowed_edit_lines=allowed_edit_lines)}\n\n[APOLLO Subproblem Depth {depth + 1}]\n"
                     f"- node_id: {node.get('id', '')}\n"
                     f"- node_kind: {node.get('kind', '')}\n"
                     f"- target: {node.get('target', '')}\n"
                     f"- evidence: {node.get('evidence', '')}\n"
-                    "- Focus only this subproblem and produce minimal verified patch."
+                    f"- repair_unit: {repair_unit}\n"
+                    f"- target_region: {target_region or allowed_edit_lines or 'unknown'}\n"
+                    "- Focus only this subproblem and produce a verified local repair."
                 )
             else:
                 search_prompt = (
-                    f"{targeted_prompt}\n\n[APOLLO Subproblem Depth {depth + 1}]\n"
+                    f"{_build_agent3_search_prompt(base_prompt=targeted_prompt, profile=profile, decomposition_plan=decomposition_plan, target_region=target_region, allowed_edit_lines=allowed_edit_lines)}\n\n[APOLLO Subproblem Depth {depth + 1}]\n"
                     "- Focus top error signature only and avoid broad rewrites."
                 )
 
@@ -626,6 +1033,20 @@ def run_agent3_search_kernel(
             "failure_kind": best_failed_summary.get("failure_kind", "strategy_failure"),
             "observed_signature": best_failed_summary.get("observed_signature", ""),
             "best_failed_candidate_summary": best_failed_summary,
+            "execution_profile": profile.name,
+            "candidate_timings": candidate_timings,
+            "search_timing": {
+                **search_timing,
+                "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
+            },
+            "blocked_state": {
+                "failure_kind": best_failed_summary.get("failure_kind", "strategy_failure"),
+                "observed_signature": best_failed_summary.get("observed_signature", ""),
+                "target_region": target_region or allowed_edit_lines or "unknown",
+                "candidate_budget_consumed": consumed_candidates,
+                "candidate_budget_total": total_candidate_budget,
+                "execution_profile": profile.name,
+            },
         }
         return fallback
     finally:
@@ -633,8 +1054,68 @@ def run_agent3_search_kernel(
             repl_session.close()
 
 
+def _agent3_patch_signature(arguments: dict | None) -> str:
+    """Build a stable short signature for an Agent3 patch proposal."""
+    args = arguments or {}
+    old = str(args.get("old_str", "") or "")
+    new = str(args.get("new_str", "") or "")
+    payload = f"{old}\n---PATCH---\n{new}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _agent3_error_signature(errors_text: str) -> str:
+    """Extract a normalized top error signature for repeat suppression."""
+    for line in str(errors_text or "").splitlines():
+        raw = line.strip()
+        if raw:
+            return re.sub(r"\s+", " ", raw)[:180]
+    return ""
+
+
+def _build_agent3_distilled_context(
+    *,
+    attempt: int,
+    guidance: str,
+    best_checkpoint: dict,
+    failure_ledger: list[dict],
+) -> str:
+    """Create compact failure memory for Agent3 after context eviction."""
+    recent = failure_ledger[-3:]
+    if recent:
+        recent_lines = [
+            (
+                f"  - error={entry.get('error_signature', '')[:120]} | "
+                f"patch={entry.get('patch_signature', '')} | "
+                f"target={entry.get('target_ref', '')[:80]} | "
+                f"outcome={entry.get('outcome', '')}"
+            )
+            for entry in recent
+        ]
+        blocked_pairs = [
+            f"  - {entry.get('error_signature', '')[:90]} :: {entry.get('patch_signature', '')}"
+            for entry in recent
+            if entry.get("repeat_count", 0) >= 2 and entry.get("patch_signature")
+        ]
+    else:
+        recent_lines = ["  (none recorded)"]
+        blocked_pairs = ["  (none)"]
+    return (
+        f"[CONTEXT REFRESH — Attempt {attempt}]\n"
+        "Your conversation history was cleared. Preserve the active object and do not "
+        "repeat known-failing repair patterns.\n\n"
+        f"## Current guidance\n{guidance[:3000]}\n\n"
+        f"## Best checkpoint (sorry={best_checkpoint['sorry_count']})\n"
+        f"```lean\n{(best_checkpoint['content'] or '')[:2500]}\n```\n\n"
+        "## Recent failure ledger\n"
+        + "\n".join(recent_lines)
+        + "\n\n## Forbidden repeated patch/error pairs\n"
+        + "\n".join(blocked_pairs)
+        + "\n\nUse a different tactic family, lookup fresh evidence, or escalate."
+    )
+
+
 def phase3_prove(
-    agent2: Agent,
+    agent2: Agent | None,
     target_file: str,
     plan: str,
     *,
@@ -717,7 +1198,13 @@ def phase3_prove(
         except FileNotFoundError:
             return False
 
-    if _target_exists_overlay():
+    if skip_to_agent9 and not _target_exists_overlay():
+        raise FileNotFoundError(
+            "--skip-to-agent9 requires an existing target file before Agent9 planning; "
+            f"missing: {target_file}"
+        )
+
+    if _target_exists_overlay() and not skip_to_agent9:
         pre_result = registry.call("run_lean_verify", target_file)
         if int(pre_result.get("exit_code", 1)) == 0 and int(pre_result.get("sorry_count", 0)) == 0:
             console.print(
@@ -727,6 +1214,7 @@ def phase3_prove(
             return True, 0, "", {
                 "execution_history": [],
                 "attempt_failures": [],
+                "failure_ledger": [],
                 "agent7_invocations": [],
                 "agent7_step_execution_log": [],
                 "agent7_plan_revisions": [],
@@ -778,31 +1266,42 @@ def phase3_prove(
         f"\n\n{_imported_sigs}"
         if _imported_sigs else ""
     )
-    guidance, _ = _call_agent2_with_tools(
-        agent2,
-        readonly_registry,
-        "The verification target file is "
-        + target_file
-        + ". Provide initial proving guidance for Agent3.  Specify which sorry "
-        "to tackle first and the recommended proof strategy (Mathlib lemma, "
-        "glue pattern letter, etc.). "
-        "When the plan requires both new glue AND a new algorithm file, your "
-        "guidance MUST instruct Agent3 to complete BOTH in a single attempt, "
-        "or verification will fail."
-        + _archetype_b_warning
-        + _imported_sigs_block,
-    )
-    console.print(Panel(
-        guidance[:400] + "..." if len(guidance) > 400 else guidance,
-        title="[cyan]Agent2 — Initial Guidance",
-    ))
+    if skip_to_agent9:
+        guidance = plan
+        console.print(Panel(
+            guidance[:400] + "..." if len(guidance) > 400 else guidance,
+            title="[cyan]Skip-to-Agent9 Guidance",
+        ))
+    else:
+        if agent2 is None:
+            raise ValueError("phase3_prove requires agent2 unless skip_to_agent9=True")
+        guidance, _ = _call_agent2_with_tools(
+            agent2,
+            readonly_registry,
+            "The verification target file is "
+            + target_file
+            + ". Provide initial proving guidance for Agent3.  Specify which sorry "
+            "to tackle first and the recommended proof strategy (Mathlib lemma, "
+            "glue pattern letter, etc.). "
+            "When the plan requires both new glue AND a new algorithm file, your "
+            "guidance MUST instruct Agent3 to complete BOTH in a single attempt, "
+            "or verification will fail."
+            + _archetype_b_warning
+            + _imported_sigs_block,
+        )
+        console.print(Panel(
+            guidance[:400] + "..." if len(guidance) > 400 else guidance,
+            title="[cyan]Agent2 — Initial Guidance",
+        ))
 
     last_errors = state.last_errors
     last_sorry_count = state.last_sorry_count
     attempts = state.attempts
     execution_history = state.execution_history
+    decision_history = state.decision_history
     attempt_failures = state.attempt_failures
     agent3_turns = state.agent3_turns
+    blocker_reports = state.blocker_reports
     _last_audit_flush_time = time.time()
     state.last_audit_flush_time = _last_audit_flush_time
     # Progress-panel dedup: suppress identical consecutive error text prints.
@@ -837,6 +1336,7 @@ def phase3_prove(
     # Failed approaches history: accumulates structured failure records across attempts.
     # Injected into Agent2 prompts so it avoids repeating strategies that already failed.
     _failed_approaches = state.failed_approaches
+    _failure_ledger = state.failure_ledger
 
     # get_lean_goal cache: avoids re-running expensive LSP elaboration when the
     # file content and sorry line are identical across attempts.
@@ -871,7 +1371,10 @@ def phase3_prove(
     if skip_to_agent9:
         # Skip Phase 2 (already handled by caller) and Phase 3a (scaffold + Agent10).
         # Agent9 strategy planning runs in the unified Phase 4/7 block below.
-        console.print("[dim][Phase 3/7] Skipped via --skip-to-agent9.")
+        console.print(
+            "[dim][Phase 3/7] Scaffold and Agent10 skipped via --skip-to-agent9; "
+            "jumping directly to Agent9."
+        )
         _prog_advance()  # Phase 3/7
 
     elif not _target_exists_overlay():
@@ -916,6 +1419,7 @@ def phase3_prove(
                 "attempts": 0,
                 "execution_history": [],
                 "attempt_failures": [],
+                "failure_ledger": [],
                 "agent3_turns": [],
                 "agent7_invocations": [],
                 "agent7_step_execution_log": [],
@@ -1003,6 +1507,8 @@ def phase3_prove(
             "Agent8 will operate without structured plan."
         )
     _prog_advance()  # Phase 4/7
+    if agent2 is None:
+        agent2 = Agent("planner")
 
     # ------------------------------------------------------------------
     # Phase 5/7 — Proof Fill: Agent3 / Agent8 close all sorry placeholders.
@@ -1025,9 +1531,27 @@ def phase3_prove(
             if (attempt - 1) % _a3_evict_n == 0:
                 agent3.messages.clear()
                 _goal_cache.clear()  # avoid stale file-hash cache entries after eviction
+                _agent3_distilled_ctx = _build_agent3_distilled_context(
+                    attempt=attempt,
+                    guidance=guidance,
+                    best_checkpoint=best_checkpoint,
+                    failure_ledger=_failure_ledger,
+                )
+                _seed_msg = (
+                    f"{getattr(agent3, '_file_context', '')}\n\n{_agent3_distilled_ctx}"
+                    if getattr(agent3, "_file_context", "")
+                    else _agent3_distilled_ctx
+                )
+                agent3.messages.append({"role": "user", "content": _seed_msg})
+                agent3.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "Acknowledged. I will keep the distilled context and avoid repeating blocked repairs.",
+                    }
+                )
                 console.print(
-                    f"  [ContextEvict] a{attempt} — Agent3 context cleared "
-                    f"(every {_a3_evict_n} attempts)"
+                    f"  [ContextEvict] a{attempt} — Agent3 context refreshed "
+                    f"(every {_a3_evict_n} attempts, distilled)"
                 )
 
             _a2_evict_n = RETRY_LIMITS.get("AGENT2_CONTEXT_EVICT_EVERY_N", 4)
@@ -1190,6 +1714,9 @@ def phase3_prove(
         _lookup_done_since_last_edit: bool = False
         _patch_without_lookup_count: int = 0
         _tools_used_this_attempt: set[str] = set()
+        _tool_sequence_this_attempt: list[str] = []
+        _last_patch_signature: str = ""
+        _last_error_signature: str = ""
         _inner_break_reason = ""
 
         # Scan sorry lines for per-sorry iteration.
@@ -1395,25 +1922,76 @@ def phase3_prove(
                             _midcheck_errors,
                             agent2=agent2,
                             agent9_plan=locals().get("_agent9_plan"),
-                            decision_history=None,  # fresh per mid-check; no shared history
+                            decision_history=decision_history,
                             turns_elapsed=_total_turns_this_attempt,
                             baseline_errors=_baseline_errors_text,
                         )
                         _mc_action = _mc_decision.get("action", "agent3_tactical")
                         _mc_prompt = _mc_decision.get("targeted_prompt", "")
+                        _mc_tick = len(decision_history) + 1
+                        _mc_region = str(_mc_decision.get("target_region", "unknown") or "unknown")
+                        _mc_repair_unit = str(_mc_decision.get("repair_unit", "local_patch") or "local_patch")
+                        _mc_exec_mode = str(_mc_decision.get("agent3_execution_mode", "") or "")
+                        _mc_before_errs = _midcheck_errors
+                        _mc_before_count = len([ln for ln in str(_mc_before_errs).splitlines() if ln.strip()])
                         console.print(
                             f"  [Agent8 MidCheck] a{attempt} turn={_total_turns_this_attempt} "
                             f"→ {_mc_action}"
                         )
-                        if _mc_action != "agent3_tactical":
+                        _mc_handoff_to_search = _midcheck_should_handoff_to_search(_mc_decision)
+                        if _mc_action == "agent3_tactical" and not _mc_handoff_to_search:
+                            decision_history.append({
+                                "tick": _mc_tick,
+                                "action": _mc_action,
+                                "repair_unit": _mc_repair_unit,
+                                "target_region": _mc_region,
+                                "error_signature": str(_mc_decision.get("error_signature", "")),
+                                "canonical_error_signature": str(_mc_decision.get("canonical_error_signature", _mc_decision.get("error_signature", ""))),
+                                "hypothesis": str(_mc_decision.get("hypothesis", "")),
+                                "error_subtype": str(_mc_decision.get("error_subtype", "")),
+                                "errors_before": _mc_before_errs,
+                                "errors_after": _mc_before_errs,
+                                "top_error_count_before": _mc_before_count,
+                                "top_error_count_after": _mc_before_count,
+                                "error_count_delta": 0,
+                                "main_error_signature_changed": False,
+                                "route_effective": False,
+                                "sorry_delta": 0,
+                                "outcome": "continue",
+                                "blocker_status": str(_mc_decision.get("blocker_status", "")),
+                                "blocker_report": dict(_mc_decision.get("blocker_report", {}) or {}),
+                            })
+                            if _mc_decision.get("blocker_report"):
+                                blocker_reports.append(dict(_mc_decision.get("blocker_report", {}) or {}))
+                        if _mc_handoff_to_search:
+                            console.print(
+                                "  [Agent8 MidCheck] promoting tactical route into "
+                                f"{_mc_exec_mode or _mc_repair_unit}"
+                            )
+                        if _mc_action != "agent3_tactical" or _mc_handoff_to_search:
                             # Execute the escalation action, then resume Agent3.
                             from orchestrator.phase3_agent8 import (
+                                _agent8_run_agent3,
                                 _agent8_run_agent7,
                                 _agent8_run_agent7_then_agent6,
                             )
                             from orchestrator.tools import run_lean_verify as _rlv_mc
                             try:
-                                if _mc_action == "agent7_signature":
+                                if _mc_action == "agent3_tactical" and _mc_handoff_to_search:
+                                    _agent8_run_agent3(
+                                        target_file,
+                                        guidance,
+                                        _mc_prompt,
+                                        None,
+                                        compile_first_mode=False,
+                                        transactional_mode=False,
+                                        patch_guard_mode=False,
+                                        search_allowed=True,
+                                        error_subtype=str(_mc_decision.get("error_subtype", "")),
+                                        repair_unit=_mc_repair_unit,
+                                        target_region=_mc_region,
+                                    )
+                                elif _mc_action == "agent7_signature":
                                     _a7p = _mc_decision.get("agent7_targeted_prompt", _mc_prompt)
                                     _a7plan, _ = _agent8_run_agent7(
                                         target_file, _midcheck_errors, _a7p
@@ -1445,6 +2023,48 @@ def phase3_prove(
                                     )
                                     _attempt_esc_a7 += 1
                                     _attempt_esc_a6 += 1
+
+                                elif _mc_action == "apollo_decompose_repair":
+                                    from orchestrator.apollo_repair import run_apollo_decompose_repair as _run_apollo_midcheck
+                                    _apollo_result = _run_apollo_midcheck(
+                                        target_file=target_file,
+                                        current_errors=_midcheck_errors,
+                                        error_subtype=str(_mc_decision.get("error_subtype", "")),
+                                        policy_context={
+                                            "trigger_reason": str(_mc_decision.get("trigger_reason", "")),
+                                            "midcheck_turns_elapsed": _total_turns_this_attempt,
+                                        },
+                                    )
+                                    if (
+                                        isinstance(_apollo_result, dict)
+                                        and _apollo_result.get("status") != "success"
+                                        and _apollo_result.get("subproblem_graph")
+                                    ):
+                                        _first_node = next(
+                                            (
+                                                n for n in _apollo_result.get("subproblem_graph", [])
+                                                if isinstance(n, dict)
+                                            ),
+                                            None,
+                                        )
+                                        if _first_node is not None:
+                                            _fallback_prompt = (
+                                                f"[MIDCHECK APOLLO FALLBACK] node={_first_node.get('id', '')} "
+                                                f"kind={_first_node.get('kind', '')}\n"
+                                                f"target={_first_node.get('target', '')}\n"
+                                                f"evidence={_first_node.get('evidence', '')}\n"
+                                            )
+                                            _agent8_run_agent3(
+                                                target_file,
+                                                guidance,
+                                                _fallback_prompt,
+                                                None,
+                                                compile_first_mode=False,
+                                                transactional_mode=False,
+                                                error_subtype=str(_mc_decision.get("error_subtype", "")),
+                                                repair_unit="block_restructure",
+                                                target_region=str(_first_node.get("target", "")),
+                                            )
 
                                 elif _mc_action == "agent9_replan":
                                     from orchestrator.phase3a_agent9 import run_agent9_replan as _run_a9_midcheck
@@ -1488,6 +2108,32 @@ def phase3_prove(
                                     else str(_mc_errors_raw)
                                 )
                                 last_errors = last_verify_text
+                                _mc_after_count = len([ln for ln in str(last_verify_text).splitlines() if ln.strip()])
+                                _mc_sig_before = next((ln.strip()[:240] for ln in str(_mc_before_errs).splitlines() if ln.strip()), "")
+                                _mc_sig_after = next((ln.strip()[:240] for ln in str(last_verify_text).splitlines() if ln.strip()), "")
+                                decision_history.append({
+                                    "tick": _mc_tick,
+                                    "action": _mc_action,
+                                    "repair_unit": _mc_repair_unit,
+                                    "target_region": _mc_region,
+                                    "error_signature": str(_mc_decision.get("error_signature", "")),
+                                    "canonical_error_signature": str(_mc_decision.get("canonical_error_signature", _mc_decision.get("error_signature", ""))),
+                                    "hypothesis": str(_mc_decision.get("hypothesis", "")),
+                                    "error_subtype": str(_mc_decision.get("error_subtype", "")),
+                                    "errors_before": _mc_before_errs,
+                                    "errors_after": last_verify_text,
+                                    "top_error_count_before": _mc_before_count,
+                                    "top_error_count_after": _mc_after_count,
+                                    "error_count_delta": _mc_after_count - _mc_before_count,
+                                    "main_error_signature_changed": _mc_sig_before != _mc_sig_after,
+                                    "route_effective": last_verify_text != _mc_before_errs,
+                                    "sorry_delta": last_sorry_in_attempt - last_sorry_count,
+                                    "outcome": "success" if last_exit_code == 0 and last_sorry_in_attempt == 0 else "failed",
+                                    "blocker_status": str(_mc_decision.get("blocker_status", "")),
+                                    "blocker_report": dict(_mc_decision.get("blocker_report", {}) or {}),
+                                })
+                                if _mc_decision.get("blocker_report"):
+                                    blocker_reports.append(dict(_mc_decision.get("blocker_report", {}) or {}))
                                 # Re-prime Agent3 with the updated state so it doesn't
                                 # act on stale context.
                                 _mc_feedback = (
@@ -1555,6 +2201,9 @@ def phase3_prove(
                     arguments = {}
                 if tool_name:
                     _tools_used_this_attempt.add(tool_name)
+                    _tool_sequence_this_attempt.append(tool_name)
+                    if len(_tool_sequence_this_attempt) > 8:
+                        _tool_sequence_this_attempt = _tool_sequence_this_attempt[-8:]
 
                 if progress_detail == "debug":
                     _line_tag = f"line={_active_sorry_line}" if _active_sorry_line else "err-fix"
@@ -1908,6 +2557,7 @@ def phase3_prove(
                             return True, attempts, "", {
                                 "execution_history": [r.__dict__ for r in execution_history],
                                 "attempt_failures": attempt_failures,
+                                "failure_ledger": _failure_ledger,
                                 "agent7_invocations": agent7_invocations,
                                 "agent7_step_execution_log": agent7_step_execution_log,
                                 "agent7_plan_revisions": agent7_plan_revisions,
@@ -2206,6 +2856,27 @@ def phase3_prove(
                 # Patch symbol pre-check: warn Agent3 about unverified identifiers
                 # before applying the patch (P1 - symbol existence gate).
                 if tool_name == "edit_file_patch":
+                    _proposed_patch_sig = _agent3_patch_signature(arguments)
+                    _current_err_sig = _agent3_error_signature(last_verify_text)
+                    _repeat_count = sum(
+                        1
+                        for entry in _failure_ledger
+                        if entry.get("error_signature") == _current_err_sig
+                        and entry.get("patch_signature") == _proposed_patch_sig
+                    )
+                    if _repeat_count >= 2:
+                        _repeat_block_msg = (
+                            "## BLOCKED — REPEATED PATCH/ERROR PAIR\n"
+                            "This patch signature has already failed multiple times against the "
+                            "same normalized error signature.\n\n"
+                            f"error_signature: {_current_err_sig}\n"
+                            f"patch_signature: {_proposed_patch_sig}\n\n"
+                            "Do NOT repeat it. Perform lookup, choose a different tactic family, "
+                            "or escalate."
+                        )
+                        raw_reply = agent3.call(_repeat_block_msg)
+                        token_char_budget += len(_repeat_block_msg) + len(raw_reply)
+                        continue
                     _patch_warning = _check_patch_symbols(arguments, registry)
                     # Hard gate: if a patch introduces unverifiable external symbols,
                     # Agent3 must perform lookup first even on the first patch turn.
@@ -2243,6 +2914,7 @@ def phase3_prove(
                             token_char_budget += len(_traj_warning) + len(raw_reply)
                             continue
                     _lookup_done_since_last_edit = False  # reset after edit
+                    _last_patch_signature = _proposed_patch_sig
 
                 # Pre-edit snapshot: capture file content before Agent3's patch so
                 # we can rollback if protected content (from DirectApply) is removed.
@@ -2332,6 +3004,8 @@ def phase3_prove(
                             attempt_failures=attempt_failures,
                             agent3_turns=agent3_turns,
                             extra={
+                                "decision_history": decision_history,
+                                "blocker_reports": blocker_reports,
                                 "agent7_invocations": agent7_invocations,
                                 "agent7_step_execution_log": agent7_step_execution_log,
                                 "agent7_plan_revisions": agent7_plan_revisions,
@@ -2571,6 +3245,7 @@ def phase3_prove(
                                 return True, attempts, "", {
                                     "execution_history": [r.__dict__ for r in execution_history],
                                     "attempt_failures": attempt_failures,
+                                    "failure_ledger": _failure_ledger,
                                     "agent7_invocations": agent7_invocations,
                                     "agent7_step_execution_log": agent7_step_execution_log,
                                     "agent7_plan_revisions": agent7_plan_revisions,
@@ -2628,6 +3303,13 @@ def phase3_prove(
 
                     if last_exit_code != 0:
                         _primary_inner = _structured_errors_inner[0] if _structured_errors_inner else {}
+                        _last_error_signature = _agent3_error_signature(last_verify_text)
+                        _repeat_count = sum(
+                            1
+                            for entry in _failure_ledger
+                            if entry.get("error_signature") == _last_error_signature
+                            and entry.get("patch_signature") == _last_patch_signature
+                        ) + 1
                         attempt_failures.append({
                             "attempt": attempt,
                             "exit_code": last_exit_code,
@@ -2642,6 +3324,19 @@ def phase3_prove(
                                 load_file(target_file)[:50000] if _target_exists_overlay() else None
                             ),
                         })
+                        _failure_ledger.append(
+                            {
+                                "attempt": attempt,
+                                "error_signature": _last_error_signature,
+                                "patch_signature": _last_patch_signature,
+                                "tool_sequence": list(_tool_sequence_this_attempt[-6:]),
+                                "target_ref": f"line:{_active_sorry_line}" if _active_sorry_line else "compile-first",
+                                "candidate_id": "source",
+                                "theorem_anchor": f"line:{_active_sorry_line}" if _active_sorry_line else "",
+                                "outcome": "failed",
+                                "repeat_count": _repeat_count,
+                            }
+                        )
 
                     # Classify error with structured parser, passing target_file for routing.
                     error_type, _structured_errors_inner = _classify_lean_error_structured(
@@ -2858,16 +3553,6 @@ def phase3_prove(
                             f"{_primary_local.get('file', '')}:{_primary_local.get('line', 0)}:"
                             f"{str(_primary_local.get('message', ''))[:200]}"
                         )
-                        # System-driven Agent6 auto-route: infra gap detected and need to solve now.
-                        # When AGENT6_AUTO_ROUTE_ENABLED is False, Agent6 is invoked only when
-                        # Agent7's protocol explicitly indicates a missing glue lemma.
-                        should_route, infra_diag = _should_route_to_agent6_for_infra(
-                            last_verify_text,
-                            target_file,
-                            _structured_errors_inner,
-                            tool_turn,
-                            _last_local_error_sig,
-                        )
                         _last_local_error_sig = _err_sig
                         # Inject known identifier correction hint before escalation.
                         _unknown_ident_re = re.compile(
@@ -2883,95 +3568,6 @@ def phase3_prove(
                                     f"Use `{_correct}` instead of `{_ident}`. Apply via edit_file_patch.\n\n"
                                 ) + result_msg
                                 break
-                        max_agent6 = RETRY_LIMITS.get("MAX_AGENT6_ESCALATIONS_PER_ATTEMPT", 1)
-                        if should_route and AGENT6_AUTO_ROUTE_ENABLED:
-                            _line_int = int(err_line_no) if err_line_no is not None else 1
-                            try:
-                                g = registry.call("get_lean_goal", file_path=target_file, sorry_line=_line_int)
-                                goal = (g.get("goal") or g.get("raw") or "").strip()
-                                hypotheses = g.get("hypotheses")
-                                if not isinstance(hypotheses, list):
-                                    hypotheses = []
-                            except Exception:
-                                goal = ""
-                                hypotheses = []
-                            if goal:
-                                _candidate_escalation = _agent6_escalation_count + 1
-                                if _candidate_escalation > max_agent6:
-                                    # exhausted Agent6 budget in this attempt
-                                    goal = ""
-                                _current_goal_sig = hashlib.md5(goal[:1000].encode("utf-8")).hexdigest()
-                                if _candidate_escalation == 2:
-                                    _same_goal_ok = (not _agent6_second_require_same_goal) or (
-                                        _agent6_first_goal_sig is not None and _current_goal_sig == _agent6_first_goal_sig
-                                    )
-                                    _progress_ok = _agent6_first_progress_ok
-                                    if not (_same_goal_ok and _progress_ok):
-                                        goal = ""
-                                if not goal:
-                                    continue
-                                _agent6_escalation_count = _candidate_escalation
-                                console.print(
-                                    f"  [System→Agent6] Auto-route #{_agent6_escalation_count} at turn "
-                                    f"{tool_turn + 1}: infra gap detected — {infra_diag}"
-                                )
-                                _pre_agent6_sorry = last_sorry_in_attempt
-                                success, agent6_msg = _run_agent6_glue_loop(
-                                    agent6,
-                                    agent6_registry,
-                                    target_file,
-                                    goal,
-                                    str(_primary_local.get("message", ""))[:600],
-                                    infra_diag,
-                                    _algo_name,
-                                    hypotheses=hypotheses,
-                                    stuck_line=_line_int,
-                                )
-                                if success:
-                                    exec_results.append(ExecutionResult(
-                                        status_code="SUCCESS",
-                                        message=f"Agent6 auto-route: succeeded (turn {tool_turn + 1})",
-                                        attempt=attempt,
-                                    ))
-                                    _target_verify_after_agent6 = registry.call("run_lean_verify", target_file)
-                                    _tv_exit = int(_target_verify_after_agent6.get("exit_code", 1))
-                                    _tv_sorry = int(_target_verify_after_agent6.get("sorry_count", 0))
-                                    _tv_errors = _target_verify_after_agent6.get("errors", [])
-                                    _tv_error_text = (
-                                        "\n".join(_tv_errors[:5]) if isinstance(_tv_errors, list) else str(_tv_errors)
-                                    )
-                                    _progress_delta = max(0, _pre_agent6_sorry - _tv_sorry)
-                                    if _candidate_escalation == 1:
-                                        _agent6_first_goal_sig = _current_goal_sig
-                                        _agent6_first_progress_ok = _progress_delta >= _agent6_second_min_progress
-                                    result_msg = (
-                                        "## System routed to Agent6 (infra gap detected).\n"
-                                        f"{agent6_msg}\n\n"
-                                        "## Target regression verify after Agent6\n"
-                                        f"exit_code: {_tv_exit} | sorry_count: {_tv_sorry}\n"
-                                        + (
-                                            f"Top errors:\n```\n{_tv_error_text[:1200]}\n```\n\n"
-                                            if _tv_error_text else "\n"
-                                        )
-                                        + "Original verify result:\n" + result_msg
-                                    )
-                                else:
-                                    _current_snippet = _build_escalation_file_context(target_file, _line_int)
-                                    new_guidance, _ = _call_agent2_with_tools(
-                                        agent2,
-                                        escalation_registry,
-                                        f"[AGENT6 AUTO-ROUTE FALLBACK — Agent6 could not prove helper lemma]\n"
-                                        f"System detected infra gap: {infra_diag}\n\n"
-                                        f"Error: {_primary_local.get('message', '')}\n\n"
-                                        f"Target: {target_file} line {err_line_no}. Goal: {goal[:500]}...\n\n"
-                                        f"=== CURRENT FILE ({target_file}) ===\n```lean\n{_current_snippet}\n```\n\n"
-                                        f"Provide revised guidance. Agent3 continues in the SAME attempt.",
-                                    )
-                                    result_msg = (
-                                        "## System routed to Agent6 — Agent6 could not fill glue. Agent2 guidance:\n"
-                                        f"{new_guidance}\n\n"
-                                        "Apply this guidance now. Original verify result:\n" + result_msg
-                                    )
                         if _stale_err_count >= 3:
                             result_msg = result_msg + "\n\n" + _build_stale_error_hint(
                                 registry,
@@ -3853,7 +4449,10 @@ def phase3_prove(
             console.print("[green bold][Agent8] Decision Hub succeeded — Phase 5/7 complete.")
             return True, attempts, "", {
                 "execution_history": [r.__dict__ for r in execution_history],
+                "decision_history": decision_history,
+                "blocker_reports": blocker_reports,
                 "attempt_failures": attempt_failures,
+                "failure_ledger": _failure_ledger,
                 "agent7_invocations": agent7_invocations,
                 "agent7_step_execution_log": agent7_step_execution_log,
                 "agent7_plan_revisions": agent7_plan_revisions,
@@ -3917,7 +4516,10 @@ def phase3_prove(
             console.print("[green bold][Agent5] Auto-repair fixed the build — Phase 5/7 complete.")
             return True, attempts, "", {
                 "execution_history": [r.__dict__ for r in execution_history],
+                "decision_history": decision_history,
+                "blocker_reports": blocker_reports,
                 "attempt_failures": attempt_failures,
+                "failure_ledger": _failure_ledger,
                 "agent7_invocations": agent7_invocations,
                 "agent7_step_execution_log": agent7_step_execution_log,
                 "agent7_plan_revisions": agent7_plan_revisions,
@@ -3953,7 +4555,10 @@ def phase3_prove(
         console.print("[yellow]Re-planning requested — restarting Phase 2.")
         return False, attempts, last_errors, {
             "execution_history": [r.__dict__ for r in execution_history],
+            "decision_history": decision_history,
+            "blocker_reports": blocker_reports,
             "attempt_failures": attempt_failures,
+            "failure_ledger": _failure_ledger,
             "agent7_invocations": agent7_invocations,
             "agent7_step_execution_log": agent7_step_execution_log,
             "agent7_plan_revisions": agent7_plan_revisions,
@@ -3972,6 +4577,8 @@ def phase3_prove(
 
     return False, attempts, last_errors, {
         "execution_history": [r.__dict__ for r in execution_history],
+        "decision_history": decision_history,
+        "blocker_reports": blocker_reports,
         "attempt_failures": attempt_failures,
         "agent7_invocations": agent7_invocations,
         "agent7_step_execution_log": agent7_step_execution_log,

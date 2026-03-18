@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable
 
 from rich.console import Console
@@ -124,10 +125,17 @@ class ToolRegistry:
         if name not in self._tools:
             known = ", ".join(sorted(self._tools)) or "<none>"
             raise KeyError(f"Unknown tool: {name}. Registered: {known}")
+        start = time.perf_counter()
         result = self._tools[name](*args, **kwargs)
+        elapsed_ms = int((time.perf_counter() - start) * 1000.0)
         try:
             from orchestrator.audit_logger import AuditLogger
-            AuditLogger.get().log_tool_call(name, kwargs, result)
+            AuditLogger.get().log_tool_call(
+                name,
+                kwargs,
+                result,
+                elapsed_ms=elapsed_ms,
+            )
         except Exception:  # noqa: BLE001
             pass  # audit must not break tool execution
         return result
@@ -188,6 +196,7 @@ class Agent:
                 break
             del self.messages[1:3]  # remove oldest (assistant, user) pair
 
+        start = time.perf_counter()
         reply = call_llm(
             provider=self.provider,
             model=self.model,
@@ -195,6 +204,7 @@ class Agent:
             messages=self.messages,
             max_tokens=self.max_tokens,
         )
+        elapsed_ms = int((time.perf_counter() - start) * 1000.0)
         self.messages.append({"role": "assistant", "content": reply})
         try:
             from orchestrator.audit_logger import AuditLogger
@@ -204,6 +214,7 @@ class Agent:
                 reply,
                 prompt_full=full_msg,
                 reply_full=reply,
+                elapsed_ms=elapsed_ms,
             )
         except Exception:  # noqa: BLE001
             pass  # audit must not break agent execution

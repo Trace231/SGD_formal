@@ -28,7 +28,10 @@ def _format_prompt_cot_goedel_v2(*, source_with_sorry: str, informal_prefix: str
     return (
         "You are a Lean 4 theorem prover.\n"
         "Solve the target theorem while preserving declarations/imports.\n"
-        "Think privately and output Lean code only.\n\n"
+        "Think privately and output Lean code only.\n"
+        "DO NOT use markdown code fences.\n"
+        "DO NOT add any explanation text.\n"
+        "DO NOT introduce new import lines.\n\n"
         f"{few_shot_prefix}"
         f"{informal_prefix}\n"
         "### Target Lean file\n"
@@ -38,7 +41,7 @@ def _format_prompt_cot_goedel_v2(*, source_with_sorry: str, informal_prefix: str
         "Output requirements:\n"
         "1) Return only Lean code.\n"
         "2) Keep theorem statement unchanged.\n"
-        "3) Do not add new imports unless strictly necessary.\n"
+        "3) Do not add new imports.\n"
     )
 
 

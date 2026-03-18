@@ -31,6 +31,9 @@ def _find_theorem_body_region(source: str, theorem_name: str) -> tuple[int, int]
 
 def _apply_candidate(source: str, theorem_name: str, parsed: ParsedCandidate) -> tuple[str, str]:
     if parsed.kind == "full_file":
+        # Guardrail: reject broken full-file payloads with markdown wrappers.
+        if "```" in parsed.payload:
+            return "", ""
         return parsed.payload, ""
     if parsed.kind != "proof_body":
         return "", ""
@@ -58,6 +61,7 @@ class SearchProcess(mp.Process):
         self.data_loader = data_loader
         self.cfg = cfg
         self.execution_root = Path(str(cfg["execution_root"])).resolve()
+        self.apply_best_candidate = bool(cfg.get("apply_best_candidate", False))
         sampler_cfg = dict(cfg.get("sampler", {}))
         sampler_cfg.setdefault("model_args", dict(cfg.get("model_args", {})))
         self.sampler = Sampling(
@@ -65,6 +69,33 @@ class SearchProcess(mp.Process):
             process_print=self.process_print,
             cfg=sampler_cfg,
         )
+
+    def _maybe_apply_best_candidate(
+        self,
+        *,
+        row: dict[str, Any],
+        target_path: Path,
+        current_best: list[float] | None,
+    ) -> tuple[list[float] | None, bool]:
+        if not self.apply_best_candidate:
+            return current_best, False
+        result = row.get("result", {})
+        full_code = str(row.get("full_code", ""))
+        if not bool(result.get("complete", False)):
+            return current_best, False
+        if not full_code.strip():
+            return current_best, False
+        score = row.get("score", [])
+        if not isinstance(score, list):
+            return current_best, False
+        if current_best is not None and tuple(score) <= tuple(current_best):
+            return current_best, False
+        target_path.write_text(full_code, encoding="utf-8")
+        self.process_print(
+            f"[ApplyBest] updated target file with score={score}",
+            flush=True,
+        )
+        return list(score), True
 
     def process_print(self, logs: str, **kwargs: Any) -> None:
         print(f"[SearchProcess:{self.idx}] {logs}", **kwargs)
@@ -148,6 +179,8 @@ class SearchProcess(mp.Process):
 
             success_rows: list[dict[str, Any]] = []
             failure_rows: list[dict[str, Any]] = []
+            best_applied_score: list[float] | None = None
+            applied_updates = 0
             for rec, ver in zip(candidate_records, verify_outputs):
                 score = self._score(ver, str(rec.get("generation_error", "")))
                 row = {
@@ -168,6 +201,13 @@ class SearchProcess(mp.Process):
                     success_rows.append(row)
                 else:
                     failure_rows.append(row)
+                best_applied_score, changed = self._maybe_apply_best_candidate(
+                    row=row,
+                    target_path=target_path,
+                    current_best=best_applied_score,
+                )
+                if changed:
+                    applied_updates += 1
 
             success_count = len(success_rows)
             self.process_print(
@@ -206,6 +246,9 @@ class SearchProcess(mp.Process):
                 "sample_time": sample_time,
                 "verify_time": verify_time,
                 "algorithm": self.sampler.algorithm_name,
+                "apply_best_candidate": self.apply_best_candidate,
+                "applied_updates": int(applied_updates),
+                "best_applied_score": best_applied_score or [],
             }
             (prob_log_dir / "summary.json").write_text(
                 json.dumps(summary, indent=2, ensure_ascii=False),
