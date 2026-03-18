@@ -1,0 +1,40 @@
+{
+  "pass": false,
+  "complete": false,
+  "errors": [
+    "37:5: unknown namespace `MeasureTheory`",
+    "38:12: unknown namespace `InnerProductSpace`",
+    "40:18: unexpected token '*'; expected '}'",
+    "42:18: unexpected token '*'; expected '}'",
+    "43:18: unexpected token '*'; expected '}'",
+    "52:13: unexpected token '*'; expected ')'",
+    "70:5: unexpected token '+'; expected '=>'",
+    "68:52: Unknown constant `CoeFun`",
+    "76:18: Unknown constant `CoeFun`",
+    "79:39: expected token",
+    "79:23: Unknown constant `CoeFun`",
+    "82:47: unexpected token '+'; expected ')', ',' or ':'",
+    "98:29: expected token"
+  ],
+  "warnings": [],
+  "error_count": 13,
+  "warning_count": 0,
+  "sorry_count": 0,
+  "sorries": [],
+  "verify_time": 3.031912088394165,
+  "verify_backend_used": "apollo_python",
+  "verify_backend_reason": "apollo_python_success",
+  "blocked_sorry_count": 0,
+  "sorry_declarations": 0,
+  "target": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/Algorithms/SubgradientMethod_scaffold.lean",
+  "execution_root": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace",
+  "workspace_root": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace",
+  "isolation_check_passed": true,
+  "preflight": {
+    "execution_root": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace",
+    "repl_workspace": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace",
+    "apollo_project_path": "/root/SGD/APOLLO",
+    "workspace_root": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace",
+    "execution_in_workspace": true
+  }
+}

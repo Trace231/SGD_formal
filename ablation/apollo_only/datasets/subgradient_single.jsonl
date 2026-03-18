@@ -1,0 +1,2 @@
+{"name":"SubgradientMethod_scaffold_main_theorem","split":"ablation","target_file":"Algorithms/SubgradientMethod_scaffold.lean","theorem_name":"subgradient_convergence_convex","informal_prefix":"Goal: fill the main convex convergence theorem proof for stochastic subgradient method. Use primitive subgradient inequality, norm expansion, integration, bounded-gradient bound, and telescoping sum structure."}
+

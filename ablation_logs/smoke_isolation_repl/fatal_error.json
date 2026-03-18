@@ -1,0 +1,29 @@
+{
+  "status": "failed",
+  "error": "Object of type PosixPath is not JSON serializable",
+  "traceback": "Traceback (most recent call last):\n  File \"/root/SGD/SGD_APOLLO/ablation/apollo_only/runner.py\", line 563, in main\n    summary = run_problem(\n              ^^^^^^^^^^^^\n  File \"/root/SGD/SGD_APOLLO/ablation/apollo_only/runner.py\", line 320, in run_problem\n    _write_artifacts(\n  File \"/root/SGD/SGD_APOLLO/ablation/apollo_only/runner.py\", line 377, in _write_artifacts\n    json.dumps(runtime_cfg, indent=2, ensure_ascii=False),\n    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/miniconda3/lib/python3.11/json/__init__.py\", line 238, in dumps\n    **kw).encode(obj)\n          ^^^^^^^^^^^\n  File \"/miniconda3/lib/python3.11/json/encoder.py\", line 202, in encode\n    chunks = list(chunks)\n             ^^^^^^^^^^^^\n  File \"/miniconda3/lib/python3.11/json/encoder.py\", line 432, in _iterencode\n    yield from _iterencode_dict(o, _current_indent_level)\n  File \"/miniconda3/lib/python3.11/json/encoder.py\", line 406, in _iterencode_dict\n    yield from chunks\n  File \"/miniconda3/lib/python3.11/json/encoder.py\", line 439, in _iterencode\n    o = _default(o)\n        ^^^^^^^^^^^\n  File \"/miniconda3/lib/python3.11/json/encoder.py\", line 180, in default\n    raise TypeError(f'Object of type {o.__class__.__name__} '\nTypeError: Object of type PosixPath is not JSON serializable\n",
+  "isolation": {
+    "workspace_root": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace",
+    "execution_root": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace",
+    "target_file_rel": "Algorithms/SubgradientMethod_scaffold.lean",
+    "target_file_abs": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/Algorithms/SubgradientMethod_scaffold.lean",
+    "workspace_metadata": {
+      "generated_at_utc": "2026-03-18T09:55:52.360001+00:00",
+      "source_root": "/root/SGD/SGD_APOLLO",
+      "workspace_root": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace",
+      "source_scaffold_path": "/root/SGD/SGD_APOLLO/Algorithms/sorry.lean",
+      "workspace_scaffold_path": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/Algorithms/SubgradientMethod_scaffold.lean",
+      "source_scaffold_hash": "ad3a91e23a172ac6f8f0d4f3291ee6bc0bf6bab7018d16b169668d8c04d46236",
+      "workspace_scaffold_hash": "ad3a91e23a172ac6f8f0d4f3291ee6bc0bf6bab7018d16b169668d8c04d46236",
+      "source_main_hash": "f93c438a86f673cee80ebb8e995b8d15f6820e403bc1ee3c68168f4cff3ba55b",
+      "workspace_main_hash": "f93c438a86f673cee80ebb8e995b8d15f6820e403bc1ee3c68168f4cff3ba55b",
+      "repl_link_status": "linked",
+      "repl_binary_source": "/root/SGD/repl428/.lake/build/bin/repl",
+      "workspace_repl_path": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/build/bin/repl",
+      "metadata_path": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.apollo_ablation_meta.json",
+      "exists": true
+    },
+    "source_snapshot_hash": "ad3a91e23a172ac6f8f0d4f3291ee6bc0bf6bab7018d16b169668d8c04d46236",
+    "isolation_check_passed": true
+  }
+}
