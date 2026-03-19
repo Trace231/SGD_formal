@@ -248,14 +248,15 @@ def check_glue_tricks_gate(
 # Hard Gate 4: Used-in tag check
 # ---------------------------------------------------------------------------
 
+_USED_IN_DECL_KINDS = r"(?:theorem|lemma|noncomputable\s+def|def|structure)"
 _LEMMA_DEF_RE = re.compile(
-    r"^(?:theorem|lemma|noncomputable\s+def|def)\s+(\w+)",
+    rf"^{_USED_IN_DECL_KINDS}\s+(\w+)",
     re.MULTILINE,
 )
 
 
 def extract_new_lemmas(filepath: str | Path) -> list[str]:
-    """Return names of theorem/lemma/def declarations in *filepath*."""
+    """Return names of declarations subject to Gate 4 Used-in checks."""
     p = Path(filepath)
     if not p.is_absolute():
         p = PROJECT_ROOT / p
@@ -268,7 +269,7 @@ def extract_new_lemmas(filepath: str | Path) -> list[str]:
 def _get_docstring_for_lemma(content: str, lemma_name: str) -> str:
     """Extract the docstring (/-  … -/) immediately preceding *lemma_name*."""
     pattern = re.compile(
-        r"(/\-\-.*?\-/)\s*\n\s*(?:omit\b[^\n]*\n\s*)?(?:theorem|lemma|noncomputable\s+def|def)\s+"
+        rf"(/\-\-.*?\-/)\s*\n\s*(?:omit\b[^\n]*\n\s*)?{_USED_IN_DECL_KINDS}\s+"
         + re.escape(lemma_name),
         re.DOTALL,
     )
@@ -283,7 +284,7 @@ def _is_simp_lemma(content: str, lemma_name: str) -> bool:
     exempt from the Convention 4 ``Used in:`` requirement.
     """
     decl_pat = re.compile(
-        r"^(?:theorem|lemma|noncomputable\s+def|def)\s+" + re.escape(lemma_name),
+        rf"^{_USED_IN_DECL_KINDS}\s+" + re.escape(lemma_name),
         re.MULTILINE,
     )
     m = decl_pat.search(content)

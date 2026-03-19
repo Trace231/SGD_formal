@@ -543,6 +543,30 @@ def _current_plan_dict_from_text(plan_text: str) -> dict[str, Any]:
     return obj if isinstance(obj, dict) else {}
 
 
+def _require_repo_clean_for_success(target_file: str, verify_result: dict[str, Any]) -> tuple[bool, str]:
+    """Require full repo build before treating a file-local clean result as success."""
+    from orchestrator.tools import run_repo_verify
+
+    if not (
+        int(verify_result.get("exit_code", 1)) == 0
+        and int(verify_result.get("sorry_count", -1)) == 0
+    ):
+        return False, ""
+
+    repo_verify = dict(run_repo_verify())
+    if int(repo_verify.get("exit_code", 1)) == 0:
+        return True, ""
+
+    repo_errors = _coerce_errors_text(repo_verify.get("errors", ""))
+    if not repo_errors.strip():
+        repo_errors = "repo verify failed after file-local clean result"
+    console.print(
+        "[yellow][Agent8] File-local verify reported clean, but full repo verify failed. "
+        "Continuing instead of declaring success."
+    )
+    return False, repo_errors
+
+
 def run_agent8_loop(
     agent2: Any,
     target_file: str,
@@ -575,8 +599,12 @@ def run_agent8_loop(
         fresh["errors"] = fresh_errors
         current_errors = fresh_errors
 
-        if int(fresh.get("exit_code", 1)) == 0 and int(fresh.get("sorry_count", -1)) == 0:
+        fresh_ok, fresh_repo_errors = _require_repo_clean_for_success(target_file, fresh)
+        if fresh_ok:
             return True, current_plan_text, ""
+        if fresh_repo_errors:
+            fresh["errors"] = fresh_repo_errors
+            current_errors = fresh_repo_errors
 
         subtype = _classify_error_subtype(
             current_errors,
@@ -668,8 +696,11 @@ def run_agent8_loop(
             )
         )
 
-        if int(result.get("exit_code", 1)) == 0 and int(result.get("sorry_count", -1)) == 0:
+        result_ok, result_repo_errors = _require_repo_clean_for_success(target_file, result)
+        if result_ok:
             return True, current_plan_text, ""
+        if result_repo_errors:
+            current_errors = result_repo_errors
 
     return False, current_plan_text, current_errors
 

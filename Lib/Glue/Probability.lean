@@ -194,6 +194,38 @@ theorem hasBoundedVariance_of_pointwise_bound
     ((hgL_meas.comp (measurable_const.prodMk measurable_id)).aestronglyMeasurable)
     (fun s => hbounded w s)
 
+
+
+/-- If `‖gradL w s‖ ≤ G` for all `w, s`, then for any random iterate `wt : Ω → E`
+and sample `ξt : Ω → S`, the composed squared norm is integrable and bounded:
+`∫ ω, ‖gradL (wt ω) (ξt ω)‖ ^ 2 ∂P ≤ G ^ 2`.
+
+Layer: Glue | Gap: Level 2 (composition missing)
+Technique: `integral_mono` with constant domination, `integral_const`, `pow_le_pow_left₀`.
+
+This is the random-iterate form of Pattern A. For the oracle-level bound
+`∀ w, ∫ s, ‖gradL w s‖² ∂ν ≤ G²`, see `hasBoundedVariance_of_pointwise_bound`.
+Used in: `SubgradientMethod.subgradient_convergence_convex` (variance bound step) -/
+theorem integral_norm_sq_gradL_comp_of_pointwise_bound
+    {gradL : E → S → E} {G : ℝ} {P : Measure Ω} [IsProbabilityMeasure P]
+    {wt : Ω → E} {ξt : Ω → S}
+    (hgL : Measurable (Function.uncurry gradL))
+    (hmeas_wt : Measurable wt) (hmeas_ξt : Measurable ξt)
+    (hbounded : ∀ w s, ‖gradL w s‖ ≤ G)
+    (h_int_sq : Integrable (fun ω => ‖gradL (wt ω) (ξt ω)‖ ^ 2) P) :
+    ∫ ω, ‖gradL (wt ω) (ξt ω)‖ ^ 2 ∂P ≤ G ^ 2 := by
+  have h_pointwise : ∀ ω, ‖gradL (wt ω) (ξt ω)‖ ^ 2 ≤ G ^ 2 := by
+    intro ω
+    have hG_nonneg : 0 ≤ G := by
+      have h := hbounded (wt ω) (ξt ω)
+      linarith [norm_nonneg (gradL (wt ω) (ξt ω))]
+    exact pow_le_pow_left₀ (norm_nonneg _) (hbounded (wt ω) (ξt ω)) 2
+  have h_mono : ∫ ω, ‖gradL (wt ω) (ξt ω)‖ ^ 2 ∂P ≤ ∫ ω, (G ^ 2 : ℝ) ∂P :=
+    integral_mono h_int_sq (integrable_const (G ^ 2)) h_pointwise
+  have h_const : ∫ ω, (G ^ 2 : ℝ) ∂P = G ^ 2 := by
+    simp [integral_const, probReal_univ]
+  rw [h_const] at h_mono
+  exact h_mono
 /-- SVRG variance-reduction inequality (finite-sum / uniform-sampling form).
 
 This version is aligned with finite-sum SVRG assumptions:

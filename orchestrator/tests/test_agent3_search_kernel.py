@@ -231,6 +231,78 @@ def test_tactic_probe_early_stops_clean(monkeypatch, tmp_path):
     assert llm_calls["n"] == 0
 
 
+def test_tactic_probe_does_not_early_stop_when_incomplete(monkeypatch, tmp_path):
+    target = _mk_target(tmp_path)
+    monkeypatch.setattr(a3, "AGENT3_SEARCH_ENABLED", True)
+    monkeypatch.setattr(a3, "AGENT3_CANDIDATE_COUNT", 2)
+    monkeypatch.setattr(a3, "AGENT3_RECURSION_DEPTH", 0)
+    monkeypatch.setattr(a3, "AGENT3_NO_IMPROVEMENT_WINDOW", 1)
+    monkeypatch.setattr(a3, "AGENT3_TACTIC_PROBE_ENABLED", True)
+    monkeypatch.setattr(a3, "AGENT3_TACTIC_PROBE_STR", "try trivial")
+
+    import orchestrator.tools as tools_mod
+    import orchestrator.apollo_sorrify as sor
+    import orchestrator.repl_adapter as repl_mod
+
+    monkeypatch.setattr(
+        tools_mod,
+        "run_lean_verify",
+        lambda _path: {"exit_code": 1, "sorry_count": 1, "error_count": 1, "errors": ["e"]},
+    )
+    monkeypatch.setattr(
+        sor,
+        "build_apollo_verify_callable",
+        lambda **_: (lambda _code: {"pass": False, "complete": False, "errors": []}),
+    )
+    monkeypatch.setattr(sor, "apply_syntax_correction", lambda code: (code, {"ok": True, "changed": False}))
+    monkeypatch.setattr(sor, "apply_sorrify", lambda code, _v: (code, {"ok": True, "changed": False}))
+    monkeypatch.setattr(sor, "apply_hint_repair", lambda code, _v: (code, {"ok": True, "changed": False}))
+    monkeypatch.setattr(repl_mod, "_extract_header_lines", lambda _code: "import Main")
+
+    class _Sess:
+        def __init__(self, **_kwargs):
+            pass
+
+        def prime_header(self, _header):
+            return 11
+
+        def verify(self, _code, *, env=None):
+            assert env == 11
+            return {
+                "pass": True,
+                "complete": False,
+                "errors": [],
+                "warnings": [{"severity": "warning", "data": "failed probe quality gate"}],
+                "errors_text": [],
+                "warnings_text": ["probe: warning: failed probe quality gate"],
+                "verify_time": 0.01,
+                "source_sorry_count": 0,
+                "sorry_declarations": 0,
+                "blocked_sorry_count": 0,
+            }
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(repl_mod, "ReplSession", _Sess)
+
+    llm_calls = {"n": 0}
+
+    def _fake_single(*_args, **_kwargs):
+        llm_calls["n"] += 1
+        return {"exit_code": 1, "sorry_count": 2, "errors": "err", "verify_time": 0.01}
+
+    out = a3.run_agent3_search_kernel(
+        target,
+        "plan",
+        "prompt",
+        None,
+        run_single_candidate=_fake_single,
+    )
+    assert out["best_candidate_reason"] != "tactic_probe_clean"
+    assert llm_calls["n"] > 0
+
+
 def test_strategy_injection_varies_by_index(monkeypatch, tmp_path):
     target = _mk_target(tmp_path)
     monkeypatch.setattr(a3, "AGENT3_SEARCH_ENABLED", True)

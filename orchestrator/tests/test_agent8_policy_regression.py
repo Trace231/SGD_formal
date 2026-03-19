@@ -18,6 +18,7 @@ from orchestrator.phase3_agent8 import (
     _prefer_agent3_search_owner,
     _resolve_decision_prompt,
     _route_for_subtype,
+    run_agent8_loop,
 )
 
 
@@ -170,3 +171,64 @@ def test_canonical_error_signature_prefers_primary_line():
         "Algorithms/Foo.lean:48:2: error: unsolved goals"
     )
     assert _canonical_error_signature(errors) == "Foo.lean:42:application type mismatch"
+
+
+def test_run_agent8_loop_requires_repo_verify_for_initial_clean(monkeypatch):
+    import orchestrator.tools as tools_mod
+    import orchestrator.phase3_agent8 as a8
+
+    monkeypatch.setattr(
+        tools_mod,
+        "run_lean_verify",
+        lambda _path: {"exit_code": 0, "sorry_count": 0, "errors": ""},
+    )
+    monkeypatch.setattr(
+        tools_mod,
+        "run_repo_verify",
+        lambda: {"exit_code": 1, "errors": ["Algorithms/Foo.lean:1:1: error: repo failed"]},
+    )
+    monkeypatch.setattr(
+        a8,
+        "_dispatch_agent9",
+        lambda *_args, **_kwargs: {"theorems": []},
+    )
+    monkeypatch.setattr(
+        a8,
+        "_agent8_run_agent3",
+        lambda *_args, **_kwargs: {"exit_code": 1, "sorry_count": 1, "errors": "repo failed"},
+    )
+    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_MAX_STEPS", 1)
+
+    success, _plan, errors = run_agent8_loop(None, "Algorithms/Foo.lean", "plan", "old errors")
+    assert success is False
+    assert "repo failed" in errors
+
+
+def test_run_agent8_loop_requires_repo_verify_after_agent3_clean(monkeypatch):
+    import orchestrator.tools as tools_mod
+    import orchestrator.phase3_agent8 as a8
+
+    verify_calls = {"n": 0}
+
+    def _verify(_path):
+        verify_calls["n"] += 1
+        if verify_calls["n"] == 1:
+            return {"exit_code": 1, "sorry_count": 1, "errors": "Foo.lean:10: error: rewrite failed"}
+        return {"exit_code": 0, "sorry_count": 0, "errors": ""}
+
+    monkeypatch.setattr(tools_mod, "run_lean_verify", _verify)
+    monkeypatch.setattr(
+        tools_mod,
+        "run_repo_verify",
+        lambda: {"exit_code": 1, "errors": ["Algorithms/Foo.lean:2:3: error: build failed"]},
+    )
+    monkeypatch.setattr(
+        a8,
+        "_agent8_run_agent3",
+        lambda *_args, **_kwargs: {"exit_code": 0, "sorry_count": 0, "errors": ""},
+    )
+    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_MAX_STEPS", 1)
+
+    success, _plan, errors = run_agent8_loop(None, "Algorithms/Foo.lean", "plan", "old errors")
+    assert success is False
+    assert "build failed" in errors

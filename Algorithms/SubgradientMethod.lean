@@ -84,6 +84,30 @@ theorem process_succ (t : ℕ) : process setup (t + 1) = fun ω => process setup
 
 end SubgradientSetup
 
+/-- Each `SubgradientSetup.process t` is a measurable function (i.e. a random variable).
+Requires `gradL` to be jointly measurable and each `ξ t` to be measurable.
+Used in: `subgradient_convergence_convex` (Algorithms/SubgradientMethod.lean, Step 4) -/
+theorem SubgradientSetup.process_measurable (setup : SubgradientSetup E S Ω) (t : ℕ) :
+    Measurable (setup.process t) := by
+  induction t with
+  | zero =>
+    rw [SubgradientSetup.process_zero]
+    exact measurable_const
+  | succ t ih =>
+    rw [SubgradientSetup.process_succ]
+    have h1 : Measurable (fun ω => setup.process t ω) := ih
+    have h2 : Measurable (fun ω => setup.gradL (setup.process t ω) (setup.ξ t ω)) := by
+      have h3 : Measurable (Function.uncurry setup.gradL) := setup.hgL
+      have h4 : Measurable (fun ω => (setup.process t ω, setup.ξ t ω)) :=
+        Measurable.prodMk h1 (setup.hξ_meas t)
+      exact h3.comp h4
+    have h3 : Measurable (fun ω => setup.η t • setup.gradL (setup.process t ω) (setup.ξ t ω)) := by
+      have h4 : Measurable (fun ω => (setup.η t, setup.gradL (setup.process t ω) (setup.ξ t ω))) :=
+        Measurable.prodMk measurable_const h2
+      have h5 : Continuous (fun p : ℝ × E => p.1 • p.2) := continuous_smul
+      exact h5.measurable.comp h4
+    exact Measurable.sub h1 h3
+
 -- ============================================================================
 -- Convergence theorem (PRIMITIVE FORM — NO abstract subdifferential symbols)
 -- ============================================================================
@@ -187,21 +211,10 @@ theorem subgradient_convergence_convex
                 rw [integral_const_mul]
               rw [h_smul2]
             rw [h3] at h2
-            have h4 : (∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P) ≤ G ^ 2 := by
-              have h5 : ∀ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ≤ G ^ 2 := by
-                intro ω
-                have h6 := hbounded (setup.process t ω) (setup.ξ t ω)
-                have h7 : 0 ≤ ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ := norm_nonneg _
-                have h8 : 0 ≤ G := by
-                  have h9 := hbounded (setup.w₀ : E) (setup.ξ 0 ω)
-                  linarith [norm_nonneg (setup.gradL (setup.w₀ : E) (setup.ξ 0 ω))]
-                nlinarith
-              have h6 : (∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P) ≤ ∫ ω, (G ^ 2 : ℝ) ∂setup.P := by
-                apply integral_mono (h_int_sq t) (integrable_const (G ^ 2)) (fun ω => h5 ω)
-              have h7 : ∫ ω, (G ^ 2 : ℝ) ∂setup.P = G ^ 2 := by
-                simp [integral_const]
-              rw [h7] at h6
-              exact h6
+            have h4 : (∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P) ≤ G ^ 2 :=
+              integral_norm_sq_gradL_comp_of_pointwise_bound
+                setup.hgL (SubgradientSetup.process_measurable setup t) (setup.hξ_meas t)
+                hbounded (h_int_sq t)
             have h5 : 0 ≤ η ^ 2 := by positivity
             have h6 : 2 * η * (∫ ω, f (setup.process t ω) ∂setup.P - f wStar) ≤ (∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P) - (∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P) + η ^ 2 * G ^ 2 := by
               have h7 : (∫ ω, ‖setup.process (t + 1) ω - wStar‖ ^ 2 ∂setup.P) ≤ (∫ ω, ‖setup.process t ω - wStar‖ ^ 2 ∂setup.P) - 2 * η * (∫ ω, f (setup.process t ω) ∂setup.P - f wStar) + η ^ 2 * (∫ ω, ‖setup.gradL (setup.process t ω) (setup.ξ t ω)‖ ^ 2 ∂setup.P) := h2
@@ -248,7 +261,7 @@ theorem subgradient_convergence_convex
         gcongr
         have h_nonneg : 0 ≤ (∫ ω, ‖setup.process T ω - wStar‖ ^ 2 ∂setup.P) := by
           apply integral_nonneg
-          intro ω _
+          intro ω
           exact pow_two_nonneg _
         linarith
       _ = ‖setup.w₀ - wStar‖ ^ 2 / (2 * η * T) + η * G ^ 2 / 2 := by

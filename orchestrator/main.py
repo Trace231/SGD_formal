@@ -262,7 +262,7 @@ def phase3b_fix_tags(
         "a line such as:\n"
         "  Used in: `<main_theorem>` (<file>, <step>)\n"
         "If the declaration has no docstring yet, add one immediately before "
-        "the keyword (def/lemma/theorem).\n"
+        "the declaration keyword (def/lemma/theorem/structure).\n"
         "Do NOT touch any :=, tactic, or import lines.\n"
         "After all edits call 'run_lean_verify' once to confirm the file "
         "still compiles.\n"

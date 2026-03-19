@@ -308,7 +308,8 @@ def _build_agent3_execution_profile(
 ) -> Agent3ExecutionProfile:
     """Map Agent8 routing metadata to an Agent3-owned execution profile.
     
-    Simplified version: always use 1 candidate to avoid redundant work.
+    Simplified version: keep routing logic minimal while letting the
+    search kernel decide how many parallel candidates to launch.
     """
     base_strategies = list(AGENT3_TACTIC_STRATEGIES) or ["general (no tactic preference)"]
     profile_name = "local_patch"
@@ -318,7 +319,7 @@ def _build_agent3_execution_profile(
     )
     strategy_hints = list(base_strategies)
     prefer_lean_decomposition = repair_unit == "block_restructure"
-    candidate_count = 1
+    candidate_count = max(1, int(base_candidate_count))
 
     if repair_unit == "glue":
         profile_name = "proof_state_sublemma"
@@ -335,6 +336,15 @@ def _build_agent3_execution_profile(
     elif repair_unit == "block_restructure":
         profile_name = "block_restructure"
         prefer_lean_decomposition = True
+        candidate_count = max(
+            candidate_count,
+            int(
+                RETRY_LIMITS.get(
+                    "AGENT8_AGENT3_SAMPLE_MAX_CANDIDATES",
+                    RETRY_LIMITS.get("AGENT8_AGENT3_SAMPLE_CANDIDATES", candidate_count),
+                )
+            ),
+        )
         strategy_hints = [
             "split long calc/have chains into explicit intermediate steps",
             "rewrite one local block before touching adjacent proof code",
@@ -348,6 +358,8 @@ def _build_agent3_execution_profile(
     elif error_subtype == "proof_api_mismatch":
         profile_name = "api_shape"
         prefer_lean_decomposition = True
+        if patch_guard_mode:
+            candidate_count = 1
         strategy_hints = [
             "lookup current signature before patching callsites",
             "change argument shape only before changing proof logic",
@@ -743,7 +755,12 @@ def run_agent3_search_kernel(
                     probe_path.write_text(probe_content, encoding="utf-8")
                     candidate_artifacts.append((0, probe_norm, probe_content, probe_path))
                     consumed_candidates += 1
-                    if probe_norm["exit_code"] == 0 and probe_norm["sorry_count"] == 0:
+                    probe_complete = bool(probe_verify.get("complete", False))
+                    if (
+                        probe_norm["exit_code"] == 0
+                        and probe_norm["sorry_count"] == 0
+                        and probe_complete
+                    ):
                         target_path.write_text(probe_content, encoding="utf-8")
                         probe_path.unlink(missing_ok=True)
                         return {
@@ -1486,11 +1503,11 @@ def phase3_prove(
         _algo_name,
         verify_state=_pre_agent9_verify if _pre_agent9_verify else None,
     )
+    # Phase 5 is now Agent8-owned regardless of whether Agent9 managed to
+    # produce a structured plan. Keep the legacy retry loop bypassed so the
+    # deterministic Agent8 router remains the single proof-fill driver.
+    max_retries = 0
     if _agent9_plan:
-        # Agent9 plan ready — bypass Agent3 multi-retry loop and hand control
-        # directly to Agent8 Decision Hub.  Set max_retries=0 so the Agent3
-        # loop (range(1, max_retries+1)) is skipped entirely.
-        max_retries = 0
         last_errors = str(_pre_agent9_verify.get("errors", ""))
         last_sorry_count = int(
             _pre_agent9_verify.get("sorry_count", _initial_sorry_for_ckpt)
@@ -1515,6 +1532,8 @@ def phase3_prove(
     # ------------------------------------------------------------------
     console.rule("[bold cyan]Phase 5/7 — Proof Fill  [Agent8]")
     _prog_update("Phase 5/7: Proof filling  [Agent8]...")
+    # Legacy per-attempt Agent3 retry loop is intentionally left unreachable
+    # while the new Agent8-centric flow is stabilized.
 
     for attempt in range(1, max_retries + 1):
         attempts = attempt

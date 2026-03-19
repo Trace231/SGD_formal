@@ -73,7 +73,7 @@ AGENT_CONFIGS: dict[str, dict] = {
     "planner":            {"provider": "qwen", "model": "qwen3-max-2026-01-23", "max_tokens": 32768},  # Agent2
     # "sorry_closer":     {"provider": "deepseek", "model": "deepseek-reasoner", "temperature": 0.0, "max_tokens": 8192, "use_manifest": True},
     "sorry_closer":       {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768, "use_manifest": True},  # Agent3
-    "strategy_planner":   {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 16384},  # Agent9
+    "strategy_planner":   {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 16384, "use_manifest": True},  # Agent9
     "persister":          {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768},  # Agent4
     "diagnostician":      {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 16384},   # Agent5
     "glue_filler":        {"provider": "qwen", "model": "qwen3-max-2026-01-23", "max_tokens": 32768, "use_manifest": True},  # Agent6
@@ -96,7 +96,7 @@ READ_ONLY_PATHS = ["Algorithms/", "Lib/", "docs/", "Main.lean", "lakefile.lean"]
 # ---------------------------------------------------------------------------
 # Lean verify backend controls (low-intrusion APOLLO integration)
 # ---------------------------------------------------------------------------
-_LEAN_VERIFY_BACKEND_RAW = os.getenv("LEAN_VERIFY_BACKEND", "lake").strip().lower()
+_LEAN_VERIFY_BACKEND_RAW = os.getenv("LEAN_VERIFY_BACKEND", "apollo").strip().lower()
 LEAN_VERIFY_BACKEND = (
     _LEAN_VERIFY_BACKEND_RAW if _LEAN_VERIFY_BACKEND_RAW in {"lake", "apollo"} else "lake"
 )
@@ -504,7 +504,7 @@ AGENT8_MIDCHECK_MIN_TURN: int = int(os.getenv("AGENT8_MIDCHECK_MIN_TURN", "8"))
 
 # Agent3 search-kernel controls (APOLLO core parity, MVP).
 AGENT3_SEARCH_ENABLED: bool = os.getenv("AGENT3_SEARCH_ENABLED", "1") != "0"
-AGENT3_CANDIDATE_COUNT: int = max(1, int(os.getenv("AGENT3_CANDIDATE_COUNT", "1")))
+AGENT3_CANDIDATE_COUNT: int = max(1, int(os.getenv("AGENT3_CANDIDATE_COUNT", "3")))
 AGENT3_RECURSION_DEPTH: int = max(0, int(os.getenv("AGENT3_RECURSION_DEPTH", "0")))
 AGENT3_NO_IMPROVEMENT_WINDOW: int = max(
     1, int(os.getenv("AGENT3_NO_IMPROVEMENT_WINDOW", "2"))
