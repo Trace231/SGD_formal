@@ -1,0 +1,66 @@
+{"synthetic": false,
+ "schemaVersion": "2025-09-10",
+ "outputs":
+ {"o": ["e9f3711bbb73dc16.olean"],
+  "i": "22d42b3b8261ebc8.ilean",
+  "c": "2f03823f605b9ee5.c"},
+ "log":
+ [{"message":
+   ".> LEAN_PATH=/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/Cli/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/batteries/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/Qq/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/aesop/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/proofwidgets/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/importGraph/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/plausible/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/mathlib/.lake/build/lib/lean:/root/SGD/SGD_cli_migration/.lake/build/lib/lean /root/.elan/toolchains/leanprover--lean4---v4.28.0/bin/lean /root/SGD/SGD_cli_migration/Lib/Glue/Probability.lean -o /root/SGD/SGD_cli_migration/.lake/build/lib/lean/Lib/Glue/Probability.olean -i /root/SGD/SGD_cli_migration/.lake/build/lib/lean/Lib/Glue/Probability.ilean -c /root/SGD/SGD_cli_migration/.lake/build/ir/Lib/Glue/Probability.c --setup /root/SGD/SGD_cli_migration/.lake/build/ir/Lib/Glue/Probability.setup.json --json",
+   "level": "trace"},
+  {"message":
+   "Lib/Glue/Probability.lean:94:0: automatically included section variable(s) unused in theorem `integrable_norm_sq_of_bounded_var`:\n  [InnerProductSpace ℝ E]\n  [CompleteSpace E]\n  [SecondCountableTopology E]\nconsider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:\n  omit [InnerProductSpace ℝ E] [CompleteSpace E] [SecondCountableTopology E] in theorem ...\n\nNote: This linter can be disabled with `set_option linter.unusedSectionVars false`",
+   "level": "warning"},
+  {"message":
+   "Lib/Glue/Probability.lean:188:0: automatically included section variable(s) unused in theorem `hasBoundedVariance_of_pointwise_bound`:\n  [InnerProductSpace ℝ E]\n  [CompleteSpace E]\nconsider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:\n  omit [InnerProductSpace ℝ E] [CompleteSpace E] in theorem ...\n\nNote: This linter can be disabled with `set_option linter.unusedSectionVars false`",
+   "level": "warning"},
+  {"message":
+   "Lib/Glue/Probability.lean:209:0: automatically included section variable(s) unused in theorem `integral_norm_sq_gradL_comp_of_pointwise_bound`:\n  [InnerProductSpace ℝ E]\n  [CompleteSpace E]\n  [BorelSpace E]\n  [SecondCountableTopology E]\nconsider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:\n  omit [InnerProductSpace ℝ E] [CompleteSpace E] [BorelSpace E] [SecondCountableTopology E] in theorem ...\n\nNote: This linter can be disabled with `set_option linter.unusedSectionVars false`",
+   "level": "warning"},
+  {"message":
+   "Lib/Glue/Probability.lean:212:5: unused variable `hgL`\n\nNote: This linter can be disabled with `set_option linter.unusedVariables false`",
+   "level": "warning"},
+  {"message":
+   "Lib/Glue/Probability.lean:213:5: unused variable `hmeas_wt`\n\nNote: This linter can be disabled with `set_option linter.unusedVariables false`",
+   "level": "warning"},
+  {"message":
+   "Lib/Glue/Probability.lean:213:32: unused variable `hmeas_ξt`\n\nNote: This linter can be disabled with `set_option linter.unusedVariables false`",
+   "level": "warning"},
+  {"message":
+   "Lib/Glue/Probability.lean:238:0: automatically included section variable(s) unused in theorem `svrg_variance_reduction`:\n  [InnerProductSpace ℝ E]\n  [CompleteSpace E]\n  [MeasurableSpace E]\n  [BorelSpace E]\n  [SecondCountableTopology E]\nconsider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:\n  omit [InnerProductSpace ℝ\n  E] [CompleteSpace E] [MeasurableSpace E] [BorelSpace E] [SecondCountableTopology E] in theorem ...\n\nNote: This linter can be disabled with `set_option linter.unusedSectionVars false`",
+   "level": "warning"}],
+ "inputs":
+ [["Lib.Glue.Probability:deps",
+   [["deps",
+     [["sgd/StochOptLib:extraDep", [["@sgd:extraDep", "00000000000006bb"]]],
+      ["imports",
+       [["Mathlib.MeasureTheory.Integral.Bochner.Basic transitive imports (legacy)",
+         "7e91de4c9ca2aac0"],
+        ["Mathlib.MeasureTheory.Integral.Bochner.Basic:importAllArts",
+         "88452cf8e652d5ce"],
+        ["Mathlib.MeasureTheory.Integral.Prod transitive imports (legacy)",
+         "39c7b11045f17c12"],
+        ["Mathlib.MeasureTheory.Integral.Prod:importAllArts",
+         "fdab6d71b15a935b"],
+        ["Mathlib.Probability.Independence.Basic transitive imports (legacy)",
+         "9e54503d995496a0"],
+        ["Mathlib.Probability.Independence.Basic:importAllArts",
+         "0b009d2fff59f02b"],
+        ["Mathlib.Probability.IdentDistrib transitive imports (legacy)",
+         "19ffb1a0ac43d1d6"],
+        ["Mathlib.Probability.IdentDistrib:importAllArts", "507a6f7b95b690cf"],
+        ["Mathlib.Analysis.InnerProductSpace.Basic transitive imports (legacy)",
+         "1b1fd5899bc67a2b"],
+        ["Mathlib.Analysis.InnerProductSpace.Basic:importAllArts",
+         "1bd1c6d38400c6a0"]]]]],
+    ["libs",
+     [["import dynlibs", "00000000000006bb"],
+      ["package external libraries", "00000000000006bb"],
+      ["module dynlibs", "00000000000006bb"],
+      ["module plugins", "00000000000006bb"]]]]],
+  ["Lean 4.28.0, commit 7e01a1bf5c70fc6167d49c345d3bf80596e9a79b",
+   "a96bc04a2e5e9630"],
+  ["/root/SGD/SGD_cli_migration/Lib/Glue/Probability.lean", "e7e7ffa4ab7b7bdb"],
+  ["options", "00000000000006bb"],
+  ["Module.leanArgs: #[]", "00000000000006bb"]],
+ "depHash": "9baa6f25a23da4c8"}

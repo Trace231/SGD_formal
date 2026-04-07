@@ -101,88 +101,51 @@ def test_deepseek_does_not_touch_qwen_meter(monkeypatch: pytest.MonkeyPatch) -> 
     assert p.get_qwen_tokens()["total_tokens"] == 0
 
 
-def test_qwen_stream_forwards_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: dict[str, object] = {}
+def test_qwen_stream_retryable_failure_falls_back_to_non_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RemoteProtocolError(Exception):
+        pass
 
-    class _FinalChunk:
-        choices = []
+    class _StreamChunk:
+        choices = [type("Choice", (), {"delta": type("Delta", (), {"content": "partial"})()})()]
         usage = None
 
-    def _fake_stream():
-        yield _FinalChunk()
+    class _Usage:
+        prompt_tokens = 7
+        completion_tokens = 4
+        total_tokens = 11
+
+    class _Resp:
+        choices = [type("Choice", (), {"message": type("Msg", (), {"content": "fallback answer"})()})()]
+        usage = _Usage()
+
+    class _BrokenStream:
+        def __iter__(self):
+            yield _StreamChunk()
+            raise RemoteProtocolError("incomplete chunked read")
+
+    class _Completions:
+        def create(self, **kwargs):  # noqa: ANN003
+            if kwargs.get("stream"):
+                return _BrokenStream()
+            return _Resp()
 
     class _Client:
-        class _Chat:
-            class _Completions:
-                @staticmethod
-                def create(**kwargs):
-                    captured.update(kwargs)
-                    return _fake_stream()
-
-            completions = _Completions()
-
-        chat = _Chat()
+        chat = type("Chat", (), {"completions": _Completions()})()
 
     monkeypatch.setattr(p, "get_client", lambda _prov: _Client())
 
-    p._call_llm_once(
+    text = p._call_llm_once(
         "qwen",
         "qwen3.5-plus",
         "s",
         [{"role": "user", "content": "x"}],
         max_tokens=10,
-        timeout=60,
     )
-    assert captured["timeout"] == 60
 
-
-def test_call_llm_retry_limit_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = {"count": 0}
-
-    class ConnectTimeout(Exception):
-        pass
-
-    def _boom(*args, **kwargs):
-        _ = (args, kwargs)
-        calls["count"] += 1
-        raise ConnectTimeout("timeout")
-
-    monkeypatch.setattr(p, "_call_llm_once", _boom)
-    monkeypatch.setattr(p.time, "sleep", lambda _secs: None)
-
-    with pytest.raises(ConnectTimeout):
-        p.call_llm(
-            "qwen",
-            "qwen3.5-plus",
-            "s",
-            [{"role": "user", "content": "x"}],
-            retry_limit=3,
-        )
-
-    assert calls["count"] == 4
-
-
-def test_call_llm_uses_configured_default_retry_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = {"count": 0}
-
-    class ConnectTimeout(Exception):
-        pass
-
-    def _boom(*args, **kwargs):
-        _ = (args, kwargs)
-        calls["count"] += 1
-        raise ConnectTimeout("timeout")
-
-    monkeypatch.setattr(p, "_call_llm_once", _boom)
-    monkeypatch.setattr(p.time, "sleep", lambda _secs: None)
-    monkeypatch.setattr(p, "CODEX_SDK_RETRY_LIMIT", 1)
-
-    with pytest.raises(ConnectTimeout):
-        p.call_llm(
-            "qwen",
-            "qwen3.5-plus",
-            "s",
-            [{"role": "user", "content": "x"}],
-        )
-
-    assert calls["count"] == 2
+    assert text == "fallback answer"
+    t = p.get_qwen_tokens()
+    assert t["prompt_tokens"] == 7
+    assert t["completion_tokens"] == 4
+    assert t["total_tokens"] == 11

@@ -85,7 +85,7 @@ def test_verify_with_apollo_falls_back_to_apollo_python(monkeypatch, tmp_path):
     assert out["backend_reason"] == "apollo_python_success"
 
 
-def test_verify_with_apollo_zero_timeout_passes_none_to_apollo_python(monkeypatch, tmp_path):
+def test_verify_with_apollo_zero_timeout_disables_python_timeout(monkeypatch, tmp_path):
     ws = tmp_path / "replws"
     (ws / ".lake" / "build" / "bin").mkdir(parents=True)
     (ws / ".lake" / "build" / "bin" / "repl").write_text("", encoding="utf-8")
@@ -94,13 +94,14 @@ def test_verify_with_apollo_zero_timeout_passes_none_to_apollo_python(monkeypatc
     project_root = tmp_path / "proj"
     project_root.mkdir()
     (project_root / "lakefile.lean").write_text("import Lake\n", encoding="utf-8")
-    captured: dict[str, object] = {}
 
     monkeypatch.setattr(
         apollo_mod,
         "verify_with_repl",
         lambda **_: (_ for _ in ()).throw(RuntimeError("repl_protocol_error: boom")),
     )
+
+    captured: dict[str, object] = {}
 
     def _fake_verify_lean4_file(**kwargs):
         captured["timeout"] = kwargs.get("timeout")

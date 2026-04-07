@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -20,18 +19,10 @@ if TYPE_CHECKING:
     from orchestrator.repl_adapter import ReplSession
 
 
-_DECL_HEADER_RE = re.compile(r"^\s*(theorem|lemma)\s+\S+", re.MULTILINE)
-
-
 def _ensure_apollo_path() -> None:
     apollo_root = str(Path(APOLLO_PROJECT_PATH).resolve())
     if apollo_root not in sys.path:
         sys.path.insert(0, apollo_root)
-
-
-def _has_theorem_header(code: str) -> bool:
-    """Return True when code contains at least one theorem/lemma declaration header."""
-    return bool(_DECL_HEADER_RE.search(code or ""))
 
 
 def build_apollo_verify_callable(
@@ -96,15 +87,6 @@ def apply_syntax_correction(code: str) -> tuple[str, dict[str, Any]]:
 
 def apply_sorrify(code: str, verifier: Callable[[str], dict[str, Any]]) -> tuple[str, dict[str, Any]]:
     """Apply APOLLO Sorrifier to isolate hard error blocks."""
-    if not _has_theorem_header(code):
-        return code, {
-            "ok": False,
-            "error": "Theorem is missing a header",
-            "changed": False,
-            "backend": "local_fallback",
-            "reason": "missing_theorem_header",
-        }
-
     try:
         _ensure_apollo_path()
         from utils.sorrify import ProofTree, Sorrifier
@@ -129,16 +111,12 @@ def apply_sorrify(code: str, verifier: Callable[[str], dict[str, Any]]) -> tuple
             "reason": "missing_apollo_utils",
         }
     except Exception as exc:
-        message = str(exc)
-        reason = "sorrify_stage_error"
-        if "Theorem is missing a header" in message:
-            reason = "missing_theorem_header"
         return code, {
             "ok": False,
-            "error": message,
+            "error": str(exc),
             "changed": False,
             "backend": "local_fallback",
-            "reason": reason,
+            "reason": "sorrify_stage_error",
         }
 
 
@@ -203,3 +181,4 @@ def extract_sublemmas(code: str, verifier: Callable[[str], dict[str, Any]]) -> t
         }
     except Exception as exc:
         return [], {"ok": False, "error": str(exc), "count": 0}
+

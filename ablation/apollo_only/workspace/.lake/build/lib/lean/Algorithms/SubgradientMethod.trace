@@ -1,0 +1,110 @@
+{"synthetic": false,
+ "schemaVersion": "2025-09-10",
+ "outputs":
+ {"o": ["0fc4de12d11512e2.olean"],
+  "i": "59d2dab46feb3059.ilean",
+  "c": "5e4bac34cd14eaea.c"},
+ "log":
+ [{"message":
+   ".> LEAN_PATH=/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/Cli/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/batteries/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/Qq/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/aesop/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/proofwidgets/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/importGraph/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/plausible/.lake/build/lib/lean:/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace/.lake/packages/mathlib/.lake/build/lib/lean:/root/SGD/SGD_cli_migration/.lake/build/lib/lean /root/.elan/toolchains/leanprover--lean4---v4.28.0/bin/lean /root/SGD/SGD_cli_migration/Algorithms/SubgradientMethod.lean -o /root/SGD/SGD_cli_migration/.lake/build/lib/lean/Algorithms/SubgradientMethod.olean -i /root/SGD/SGD_cli_migration/.lake/build/lib/lean/Algorithms/SubgradientMethod.ilean -c /root/SGD/SGD_cli_migration/.lake/build/ir/Algorithms/SubgradientMethod.c --setup /root/SGD/SGD_cli_migration/.lake/build/ir/Algorithms/SubgradientMethod.setup.json --json",
+   "level": "trace"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:79:0: automatically included section variable(s) unused in theorem `SubgradientSetup.process_zero`:\n  [SecondCountableTopology E]\nconsider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:\n  omit [SecondCountableTopology E] in theorem ...\n\nNote: This linter can be disabled with `set_option linter.unusedSectionVars false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:82:0: automatically included section variable(s) unused in theorem `SubgradientSetup.process_succ`:\n  [SecondCountableTopology E]\nconsider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:\n  omit [SecondCountableTopology E] in theorem ...\n\nNote: This linter can be disabled with `set_option linter.unusedSectionVars false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:258:32: This simp argument is unused:\n  setup.hP.measure_univ\n\nHint: Omit it from the simp argument list.\n  simp [integral_const,̵ ̵s̵e̵t̵u̵p̵.̵h̵P̵.̵m̵e̵a̵s̵u̵r̵e̵_̵u̵n̵i̵v̵]\n\nNote: This linter can be disabled with `set_option linter.unusedSimpArgs false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:141:8: 'ring_nf' tactic does nothing\n\nNote: This linter can be disabled with `set_option linter.unusedTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:149:10: 'ring' tactic does nothing\n\nNote: This linter can be disabled with `set_option linter.unusedTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:170:12: 'ring' tactic does nothing\n\nNote: This linter can be disabled with `set_option linter.unusedTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:231:14: 'ring' tactic does nothing\n\nNote: This linter can be disabled with `set_option linter.unusedTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:233:12: 'ring' tactic does nothing\n\nNote: This linter can be disabled with `set_option linter.unusedTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:248:14: 'ring_nf' tactic does nothing\n\nNote: This linter can be disabled with `set_option linter.unusedTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:251:12: 'ring_nf' tactic does nothing\n\nNote: This linter can be disabled with `set_option linter.unusedTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:269:12: 'ring' tactic does nothing\n\nNote: This linter can be disabled with `set_option linter.unusedTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:270:12: 'field_simp [hη_pos.ne', hT.ne']' tactic does nothing\n\nNote: This linter can be disabled with `set_option linter.unusedTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:271:12: 'ring' tactic does nothing\n\nNote: This linter can be disabled with `set_option linter.unusedTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:141:8: this tactic is never executed\n\nNote: This linter can be disabled with `set_option linter.unreachableTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:149:10: this tactic is never executed\n\nNote: This linter can be disabled with `set_option linter.unreachableTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:170:12: this tactic is never executed\n\nNote: This linter can be disabled with `set_option linter.unreachableTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:231:14: this tactic is never executed\n\nNote: This linter can be disabled with `set_option linter.unreachableTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:233:12: this tactic is never executed\n\nNote: This linter can be disabled with `set_option linter.unreachableTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:248:14: this tactic is never executed\n\nNote: This linter can be disabled with `set_option linter.unreachableTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:251:12: this tactic is never executed\n\nNote: This linter can be disabled with `set_option linter.unreachableTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:269:12: this tactic is never executed\n\nNote: This linter can be disabled with `set_option linter.unreachableTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:270:12: this tactic is never executed\n\nNote: This linter can be disabled with `set_option linter.unreachableTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:271:12: this tactic is never executed\n\nNote: This linter can be disabled with `set_option linter.unreachableTactic false`",
+   "level": "warning"},
+  {"message":
+   "Algorithms/SubgradientMethod.lean:247:10: Used `tac1 <;> tac2` where `(tac1; tac2)` would suffice\n\nNote: This linter can be disabled with `set_option linter.unnecessarySeqFocus false`",
+   "level": "warning"}],
+ "inputs":
+ [["Algorithms.SubgradientMethod:deps",
+   [["deps",
+     [["sgd/SGDAlgorithms:extraDep",
+       [["@sgd:extraDep", "00000000000006bb"], ["<nil>", "00000000000006bb"]]],
+      ["imports",
+       [["Main transitive imports (legacy)", "e3e0a8dbe62cb228"],
+        ["Main:importAllArts", "363b0a15ea1dfef5"],
+        ["Lib.Glue.Algebra transitive imports (legacy)", "32937ff426012c47"],
+        ["Lib.Glue.Algebra:importAllArts", "1fb76525e5c5de93"],
+        ["Lib.Glue.Probability transitive imports (legacy)",
+         "1e7cf4a78d07b662"],
+        ["Lib.Glue.Probability:importAllArts", "543d9d72593a4b8e"],
+        ["Lib.Layer0.IndepExpect transitive imports (legacy)",
+         "9d2db87a05007059"],
+        ["Lib.Layer0.IndepExpect:importAllArts", "86babeb2f212bf9f"]]]]],
+    ["libs",
+     [["import dynlibs", "00000000000006bb"],
+      ["package external libraries", "00000000000006bb"],
+      ["module dynlibs", "00000000000006bb"],
+      ["module plugins", "00000000000006bb"]]]]],
+  ["Lean 4.28.0, commit 7e01a1bf5c70fc6167d49c345d3bf80596e9a79b",
+   "a96bc04a2e5e9630"],
+  ["/root/SGD/SGD_cli_migration/Algorithms/SubgradientMethod.lean",
+   "eb31449849720b0f"],
+  ["options", "00000000000006bb"],
+  ["Module.leanArgs: #[]", "00000000000006bb"]],
+ "depHash": "e87ed471d4edb06c"}

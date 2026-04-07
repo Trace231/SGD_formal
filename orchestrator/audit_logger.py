@@ -17,11 +17,8 @@ from orchestrator.config import (
     AUDIT_DIR,
     AUDIT_ENABLED,
     AUDIT_FULL_PROMPTS_ENABLED,
-    CONTEXT_JOURNAL_DIR,
-    CONTEXT_JOURNAL_ENABLED,
     DOCS_DIR,
     PROJECT_ROOT,
-    RUN_ID_OVERRIDE,
 )
 
 
@@ -63,9 +60,6 @@ class AuditLogger:
         self._phase4_patch_ops_summary: list[dict[str, Any]] = []
         self._phase1_detail: dict[str, Any] | None = None
         self._phase2_rounds: list[dict[str, Any]] = []
-        self.context_journal_enabled = CONTEXT_JOURNAL_ENABLED
-        self.context_journal_dir = Path(CONTEXT_JOURNAL_DIR)
-        self._role_call_counters: dict[str, int] = {}
 
     @classmethod
     def get(cls) -> AuditLogger:
@@ -89,7 +83,7 @@ class AuditLogger:
         self.algorithm = algorithm
         self.started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        self.run_id = RUN_ID_OVERRIDE or f"{ts}_{algorithm}"
+        self.run_id = f"{ts}_{algorithm}"
         self.prompt_hashes = _compute_prompt_hashes()
         self.events = []
         self._next_event_id = 1
@@ -100,7 +94,6 @@ class AuditLogger:
         self._phase4_patch_ops_summary = []
         self._phase1_detail = None
         self._phase2_rounds = []
-        self._role_call_counters = {}
 
         if self.enabled:
             self.events.append({
@@ -122,13 +115,6 @@ class AuditLogger:
         reply_full: str | None = None,
         *,
         elapsed_ms: int | None = None,
-        backend: str | None = None,
-        llm_transport: str | None = None,
-        sdk_model: str | None = None,
-        degraded_to_api: bool | None = None,
-        degrade_reason: str | None = None,
-        target_file: str | None = None,
-        context_mode: str | None = None,
     ) -> None:
         """Log an agent call (prompt + reply metadata)."""
         if not self.enabled:
@@ -146,16 +132,6 @@ class AuditLogger:
         }
         if elapsed_ms is not None:
             event["elapsed_ms"] = int(elapsed_ms)
-        if backend is not None:
-            event["llm_backend"] = str(backend)
-        if llm_transport is not None:
-            event["llm_transport"] = str(llm_transport)
-        if sdk_model:
-            event["sdk_model"] = str(sdk_model)
-        if degraded_to_api is not None:
-            event["degraded_to_api"] = bool(degraded_to_api)
-        if degrade_reason:
-            event["degrade_reason"] = str(degrade_reason)
 
         if self.full_prompts_enabled:
             # Guard against unbounded growth; mark when truncated.
@@ -175,27 +151,6 @@ class AuditLogger:
 
         self.events.append(event)
         self._next_event_id += 1
-        self._append_context_journal(
-            role,
-            {
-                "entry_type": "agent_call",
-                "phase": self._current_phase,
-                "role": role,
-                "target_file": target_file or "",
-                "backend": str(backend or ""),
-                "llm_transport": str(llm_transport or ""),
-                "sdk_model": str(sdk_model or ""),
-                "context_mode": str(context_mode or ""),
-                "prompt_len": len(user_msg),
-                "reply_len": len(reply),
-                "prompt_hash": _hash_text(user_msg),
-                "reply_hash": _hash_text(reply),
-                "prompt_full": prompt_full if prompt_full is not None else user_msg,
-                "reply_full": reply_full if reply_full is not None else reply,
-                "degraded_to_api": bool(degraded_to_api) if degraded_to_api is not None else False,
-                "degrade_reason": str(degrade_reason or ""),
-            },
-        )
 
     def log_tool_call(
         self,
@@ -267,27 +222,6 @@ class AuditLogger:
                     evt["after"] = after
         self.events.append(evt)
         self._next_event_id += 1
-
-    def log_event(self, event_type: str, **payload: Any) -> None:
-        """Log a generic structured event for new pipeline observability hooks."""
-        if not self.enabled:
-            return
-        event: dict[str, Any] = {
-            "id": self._next_event_id,
-            "type": str(event_type),
-            "phase": self._current_phase,
-            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        }
-        event.update(payload)
-        self.events.append(event)
-        self._next_event_id += 1
-
-    def log_context_entry(self, role: str, entry_type: str, **payload: Any) -> None:
-        """Append a role-scoped JSONL entry for long-run context monitoring."""
-        if not self.enabled:
-            return
-        data = {"entry_type": str(entry_type), **payload}
-        self._append_context_journal(role, data)
 
     def log_phase1_detail(self, prompt_full: str, reply_full: str) -> None:
         """Log Phase 1 full prompt and generated Prover prompt."""
@@ -371,28 +305,6 @@ class AuditLogger:
             json.dumps(payload, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-
-    def _append_context_journal(self, role: str, payload: dict[str, Any]) -> None:
-        if not self.context_journal_enabled or not self.run_id:
-            return
-        self._role_call_counters[role] = int(self._role_call_counters.get(role, 0)) + 1
-        data = {
-            "run_id": self.run_id,
-            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "phase": self._current_phase,
-            "role": role,
-            "call_index": self._role_call_counters[role],
-        }
-        data.update(payload)
-        journal_dir = self.context_journal_dir / self.run_id
-        journal_dir.mkdir(parents=True, exist_ok=True)
-        journal_path = journal_dir / f"{role}.jsonl"
-        with journal_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(data, ensure_ascii=False) + "\n")
-
-
-def _hash_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     def finish_run(
         self,

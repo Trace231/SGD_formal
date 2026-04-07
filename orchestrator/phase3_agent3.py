@@ -39,7 +39,6 @@ from orchestrator.assumption_repair import (
     goals_to_patch_list,
 )
 from orchestrator.config import (
-    AGENT8_ALLOW_AGENT5,
     AGENT3_CANDIDATE_COUNT,
     AGENT3_NO_IMPROVEMENT_WINDOW,
     AGENT3_RECURSION_DEPTH,
@@ -55,7 +54,6 @@ from orchestrator.config import (
     APOLLO_REPL_WORKSPACE,
     AUDIT_FLUSH_INTERVAL_SECONDS,
     ALGORITHM_REFERENCES,
-    CODEX_SDK_RETRY_LIMIT,
     DOC_ANCHORS,
     LIB_GLUE_ANCHORS,
     MAX_PHASE3_RETRIES,
@@ -66,9 +64,7 @@ from orchestrator.config import (
     ROUTING_PARAMS,
     UNKNOWN_IDENTIFIER_RENAME_MAP,
     _get_default_references,
-    should_use_codex_backend,
 )
-from orchestrator.compile_health import check_compile_health, recover_compile_health
 from orchestrator.file_io import (
     load_file,
     snapshot_file,
@@ -195,30 +191,394 @@ from orchestrator.phase3.state import Phase3Progress, Phase3Runtime, Phase3State
 
 console = Console()
 
-
-def _build_agent_with_runtime(
-    role: str,
-    *,
-    extra_files: list[str] | None = None,
-    runtime_hint: str | None = None,
-):
-    """Construct Agent while remaining compatible with legacy/mocked signatures."""
-    kwargs: dict[str, Any] = {}
-    if extra_files is not None:
-        kwargs["extra_files"] = extra_files
-    if runtime_hint is not None:
-        kwargs["runtime_hint"] = runtime_hint
-    try:
-        return Agent(role, **kwargs)
-    except TypeError:
-        kwargs.pop("runtime_hint", None)
-        return Agent(role, **kwargs)
-
-
 # Agent3 single-step interactive loop: maximum tool turns per attempt.
 # Archetype B gets a 1.5× multiplier applied in phase3_prove.
 MAX_AGENT3_TOOL_TURNS = 20
 _A3_SORRY_RE = re.compile(r"\bsorry\b")
+_DECL_SIGNATURE_RE = re.compile(
+    r"(?m)^(?:\s*@\[[^\n]+\]\s*\n)*\s*(?:noncomputable\s+)?(?:theorem|lemma|def|example)\s+[^\s:(]+[^\n]*"
+)
+_DECL_START_RE = re.compile(
+    r"^\s*(?:noncomputable\s+)?(?P<kind>theorem|lemma|def|example)\s+(?P<name>[^\s:(]+)"
+)
+
+
+@dataclass(frozen=True)
+class _DeclarationSpan:
+    kind: str
+    name: str
+    start_line: int
+    end_line: int
+    start_offset: int
+    end_offset: int
+    header_text: str
+    declaration_text: str
+
+
+def _normalize_decl_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip())
+
+
+def _estimate_patch_line_span(old_str: str, new_str: str) -> int:
+    """Estimate patch line span from old/new replacement blocks."""
+    old_n = len((old_str or "").splitlines()) or 1
+    new_n = len((new_str or "").splitlines()) or 1
+    return max(old_n, new_n)
+
+
+def _patch_touches_decl_signature(old_str: str, new_str: str) -> bool:
+    """Detect whether patch blocks contain declaration signature edits."""
+    old_has = bool(_DECL_SIGNATURE_RE.search(old_str or ""))
+    new_has = bool(_DECL_SIGNATURE_RE.search(new_str or ""))
+    return old_has or new_has
+
+
+def _sha256_text(content: str) -> str:
+    """Return a stable sha256 digest string for text content."""
+    return hashlib.sha256((content or "").encode("utf-8")).hexdigest()
+
+
+def _parse_allowed_edit_lines(allowed_edit_lines: str | None) -> tuple[int, int] | None:
+    """Parse ``'start-end'`` or ``'start'`` into inclusive line bounds."""
+    if allowed_edit_lines is None:
+        return None
+    raw = str(allowed_edit_lines).strip()
+    if not raw:
+        return None
+    match = re.fullmatch(r"(\d+)(?:\s*-\s*(\d+))?", raw)
+    if not match:
+        raise ValueError(f"invalid allowed_edit_lines: {allowed_edit_lines!r}")
+    start = int(match.group(1))
+    end = int(match.group(2) or match.group(1))
+    if start <= 0 or end <= 0 or start > end:
+        raise ValueError(f"invalid allowed_edit_lines: {allowed_edit_lines!r}")
+    return start, end
+
+
+def _read_span_snippet(content: str, allowed_edit_lines: str | None) -> str:
+    """Extract the current active span snippet for anchor/hash binding."""
+    span = _parse_allowed_edit_lines(allowed_edit_lines)
+    if span is None:
+        return content
+    lines = content.splitlines()
+    if span[0] > len(lines):
+        raise ValueError(
+            f"allowed_edit_lines out of range: {allowed_edit_lines!r} for file with {len(lines)} line(s)"
+        )
+    end = min(len(lines), span[1])
+    return "\n".join(lines[span[0] - 1 : end])
+
+
+def _line_offsets(lines: list[str]) -> list[int]:
+    offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line)
+    return offsets
+
+
+def _extract_decl_header(lines: list[str], start_idx: int, end_idx: int) -> str:
+    header_lines: list[str] = []
+    for idx in range(start_idx, end_idx + 1):
+        header_lines.append(lines[idx].rstrip("\n"))
+        line = lines[idx]
+        if ":=" in line or line.rstrip().endswith("where"):
+            break
+    return "\n".join(header_lines).strip()
+
+
+def _iter_top_level_declarations(content: str) -> list[_DeclarationSpan]:
+    lines = content.splitlines(keepends=True)
+    if not lines:
+        return []
+    offsets = _line_offsets(lines)
+    starts: list[tuple[int, str, str]] = []
+    for idx, line in enumerate(lines):
+        if line[:1].isspace():
+            continue
+        match = _DECL_START_RE.match(line.strip())
+        if match is None:
+            continue
+        starts.append((idx, str(match.group("kind")), str(match.group("name"))))
+    spans: list[_DeclarationSpan] = []
+    for pos, (start_idx, kind, name) in enumerate(starts):
+        end_idx = (starts[pos + 1][0] - 1) if pos + 1 < len(starts) else len(lines) - 1
+        start_offset = offsets[start_idx]
+        end_offset = offsets[end_idx] + len(lines[end_idx])
+        decl_text = content[start_offset:end_offset]
+        spans.append(
+            _DeclarationSpan(
+                kind=kind,
+                name=name,
+                start_line=start_idx + 1,
+                end_line=end_idx + 1,
+                start_offset=start_offset,
+                end_offset=end_offset,
+                header_text=_extract_decl_header(lines, start_idx, end_idx),
+                declaration_text=decl_text,
+            )
+        )
+    return spans
+
+
+def _find_declarations_by_name(content: str, decl_name: str) -> list[_DeclarationSpan]:
+    if not str(decl_name or "").strip():
+        return []
+    wanted = str(decl_name).strip()
+    return [span for span in _iter_top_level_declarations(content) if span.name == wanted]
+
+
+def _find_declaration_for_line(content: str, line: int) -> _DeclarationSpan | None:
+    for span in _iter_top_level_declarations(content):
+        if span.start_line <= int(line) <= span.end_line:
+            return span
+    return None
+
+
+def _infer_target_declaration(content: str) -> _DeclarationSpan | None:
+    decls = _iter_top_level_declarations(content)
+    if not decls:
+        return None
+    theorem_like = [span for span in decls if span.kind in {"theorem", "lemma", "example"}]
+    if theorem_like:
+        return theorem_like[-1]
+    return decls[-1]
+
+
+def _declaration_header_stub(header_text: str, decl_name: str) -> str:
+    header = str(header_text or "").strip()
+    name = str(decl_name or "").strip()
+    if not name:
+        return _normalize_decl_text(header)
+    return _normalize_decl_text(re.sub(rf"\b{re.escape(name)}\b", "__TARGET_DECL__", header, count=1))
+
+
+def _build_active_repair_target(
+    target_file: str,
+    *,
+    candidate_id: str,
+    allowed_edit_lines: str | None,
+    decl_name: str = "",
+    target_region: str = "",
+    mode: str = "legacy_file_clean",
+) -> dict[str, Any]:
+    """Build the canonical active-target object used by Agent3/APOLLO search."""
+    content = load_file(target_file)
+    target_span: _DeclarationSpan | None = None
+    if decl_name:
+        matches = _find_declarations_by_name(content, decl_name)
+        if len(matches) == 1:
+            target_span = matches[0]
+    if target_span is None and allowed_edit_lines:
+        span = _parse_allowed_edit_lines(allowed_edit_lines)
+        if span is not None:
+            target_span = _find_declaration_for_line(content, span[0])
+    if target_span is None:
+        target_span = _infer_target_declaration(content)
+    anchor_text = _read_span_snippet(content, allowed_edit_lines) if allowed_edit_lines else (
+        target_span.declaration_text if target_span is not None else content
+    )
+    if target_span is None:
+        return {
+            "source_file": target_file,
+            "candidate_file": target_file,
+            "decl_name": str(decl_name or "").strip(),
+            "candidate_id": candidate_id or "",
+            "allowed_span": allowed_edit_lines,
+            "anchor_text": anchor_text,
+            "anchor_hash": _sha256_text(anchor_text) if anchor_text else _sha256_text(content),
+            "file_hash": _sha256_text(content),
+            "target_region": target_region or "",
+            "mode": mode,
+            "decl_header_text": "",
+            "decl_header_hash": "",
+            "decl_header_stub": "",
+            "decl_text_hash": "",
+            "decl_text": "",
+            "prefix_text": "",
+            "suffix_text": "",
+            "decl_start_line": None,
+            "decl_end_line": None,
+        }
+    prefix_text = content[: target_span.start_offset]
+    suffix_text = content[target_span.end_offset :]
+    return {
+        "source_file": target_file,
+        "candidate_file": target_file,
+        "decl_name": target_span.name,
+        "candidate_id": candidate_id or "",
+        "allowed_span": allowed_edit_lines,
+        "anchor_text": anchor_text,
+        "anchor_hash": _sha256_text(anchor_text) if anchor_text else _sha256_text(content),
+        "file_hash": _sha256_text(content),
+        "target_region": target_region or "",
+        "mode": mode,
+        "decl_header_text": target_span.header_text,
+        "decl_header_hash": _sha256_text(target_span.header_text),
+        "decl_header_stub": _declaration_header_stub(target_span.header_text, target_span.name),
+        "decl_text_hash": _sha256_text(target_span.declaration_text),
+        "decl_text": target_span.declaration_text,
+        "prefix_text": prefix_text,
+        "suffix_text": suffix_text,
+        "decl_start_line": target_span.start_line,
+        "decl_end_line": target_span.end_line,
+    }
+
+
+def _validate_candidate_target(
+    candidate_content: str,
+    active_target: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Validate target declaration preservation for strict APOLLO search."""
+    if not active_target:
+        return {
+            "target_decl_name": "",
+            "target_decl_present": False,
+            "target_decl_count": 0,
+            "target_validation_status": "legacy_mode",
+            "target_validation_reason": "",
+            "target_header_preserved": True,
+            "target_decl_changed": True,
+            "effective_change": True,
+            "edit_outside_target_region": False,
+            "patch_guard_reject_reason": "",
+        }
+    decl_name = str(active_target.get("decl_name", "") or "").strip()
+    mode = str(active_target.get("mode", "") or "legacy_file_clean")
+    if not decl_name or mode != "strict_target_preservation":
+        return {
+            "target_decl_name": decl_name,
+            "target_decl_present": bool(decl_name),
+            "target_decl_count": len(_find_declarations_by_name(candidate_content, decl_name)) if decl_name else 0,
+            "target_validation_status": "legacy_mode",
+            "target_validation_reason": "",
+            "target_header_preserved": True,
+            "target_decl_changed": True,
+            "effective_change": True,
+            "edit_outside_target_region": False,
+            "patch_guard_reject_reason": "",
+        }
+    matches = _find_declarations_by_name(candidate_content, decl_name)
+    all_decls = _iter_top_level_declarations(candidate_content)
+    if not matches:
+        baseline_stub = str(active_target.get("decl_header_stub", "") or "")
+        renamed = any(
+            _declaration_header_stub(span.header_text, span.name) == baseline_stub
+            for span in all_decls
+        )
+        reason = "renamed_target_declaration" if renamed else "missing_target_declaration"
+        return {
+            "target_decl_name": decl_name,
+            "target_decl_present": False,
+            "target_decl_count": 0,
+            "target_validation_status": reason,
+            "target_validation_reason": reason,
+            "target_header_preserved": False,
+            "target_decl_changed": False,
+            "effective_change": False,
+            "edit_outside_target_region": False,
+            "patch_guard_reject_reason": reason,
+        }
+    if len(matches) > 1:
+        return {
+            "target_decl_name": decl_name,
+            "target_decl_present": True,
+            "target_decl_count": len(matches),
+            "target_validation_status": "duplicate_target_declaration",
+            "target_validation_reason": "duplicate_target_declaration",
+            "target_header_preserved": False,
+            "target_decl_changed": False,
+            "effective_change": False,
+            "edit_outside_target_region": False,
+            "patch_guard_reject_reason": "duplicate_target_declaration",
+        }
+    target_span = matches[0]
+    header_preserved = _normalize_decl_text(target_span.header_text) == _normalize_decl_text(
+        str(active_target.get("decl_header_text", "") or "")
+    )
+    if not header_preserved:
+        return {
+            "target_decl_name": decl_name,
+            "target_decl_present": True,
+            "target_decl_count": 1,
+            "target_validation_status": "target_signature_changed",
+            "target_validation_reason": "target_signature_changed",
+            "target_header_preserved": False,
+            "target_decl_changed": True,
+            "effective_change": False,
+            "edit_outside_target_region": False,
+            "patch_guard_reject_reason": "target_signature_changed",
+        }
+    candidate_prefix = candidate_content[: target_span.start_offset]
+    candidate_suffix = candidate_content[target_span.end_offset :]
+    edit_outside_target_region = (
+        candidate_prefix != str(active_target.get("prefix_text", "") or "")
+        or candidate_suffix != str(active_target.get("suffix_text", "") or "")
+    )
+    if edit_outside_target_region:
+        return {
+            "target_decl_name": decl_name,
+            "target_decl_present": True,
+            "target_decl_count": 1,
+            "target_validation_status": "edit_outside_target_region",
+            "target_validation_reason": "edit_outside_target_region",
+            "target_header_preserved": True,
+            "target_decl_changed": True,
+            "effective_change": False,
+            "edit_outside_target_region": True,
+            "patch_guard_reject_reason": "edit_outside_target_region",
+        }
+    decl_changed = _normalize_decl_text(target_span.declaration_text) != _normalize_decl_text(
+        str(active_target.get("decl_text", "") or "")
+    )
+    if not decl_changed:
+        return {
+            "target_decl_name": decl_name,
+            "target_decl_present": True,
+            "target_decl_count": 1,
+            "target_validation_status": "no_effective_change",
+            "target_validation_reason": "no_effective_change",
+            "target_header_preserved": True,
+            "target_decl_changed": False,
+            "effective_change": False,
+            "edit_outside_target_region": False,
+            "patch_guard_reject_reason": "no_effective_change",
+        }
+    return {
+        "target_decl_name": decl_name,
+        "target_decl_present": True,
+        "target_decl_count": 1,
+        "target_validation_status": "preserved",
+        "target_validation_reason": "",
+        "target_header_preserved": True,
+        "target_decl_changed": True,
+        "effective_change": True,
+        "edit_outside_target_region": False,
+        "patch_guard_reject_reason": "",
+        "target_decl_text": target_span.declaration_text,
+    }
+
+
+def _target_validation_rank(status: str) -> int:
+    order = {
+        "preserved": 0,
+        "legacy_mode": 0,
+        "no_effective_change": 1,
+        "target_signature_changed": 2,
+        "edit_outside_target_region": 3,
+        "duplicate_target_declaration": 4,
+        "renamed_target_declaration": 5,
+        "missing_target_declaration": 6,
+    }
+    return order.get(str(status or ""), 7)
+
+
+def _candidate_selection_key(payload: dict[str, Any]) -> tuple[int, int, int, int, int, int, int]:
+    status = str(payload.get("target_validation_status", "") or "legacy_mode")
+    no_effective = int(status == "no_effective_change")
+    base_score = _agent3_score_result(payload)
+    return (_target_validation_rank(status), no_effective, *base_score)
 
 
 def _agent3_error_count(payload: dict[str, Any]) -> int:
@@ -360,6 +720,15 @@ def _build_agent3_execution_profile(
     elif repair_unit == "block_restructure":
         profile_name = "block_restructure"
         prefer_lean_decomposition = True
+        candidate_count = max(
+            candidate_count,
+            int(
+                RETRY_LIMITS.get(
+                    "AGENT8_AGENT3_SAMPLE_MAX_CANDIDATES",
+                    RETRY_LIMITS.get("AGENT8_AGENT3_SAMPLE_CANDIDATES", candidate_count),
+                )
+            ),
+        )
         strategy_hints = [
             "split long calc/have chains into explicit intermediate steps",
             "rewrite one local block before touching adjacent proof code",
@@ -474,6 +843,7 @@ def _build_agent3_search_prompt(
     decomposition_plan: dict[str, Any],
     target_region: str,
     allowed_edit_lines: str | None,
+    active_target: dict[str, Any] | None = None,
 ) -> str:
     """Compose Agent3-owned tactical guidance from routing metadata."""
     lines = [
@@ -498,6 +868,21 @@ def _build_agent3_search_prompt(
             lines.append(
                 f"  - {node.get('id', '')}: {node.get('kind', '')} -> "
                 f"{node.get('target', '')} :: {str(node.get('evidence', ''))[:120]}"
+            )
+    if active_target:
+        decl_name = str(active_target.get("decl_name", "") or "").strip()
+        if decl_name:
+            lines.extend(
+                [
+                    "- active_target_contract:",
+                    f"  - decl_name: {decl_name}",
+                    f"  - allowed_span: {str(active_target.get('allowed_span', '') or '(none)')}",
+                    f"  - target_region: {str(active_target.get('target_region', '') or target_region or allowed_edit_lines or 'unknown')}",
+                    f"  - mode: {str(active_target.get('mode', '') or 'legacy_file_clean')}",
+                    "  - do not delete, rename, or replace the active target declaration",
+                    "  - do not change declaration headers unless explicitly required",
+                    "  - clean build without the active target declaration is invalid",
+                ]
             )
     lines.append(
         "- Agent3 owns tactical search, local decomposition, and verification order within this mode."
@@ -526,6 +911,8 @@ def run_agent3_search_kernel(
     error_subtype: str = "",
     repair_unit: str = "local_patch",
     target_region: str = "",
+    target_decl_name: str = "",
+    active_target: dict[str, Any] | None = None,
     run_single_candidate=None,
 ) -> dict[str, Any]:
     """APOLLO-style bounded search kernel for Agent3 execution.
@@ -582,10 +969,24 @@ def run_agent3_search_kernel(
     if not target_path.is_absolute():
         target_path = (PROJECT_ROOT / target_path).resolve()
     baseline_content = target_path.read_text(encoding="utf-8")
+    strict_target_mode = bool(transactional_mode or patch_guard_mode or str(target_decl_name or "").strip())
+    initial_active_target = dict(active_target or {}) if active_target else _build_active_repair_target(
+        str(target_path),
+        candidate_id="baseline",
+        allowed_edit_lines=allowed_edit_lines,
+        decl_name=target_decl_name,
+        target_region=target_region,
+        mode="strict_target_preservation" if strict_target_mode else "legacy_file_clean",
+    )
 
     baseline_verify = run_lean_verify(str(target_path))
     search_timing["baseline_verify_ms"] = int(float(baseline_verify.get("verify_wall_ms", 0) or 0))
-    baseline_score = _agent3_score_verify(baseline_verify)
+    baseline_validation = _validate_candidate_target(baseline_content, initial_active_target)
+    baseline_payload = {
+        **dict(baseline_verify),
+        **baseline_validation,
+    }
+    baseline_score = _candidate_selection_key(baseline_payload)
 
     repl_session: ReplSession | None = None
     header_env_id: int | None = None
@@ -689,15 +1090,10 @@ def run_agent3_search_kernel(
         decomposition_plan=decomposition_plan,
         target_region=target_region,
         allowed_edit_lines=allowed_edit_lines,
+        active_target=initial_active_target,
     )
     best_failed_summary: dict[str, Any] = {}
     strategy_hints = list(profile.strategy_hints)
-    default_retry_limit = max(0, int(CODEX_SDK_RETRY_LIMIT or 0))
-
-    def _attach_execution_meta(payload: dict[str, Any]) -> dict[str, Any]:
-        payload.setdefault("candidate_count", candidate_count)
-        payload.setdefault("retry_limit", default_retry_limit)
-        return payload
 
     try:
         if not search_enabled:
@@ -713,12 +1109,21 @@ def run_agent3_search_kernel(
                 transactional_mode=transactional_mode,
                 repair_unit=repair_unit,
                 target_region=target_region,
+                decl_name=str(initial_active_target.get("decl_name", "") or ""),
                 candidate_index=1,
                 candidate_total=1,
                 candidate_id="d1.c1",
             )
+            current_content = target_path.read_text(encoding="utf-8")
+            validation = _validate_candidate_target(current_content, initial_active_target)
+            out = dict(out)
+            out.setdefault("build_exit_code", int(out.get("exit_code", 1)))
+            out.setdefault("build_sorry_count", int(out.get("sorry_count", 10**6)))
+            out.update(validation)
+            if str(validation.get("target_validation_status", "") or "legacy_mode") not in {"preserved", "legacy_mode"}:
+                out["exit_code"] = 1
             out.setdefault("candidate_id", "c1")
-            out.setdefault("candidate_score", list(_agent3_score_result(out)))
+            out.setdefault("candidate_score", list(_candidate_selection_key(out)))
             out.setdefault("recursion_depth", 0)
             out.setdefault(
                 "budget_remaining",
@@ -728,6 +1133,7 @@ def run_agent3_search_kernel(
                 "best_candidate_reason",
                 "search_disabled_by_policy" if not profile.search_allowed else "search_disabled_config",
             )
+            out.setdefault("active_target", initial_active_target)
             out.setdefault("apollo_prepass_meta", prepass_meta)
             out.setdefault("execution_profile", profile.name)
             out.setdefault("candidate_timings", candidate_timings)
@@ -738,11 +1144,11 @@ def run_agent3_search_kernel(
                     "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
                 },
             )
-            return _attach_execution_meta(out)
+            return out
 
         while depth <= max_depth:
             best_result: dict[str, Any] | None = None
-            best_score: tuple[int, int, int, int, int] | None = None
+            best_score: tuple[int, ...] | None = None
             best_content = baseline_content
             candidate_artifacts: list[tuple[int, dict[str, Any], str, Path]] = []
             candidate_paths: list[Path] = []
@@ -771,21 +1177,25 @@ def run_agent3_search_kernel(
                         "verify_time": float(probe_verify.get("verify_time", 0.0) or 0.0),
                         "_probe_candidate": True,
                     }
-                    probe_score = _agent3_score_result(probe_norm)
                     probe_path = target_path.parent / f"{target_path.stem}__a3_d{depth + 1}_probe.lean"
                     probe_path.write_text(probe_content, encoding="utf-8")
                     candidate_artifacts.append((0, probe_norm, probe_content, probe_path))
                     consumed_candidates += 1
                     probe_complete = bool(probe_verify.get("complete", False))
+                    probe_validation = _validate_candidate_target(probe_content, initial_active_target)
+                    probe_score = _candidate_selection_key({**probe_norm, **probe_validation})
                     if (
                         probe_norm["exit_code"] == 0
                         and probe_norm["sorry_count"] == 0
                         and probe_complete
+                        and str(probe_validation.get("target_validation_status", "") or "legacy_mode") in {"preserved", "legacy_mode"}
+                        and bool(probe_validation.get("effective_change", True))
                     ):
                         target_path.write_text(probe_content, encoding="utf-8")
                         probe_path.unlink(missing_ok=True)
-                        return _attach_execution_meta({
+                        return {
                             **probe_norm,
+                            **probe_validation,
                             "candidate_id": f"d{depth + 1}.probe",
                             "candidate_score": list(probe_score),
                             "recursion_depth": depth,
@@ -794,6 +1204,7 @@ def run_agent3_search_kernel(
                                 "candidates": max(0, total_candidate_budget - consumed_candidates),
                             },
                             "best_candidate_reason": "tactic_probe_clean",
+                            "active_target": initial_active_target,
                             "apollo_prepass_meta": prepass_meta,
                             "execution_profile": profile.name,
                             "candidate_timings": candidate_timings,
@@ -801,7 +1212,7 @@ def run_agent3_search_kernel(
                                 **search_timing,
                                 "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
                             },
-                        })
+                        }
 
             def _run_parallel_candidate(idx0: int) -> tuple[int, dict[str, Any], str, Path]:
                 cand_idx = idx0 + 1
@@ -857,6 +1268,7 @@ def run_agent3_search_kernel(
                     transactional_mode=transactional_mode,
                     repair_unit=repair_unit,
                     target_region=target_region,
+                    decl_name=str(initial_active_target.get("decl_name", "") or ""),
                     candidate_index=cand_idx,
                     candidate_total=candidate_count,
                     candidate_id=f"d{depth + 1}.c{cand_idx}",
@@ -880,7 +1292,23 @@ def run_agent3_search_kernel(
 
             selection_started = time.perf_counter()
             for cand_idx, candidate_result, candidate_content, _cand_path in candidate_artifacts:
-                candidate_score = _agent3_score_result(candidate_result)
+                raw_exit_code = int(candidate_result.get("exit_code", 1))
+                raw_sorry_count = int(candidate_result.get("sorry_count", 10**6))
+                target_validation = _validate_candidate_target(candidate_content, initial_active_target)
+                candidate_result = dict(candidate_result)
+                candidate_result.setdefault("build_exit_code", raw_exit_code)
+                candidate_result.setdefault("build_sorry_count", raw_sorry_count)
+                candidate_result.update(target_validation)
+                validation_status = str(target_validation.get("target_validation_status", "") or "legacy_mode")
+                if validation_status not in {"preserved", "legacy_mode"}:
+                    candidate_result["exit_code"] = 1
+                    if not str(candidate_result.get("errors", "") or "").strip():
+                        candidate_result["errors"] = validation_status
+                    else:
+                        candidate_result["errors"] = (
+                            str(candidate_result.get("errors", "")).rstrip() + f"\n[target_validation] {validation_status}"
+                        )
+                candidate_score = _candidate_selection_key(candidate_result)
                 _candidate_metrics = dict(candidate_result.get("candidate_metrics", {}) or {})
                 _candidate_metrics.setdefault(
                     "candidate_total_ms",
@@ -892,6 +1320,7 @@ def run_agent3_search_kernel(
                         "candidate_id": str(candidate_result.get("candidate_id", f"d{depth + 1}.c{cand_idx}")),
                         "depth": depth,
                         "score": list(candidate_score),
+                        "target_validation_status": validation_status,
                         **_candidate_metrics,
                     }
                 )
@@ -899,9 +1328,12 @@ def run_agent3_search_kernel(
                     best_result = dict(candidate_result)
                     best_score = candidate_score
                     best_content = candidate_content
-                if int(candidate_result.get("exit_code", 1)) == 0 and int(
-                    candidate_result.get("sorry_count", -1)
-                ) == 0:
+                if (
+                    raw_exit_code == 0
+                    and raw_sorry_count == 0
+                    and validation_status in {"preserved", "legacy_mode"}
+                    and bool(target_validation.get("effective_change", True))
+                ):
                     target_path.write_text(candidate_content, encoding="utf-8")
                     for p in candidate_paths:
                         p.unlink(missing_ok=True)
@@ -920,7 +1352,12 @@ def run_agent3_search_kernel(
                                 "depth": max(0, max_depth - depth),
                                 "candidates": max(0, total_candidate_budget - consumed_candidates),
                             },
-                            "best_candidate_reason": "clean_candidate_early_stop",
+                            "best_candidate_reason": (
+                                "clean_candidate_preserved_target_early_stop"
+                                if validation_status == "preserved"
+                                else "clean_candidate_early_stop"
+                            ),
+                            "active_target": initial_active_target,
                             "apollo_prepass_meta": prepass_meta,
                             "execution_profile": profile.name,
                             "candidate_timings": candidate_timings,
@@ -931,7 +1368,7 @@ def run_agent3_search_kernel(
                             },
                         }
                     )
-                    return _attach_execution_meta(clean)
+                    return clean
             search_timing["selection_ms"] += int((time.perf_counter() - selection_started) * 1000.0)
 
             for p in candidate_paths:
@@ -941,8 +1378,6 @@ def run_agent3_search_kernel(
 
             if best_result is None or best_score is None:
                 break
-
-            target_path.write_text(best_content, encoding="utf-8")
             best_result = dict(best_result)
             best_result.update(
                 {
@@ -956,23 +1391,29 @@ def run_agent3_search_kernel(
                     "apollo_prepass_meta": prepass_meta,
                     "execution_profile": profile.name,
                     "candidate_timings": candidate_timings,
+                    "active_target": initial_active_target,
                 }
             )
 
             # Improvement gate against current baseline.
             if best_score < baseline_score:
+                target_path.write_text(best_content, encoding="utf-8")
                 no_improve_rounds = 0
                 best_result["best_candidate_reason"] = "best_candidate_improved_baseline"
                 best_result["search_timing"] = {
                     **search_timing,
                     "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
                 }
-                return _attach_execution_meta(best_result)
+                return best_result
             no_improve_rounds += 1
 
             # No improvement: recurse to next subproblem if budget allows.
             best_errors = str(best_result.get("errors", "") or "")
-            failure_kind, _, _ = classify_failure_kind(best_errors)
+            target_failure_kind = str(best_result.get("target_validation_status", "") or "")
+            if target_failure_kind and target_failure_kind not in {"preserved", "legacy_mode"}:
+                failure_kind = target_failure_kind
+            else:
+                failure_kind, _, _ = classify_failure_kind(best_errors)
             extracted_sublemmas: list[str] = []
             try:
                 _lemmas, _lemma_meta = extract_sublemmas(best_content, verifier)
@@ -999,6 +1440,7 @@ def run_agent3_search_kernel(
                 "failure_kind": failure_kind,
                 "observed_signature": best_errors.splitlines()[0][:200] if best_errors else "",
                 "best_candidate_score": list(best_score),
+                "target_validation_status": str(best_result.get("target_validation_status", "") or ""),
                 "extracted_sublemmas": extracted_sublemmas[:5],
                 "subproblem_graph_head": graph[:2],
                 "execution_profile": profile.name,
@@ -1011,6 +1453,7 @@ def run_agent3_search_kernel(
                 "failure_kind": failure_kind,
                 "observed_signature": best_failed_summary["observed_signature"],
                 "target_region": target_region or allowed_edit_lines or "unknown",
+                "target_validation_status": str(best_result.get("target_validation_status", "") or ""),
                 "candidate_budget_consumed": consumed_candidates,
                 "candidate_budget_total": total_candidate_budget,
                 "execution_profile": profile.name,
@@ -1022,7 +1465,7 @@ def run_agent3_search_kernel(
                     **search_timing,
                     "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
                 }
-                return _attach_execution_meta(best_result)
+                return best_result
 
             if depth >= max_depth:
                 best_result["best_candidate_reason"] = "max_recursion_depth_reached"
@@ -1030,12 +1473,12 @@ def run_agent3_search_kernel(
                     **search_timing,
                     "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
                 }
-                return _attach_execution_meta(best_result)
+                return best_result
 
             if graph:
                 node = graph[0]
                 search_prompt = (
-                    f"{_build_agent3_search_prompt(base_prompt=targeted_prompt, profile=profile, decomposition_plan=decomposition_plan, target_region=target_region, allowed_edit_lines=allowed_edit_lines)}\n\n[APOLLO Subproblem Depth {depth + 1}]\n"
+                    f"{_build_agent3_search_prompt(base_prompt=targeted_prompt, profile=profile, decomposition_plan=decomposition_plan, target_region=target_region, allowed_edit_lines=allowed_edit_lines, active_target=initial_active_target)}\n\n[APOLLO Subproblem Depth {depth + 1}]\n"
                     f"- node_id: {node.get('id', '')}\n"
                     f"- node_kind: {node.get('kind', '')}\n"
                     f"- target: {node.get('target', '')}\n"
@@ -1046,12 +1489,10 @@ def run_agent3_search_kernel(
                 )
             else:
                 search_prompt = (
-                    f"{_build_agent3_search_prompt(base_prompt=targeted_prompt, profile=profile, decomposition_plan=decomposition_plan, target_region=target_region, allowed_edit_lines=allowed_edit_lines)}\n\n[APOLLO Subproblem Depth {depth + 1}]\n"
+                    f"{_build_agent3_search_prompt(base_prompt=targeted_prompt, profile=profile, decomposition_plan=decomposition_plan, target_region=target_region, allowed_edit_lines=allowed_edit_lines, active_target=initial_active_target)}\n\n[APOLLO Subproblem Depth {depth + 1}]\n"
                     "- Focus top error signature only and avoid broad rewrites."
                 )
 
-            baseline_content = best_content
-            baseline_score = best_score
             depth += 1
 
         # Fallback failure envelope.
@@ -1071,6 +1512,8 @@ def run_agent3_search_kernel(
             "failure_kind": best_failed_summary.get("failure_kind", "strategy_failure"),
             "observed_signature": best_failed_summary.get("observed_signature", ""),
             "best_failed_candidate_summary": best_failed_summary,
+            "target_validation_status": str(best_failed_summary.get("target_validation_status", "") or ""),
+            "active_target": initial_active_target,
             "execution_profile": profile.name,
             "candidate_timings": candidate_timings,
             "search_timing": {
@@ -1086,7 +1529,7 @@ def run_agent3_search_kernel(
                 "execution_profile": profile.name,
             },
         }
-        return _attach_execution_meta(fallback)
+        return fallback
     finally:
         if repl_session is not None:
             repl_session.close()
@@ -1191,8 +1634,7 @@ def phase3_prove(
         max_tool_turns = MAX_AGENT3_TOOL_TURNS
     if archetype.upper() == "B":
         max_tool_turns = int(max_tool_turns * 1.5)
-    _agent3_runtime = "codex" if should_use_codex_backend("sorry_closer", skip_to_agent9=skip_to_agent9) else "http"
-    agent3 = _build_agent_with_runtime("sorry_closer", extra_files=[target_file], runtime_hint=_agent3_runtime)
+    agent3 = Agent("sorry_closer", extra_files=[target_file])
     registry = ToolRegistry()
     registry.register_default_tools()
     _algo_name = Path(target_file).stem
@@ -1519,38 +1961,12 @@ def phase3_prove(
         registry.call("run_lean_verify", target_file)
         if _target_exists_overlay() else {}
     )
-    _pre_agent9_health = check_compile_health(_pre_agent9_verify, target_file=target_file)
-    if not _pre_agent9_health.get("healthy", True):
-        _recovery = recover_compile_health(
-            target_file,
-            registry=registry,
-            verify_result=_pre_agent9_verify,
-        )
-        _pre_agent9_verify = dict(_recovery.get("verify_result", _pre_agent9_verify))
-        _pre_agent9_health = dict(_recovery.get("health", _pre_agent9_health))
-    _agent9_runtime = "codex" if should_use_codex_backend("strategy_planner", skip_to_agent9=skip_to_agent9) else "http"
-    if _pre_agent9_health.get("healthy", True):
-        try:
-            _agent9_plan: dict = _run_agent9_plan(
-                target_file,
-                guidance,
-                _algo_name,
-                verify_state=_pre_agent9_verify if _pre_agent9_verify else None,
-                runtime_hint=_agent9_runtime,
-            )
-        except TypeError:
-            _agent9_plan = _run_agent9_plan(
-                target_file,
-                guidance,
-                _algo_name,
-                verify_state=_pre_agent9_verify if _pre_agent9_verify else None,
-            )
-    else:
-        console.print(
-            "[yellow][CompileHealth] Agent9 skipped until compile health recovers. "
-            "Agent8 will start from recovery-aware mode.[/yellow]"
-        )
-        _agent9_plan = {}
+    _agent9_plan: dict = _run_agent9_plan(
+        target_file,
+        guidance,
+        _algo_name,
+        verify_state=_pre_agent9_verify if _pre_agent9_verify else None,
+    )
     # Phase 5 is now Agent8-owned regardless of whether Agent9 managed to
     # produce a structured plan. Keep the legacy retry loop bypassed so the
     # deterministic Agent8 router remains the single proof-fill driver.
@@ -1573,8 +1989,7 @@ def phase3_prove(
         )
     _prog_advance()  # Phase 4/7
     if agent2 is None:
-        _planner_runtime = "codex" if should_use_codex_backend("planner", skip_to_agent9=skip_to_agent9) else "http"
-        agent2 = _build_agent_with_runtime("planner", runtime_hint=_planner_runtime)
+        agent2 = Agent("planner")
 
     # ------------------------------------------------------------------
     # Phase 5/7 — Proof Fill: Agent3 / Agent8 close all sorry placeholders.
@@ -4555,33 +4970,6 @@ def phase3_prove(
     console.print(
         "  [Agent8→Agent5] All agent memories cleared before Agent5 escalation."
     )
-
-    if not AGENT8_ALLOW_AGENT5:
-        console.print(
-            "[yellow][Agent8] Exhausted current budget with Agent5 disabled. "
-            "Returning current failure state without Agent5 escalation."
-        )
-        return False, attempts, last_errors, {
-            "execution_history": [r.__dict__ for r in execution_history],
-            "decision_history": decision_history,
-            "blocker_reports": blocker_reports,
-            "attempt_failures": attempt_failures,
-            "failure_ledger": _failure_ledger,
-            "agent7_invocations": agent7_invocations,
-            "agent7_step_execution_log": agent7_step_execution_log,
-            "agent7_plan_revisions": agent7_plan_revisions,
-            "agent7_blocked_actions": agent7_blocked_actions,
-            "agent7_forced_trigger_count": agent7_forced_trigger_count,
-            "agent7_force_gate_entries": agent7_force_gate_entries,
-            "agent7_force_gate_rejections": agent7_force_gate_rejections,
-            "agent7_force_gate_reason_samples": agent7_force_gate_reason_samples,
-            "estimated_token_consumption": max(1, token_char_budget // 4),
-            "retry_count": sum(
-                1
-                for r in execution_history
-                if r.status_code in {"ERROR", "BLOCKED"}
-            ),
-        }
 
     console.print("[red bold]Agent8 exhausted — escalating to Agent5.")
     if diag_log:

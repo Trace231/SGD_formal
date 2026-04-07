@@ -16,6 +16,8 @@ The prover prompt will tell you which sorry line is your **current active target
 - Work exclusively on that sorry.
 - Do NOT modify other sorry lines during this iteration.
 - Signal `done` only once your active target sorry is closed and the file compiles.
+- Do NOT delete, rename, or replace the active target declaration.
+- A clean build without the active target declaration still counts as failure.
 - If your dispatch prompt contains an APOLLO fallback marker, treat it as
   strict tactical cleanup only. Do not perform routing or global replanning.
 
@@ -26,6 +28,7 @@ an external symbol, you MUST ground yourself in the CURRENT file state:
 - Verify every new external identifier with `search_codebase`, `search_in_file`,
   `read_file`, or `check_lean_expr` in THIS attempt.
 - If you do not have current-file evidence for the symbol, you are not allowed to patch it.
+- In block-restructure / transactional repair, edit only inside the provided active target block or target region.
 
 ## Situational behavior (not a rigid "mechanical arm")
 - **When guidance contains PATCH blocks** (<<<SEARCH>>>/<<<REPLACE>>>): Execute

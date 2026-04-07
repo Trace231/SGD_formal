@@ -2,7 +2,7 @@
   "algorithm": "StochasticMirrorDescent",
   "full_name": "Stochastic Mirror Descent (Convex, Variable Step Size)",
   "source_reference": "Lan, First-order and Stochastic Optimization Methods for Machine Learning, Chapter 3-4 (Theorem 4.1)",
-  "lean_theorem": "TBD",
+  "lean_theorem": "stochasticMirrorDescent_convergence",
   "archetype": "B",
   "archetype_note": "Novel proof structure. Requires Bregman divergence infrastructure not present in Mathlib. No Layer 1 meta-theorem available. Must build V(x,z), prox-mapping, and three-point lemma from scratch.",
   "formalization_status": "not_started",
@@ -14,9 +14,7 @@
     "Define prox-mapping: argmin_{x ∈ X} γ⟨g, x⟩ + V(z, x)",
     "Prove three-point lemma (Lemma 3.4)"
   ],
-
   "sections": {
-
     "1_assumptions": {
       "title": "Assumptions and Context",
       "constraint_set": {
@@ -62,7 +60,6 @@
         "description": "x_1 ∈ X (arbitrary starting point in X)"
       }
     },
-
     "2_algorithm": {
       "title": "Algorithm Specification",
       "initialization": "x_1 ∈ X",
@@ -79,11 +76,9 @@
         "note": "Convergence is measured at this average point, not the last iterate."
       }
     },
-
     "3_key_lemma_chain": {
       "title": "Key Lemma Chain",
       "overview": "The proof proceeds in three stages: (1) single-step bound via Lemma 3.4, (2) aggregate via Young's inequality + oracle bound, (3) sum and rearrange.",
-
       "lemma_3_4": {
         "id": "Lemma3.4",
         "title": "Three-Point Lemma (Descent Lemma for Mirror Descent)",
@@ -98,7 +93,6 @@
         "key_technique": "Optimality condition of prox-mapping + Bregman three-point identity",
         "proof_technique": "novel_construction"
       },
-
       "step_1": {
         "id": "Step1",
         "title": "Single-step suboptimality bound",
@@ -113,7 +107,6 @@
         "result_math": "\\gamma_t [f(x_t) - f(x)] \\leq V(x_t, x) - V(x_{t+1}, x) + \\gamma_t^2 \\|G_t\\|_*^2 / 2 - \\gamma_t \\langle \\delta_t, x_t - x \\rangle",
         "note": "The convexity of f gives f(x_t) - f(x) ≤ <g_t, x_t - x> = <G_t - δ_t, x_t - x>. The noise term -γ_t <δ_t, x_t - x> appears and is handled in Step 3."
       },
-
       "step_2": {
         "id": "Step2",
         "title": "Oracle variance bound",
@@ -123,7 +116,6 @@
         "substitution": "Substitute into Step 1: γ_t²‖G_t‖_*²/2 ≤ γ_t²(M² + ‖δ_t‖_*²)",
         "result_math": "\\gamma_t [f(x_t) - f(x)] \\leq V(x_t, x) - V(x_{t+1}, x) + 2\\gamma_t^2(M^2 + \\|\\delta_t\\|_*^2) - \\gamma_t \\langle \\delta_t, x_t - x \\rangle"
       },
-
       "step_3": {
         "id": "Step3",
         "title": "Summation and noise cancellation",
@@ -138,7 +130,6 @@
         "result_math": "\\sum_{t=s}^{k} \\gamma_t \\cdot \\mathbb{E}[f(x_t) - f(x)] \\leq \\mathbb{E}[V(x_s, x)] + 2(M^2 + \\sigma^2) \\sum_{t=s}^{k} \\gamma_t^2",
         "key_technique": "Telescoping of V-terms + martingale property of noise (E[<δ_t, x_t - x>] = 0)"
       },
-
       "step_4": {
         "id": "Step4",
         "title": "Extract Cesaro average",
@@ -149,7 +140,6 @@
         "result_math": "\\mathbb{E}[f(\\bar{x}_s^k)] - f^* \\leq \\left(\\sum_{t=s}^{k} \\gamma_t\\right)^{-1} \\left[\\mathbb{E}[V(x_s, x^*)] + (M^2 + \\sigma^2) \\sum_{t=s}^{k} \\gamma_t^2 \\right]"
       }
     },
-
     "4_final_theorem": {
       "title": "Final Convergence Theorem",
       "lean_identifier": "TBD",
