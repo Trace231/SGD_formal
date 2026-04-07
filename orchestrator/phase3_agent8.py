@@ -1,20 +1,4 @@
-"""Agent8 Decision Hub — deterministic routing and lightweight dispatch.
-
-This rewrite intentionally removes Agent8 self-LLM routing. Agent8 now:
-
-1. Verifies the current file state.
-2. Classifies the dominant error subtype deterministically.
-3. Chooses a route from recent progress history.
-4. Dispatches Agent3 / Agent7 / Agent9 directly.
-
-The public entry points remain stable:
-
-- ``run_agent8_loop(...) -> tuple[bool, str, str]``
-- ``run_agent8_midcheck(...) -> dict``
-
-Lower-level dispatch helpers are preserved for compatibility with
-``phase3_agent3``.
-"""
+"""Agent8 Decision Hub — LLM-guided routing with deterministic hard guards."""
 
 from __future__ import annotations
 
@@ -25,13 +9,31 @@ from typing import Any
 
 from rich.console import Console
 
-from orchestrator.agents import ToolRegistry
-from orchestrator.config import RETRY_LIMITS
-from orchestrator.error_classifier import _extract_first_error_line, _parse_lean_errors
+from orchestrator.agents import Agent, ToolRegistry
+from orchestrator.audit_logger import AuditLogger
+from orchestrator.compile_health import check_compile_health, recover_compile_health
+from orchestrator.config import (
+    AGENT8_ALLOW_AGENT5,
+    AGENT8_ROUTER_MODE,
+    AGENT8_ROUTER_MODEL,
+    RETRY_LIMITS,
+    should_use_codex_backend,
+)
+from orchestrator.context_builders import _build_stale_error_hint, _prioritize_error_text
+from orchestrator.error_classifier import (
+    _build_decl_zone_map,
+    _extract_first_error_line,
+    _is_in_declaration_zone,
+    _parse_lean_errors,
+)
 from orchestrator.phase3_agent8_v1 import (
     _agent8_run_agent3_single as _legacy_agent3_single,
     _agent8_run_agent7 as _legacy_agent7,
     _agent8_run_agent7_then_agent6 as _legacy_agent7_then_agent6,
+    _build_agent8_tick_context,
+    _has_informative_investigation,
+    _parse_agent8_decision,
+    _safe_llm_call,
 )
 from orchestrator.phase3a_agent9 import run_agent9_replan
 
@@ -141,21 +143,25 @@ def _classify_error_subtype(
     *,
     decision_history: list[dict] | None = None,
 ) -> str:
-    """Classify the dominant routing subtype using deterministic heuristics."""
-    _ = target_file
+    """Classify the dominant routing subtype using proof-zone aware heuristics."""
     if not errors_text:
         return _SUBTYPE_PROOF_TACTIC_FAILURE
 
     hay = errors_text.lower()
+    error_line = _extract_first_error_line(errors_text)
+    in_declaration_zone = _error_in_declaration_zone(target_file, error_line)
 
     if any(m in hay for m in _DECLARATION_SYNTAX_MARKERS):
         return _SUBTYPE_DECLARATION_SYNTAX_FAILURE
 
     if any(m in hay for m in _DECLARATION_ZONE_MARKERS):
-        has_proof_zone_context = any(m in hay for m in _PROOF_ZONE_MARKERS)
-        if not has_proof_zone_context:
+        if in_declaration_zone:
             return _SUBTYPE_DECLARATION_API_MISMATCH
-        return _SUBTYPE_DECLARATION_API_MISMATCH
+        # When file/zone context is unavailable, preserve the legacy fallback
+        # for obviously declaration-shaped errors unless the message itself
+        # contains proof-body markers.
+        if not target_file and not any(m in hay for m in _PROOF_ZONE_MARKERS):
+            return _SUBTYPE_DECLARATION_API_MISMATCH
 
     has_proof_zone_context = any(m in hay for m in _PROOF_ZONE_MARKERS)
     has_structural_proof_marker = any(m in hay for m in _PROOF_STRUCTURAL_MARKERS)
@@ -183,6 +189,9 @@ def _classify_error_subtype(
         if all_zero_progress:
             return _SUBTYPE_STRATEGY_MISMATCH
 
+    if in_declaration_zone and has_api_shape_marker:
+        return _SUBTYPE_DECLARATION_API_MISMATCH
+
     if has_proof_zone_context and has_structural_proof_marker and not strong_api_signal:
         return _SUBTYPE_PROOF_TACTIC_FAILURE
 
@@ -190,6 +199,32 @@ def _classify_error_subtype(
         return _SUBTYPE_PROOF_API_MISMATCH
 
     return _SUBTYPE_PROOF_TACTIC_FAILURE
+
+
+def _error_in_declaration_zone(target_file: str, error_line: int | None) -> bool:
+    if not target_file or error_line is None:
+        return False
+    try:
+        lines = Path(target_file).read_text(encoding="utf-8").splitlines()
+    except Exception:
+        try:
+            from orchestrator.config import PROJECT_ROOT
+
+            lines = (PROJECT_ROOT / target_file).read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return False
+    decl_map = _build_decl_zone_map(lines)
+    return _is_in_declaration_zone(int(error_line), decl_map)
+
+
+def _build_zone_summary(target_file: str, errors_text: str) -> dict[str, Any]:
+    err_line = _extract_first_error_line(errors_text)
+    in_decl = _error_in_declaration_zone(target_file, err_line)
+    return {
+        "error_line": err_line,
+        "in_declaration_zone": in_decl,
+        "in_proof_body": bool(err_line is not None and not in_decl),
+    }
 
 
 def _target_region_from_errors(
@@ -385,6 +420,285 @@ _agent8_run_agent7 = _legacy_agent7
 _agent8_run_agent7_then_agent6 = _legacy_agent7_then_agent6
 
 
+def _fallback_decision(
+    *,
+    subtype: str,
+    history: list[dict[str, Any]],
+    canonical_sig: str,
+    target_region: str,
+) -> dict[str, Any]:
+    action, repair_unit, reason = _route_for_subtype(subtype, history, canonical_sig)
+    if action == "human_missing_assumption" and not AGENT8_ALLOW_AGENT5:
+        action = "agent9_replan"
+        repair_unit = _REPAIR_UNIT_STATEMENT_GAP
+        reason = "Agent5-disabled mode converts human gate into replan."
+    return {
+        "action": action,
+        "priority_level": "P2" if action == "agent9_replan" else "P4",
+        "reason": reason,
+        "targeted_prompt": reason,
+        "error_signature": canonical_sig,
+        "error_subtype": subtype,
+        "repair_unit": repair_unit,
+        "target_region": target_region,
+        "allowed_edit_lines": target_region,
+        "hypothesis": reason,
+        "evidence": [
+            {"source": "fallback_router", "snippet": reason},
+            {"source": "lean_verify", "snippet": canonical_sig[:180]},
+        ],
+        "confidence": 0.35,
+        "counterfactual": "Fallback keeps routing bounded when LLM routing is unavailable.",
+    }
+
+
+def _run_agent8_llm_router(
+    *,
+    target_file: str,
+    errors_text: str,
+    current_plan: str,
+    decision_history: list[dict[str, Any]],
+    agent9_plan: dict[str, Any] | None,
+    compile_health: dict[str, Any],
+    midcheck_mode: bool = False,
+    turns_elapsed: int = 0,
+    baseline_errors: str = "",
+) -> dict[str, Any]:
+    subtype = _classify_error_subtype(errors_text, target_file, decision_history=decision_history)
+    canonical_sig = _canonical_error_signature(errors_text)
+    target_region = _target_region_from_errors(errors_text)
+    zone_summary = _build_zone_summary(target_file, errors_text)
+    if str(AGENT8_ROUTER_MODE).strip().lower() != "llm_guarded":
+        decision = _fallback_decision(
+            subtype=subtype,
+            history=decision_history,
+            canonical_sig=canonical_sig,
+            target_region=target_region,
+        )
+        decision["zone_summary"] = zone_summary
+        return decision
+    verify_backend_used = str(compile_health.get("verify_backend_used", ""))
+    verify_backend_reason = str(compile_health.get("verify_backend_reason", ""))
+    prioritized_errors = _prioritize_error_text(
+        _parse_lean_errors(errors_text),
+        errors_text,
+        zone_summary.get("error_line"),
+        target_file,
+    )
+    stale_hint = ""
+    same_sig_streak = 1
+    for entry in reversed(decision_history):
+        if str(entry.get("canonical_error_signature", "")) == canonical_sig:
+            same_sig_streak += 1
+        else:
+            break
+    if same_sig_streak >= 3:
+        try:
+            ctx_registry = ToolRegistry()
+            ctx_registry.register_readonly_tools()
+            stale_hint = _build_stale_error_hint(
+                ctx_registry,
+                target_file,
+                errors_text,
+                zone_summary.get("error_line"),
+                same_sig_streak,
+            )
+        except Exception:
+            stale_hint = ""
+    ctx = _build_agent8_tick_context(
+        target_file,
+        prioritized_errors,
+        current_plan,
+        decision_history,
+        agent9_plan=agent9_plan,
+        plan_updated_tick=0,
+        midcheck_mode=midcheck_mode,
+        midcheck_turns_elapsed=turns_elapsed,
+        baseline_errors=baseline_errors,
+        error_subtype=subtype,
+        canonical_error_signature=canonical_sig,
+        stale_error_hint=stale_hint,
+        verify_backend_used=verify_backend_used,
+        verify_backend_reason=verify_backend_reason,
+    )
+    ctx += (
+        "\n\n## Compile Health\n"
+        f"- healthy: {int(bool(compile_health.get('healthy', True)))}\n"
+        f"- import_resolves: {int(bool(compile_health.get('import_resolves', True)))}\n"
+        f"- olean_available: {int(bool(compile_health.get('olean_available', True)))}\n"
+        f"- verify_backend_healthy: {int(bool(compile_health.get('verify_backend_healthy', True)))}\n"
+        f"- backend_used: {verify_backend_used or 'unknown'}\n"
+        f"- backend_reason: {verify_backend_reason or 'unknown'}\n"
+    )
+
+    runtime_hint = "codex" if should_use_codex_backend("decision_hub") else "http"
+    agent8 = Agent("decision_hub", runtime_hint=runtime_hint)
+    agent8.model = AGENT8_ROUTER_MODEL
+    inv_registry = ToolRegistry()
+    inv_registry.register_investigation_tools()
+    max_inv = min(int(RETRY_LIMITS.get("AGENT8_INVESTIGATION_TURNS", 3)), 2)
+    raw_reply = _safe_llm_call(agent8, ctx, idempotent=True, max_attempts=3)
+    investigations: list[dict[str, Any]] = []
+    for _ in range(max_inv):
+        try:
+            payload = json.loads(raw_reply)
+        except Exception:
+            break
+        if not (
+            isinstance(payload, dict)
+            and payload.get("type") == "lookup"
+            and isinstance(payload.get("tool_calls"), list)
+            and payload["tool_calls"]
+        ):
+            break
+        results: list[dict[str, Any]] = []
+        for tc in payload["tool_calls"]:
+            tn = tc.get("tool", "")
+            ta = tc.get("arguments", {}) or {}
+            try:
+                tr = inv_registry.call(tn, **ta)
+            except Exception as exc:
+                tr = {"error": str(exc)}
+            investigations.append(
+                {
+                    "tool": str(tn),
+                    "success": not (isinstance(tr, dict) and tr.get("error")),
+                    "error": str(tr.get("error", "")) if isinstance(tr, dict) else "",
+                }
+            )
+            results.append({"tool": tn, "result": tr})
+        raw_reply = _safe_llm_call(
+            agent8,
+            "Investigation results:\n"
+            + json.dumps(results, indent=2, ensure_ascii=False)
+            + "\n\nNow output your final JSON decision.",
+            idempotent=True,
+            max_attempts=2,
+        )
+
+    decision, parse_error = _parse_agent8_decision(raw_reply)
+    if decision is None:
+        decision = _fallback_decision(
+            subtype=subtype,
+            history=decision_history,
+            canonical_sig=canonical_sig,
+            target_region=target_region,
+        )
+        decision["reason"] = (
+            f"LLM router parse failure ({parse_error}); using guarded fallback."
+        )
+    decision.setdefault("error_subtype", subtype)
+    decision.setdefault("repair_unit", _REPAIR_UNIT_LOCAL_PATCH)
+    decision.setdefault("target_region", target_region)
+    decision.setdefault("allowed_edit_lines", target_region)
+    decision["error_signature"] = canonical_sig
+    decision["canonical_error_signature"] = canonical_sig
+    decision["investigation_success"] = _has_informative_investigation(investigations)
+    decision["investigation_failures"] = [item for item in investigations if not item.get("success")]
+    decision["zone_summary"] = zone_summary
+    AuditLogger.get().log_event(
+        "agent8_llm_route",
+        action=str(decision.get("action", "")),
+        error_subtype=str(decision.get("error_subtype", "")),
+        repair_unit=str(decision.get("repair_unit", "")),
+        target_region=str(decision.get("target_region", "")),
+        investigation_success=bool(decision.get("investigation_success", False)),
+        canonical_error_signature=canonical_sig,
+    )
+    return decision
+
+
+def _apply_agent8_hard_guards(
+    decision: dict[str, Any],
+    *,
+    target_file: str,
+    errors_text: str,
+    compile_health: dict[str, Any],
+) -> dict[str, Any]:
+    out = dict(decision)
+    zone_summary = out.get("zone_summary") or _build_zone_summary(target_file, errors_text)
+    subtype = str(out.get("error_subtype", ""))
+    action = str(out.get("action", ""))
+    out.setdefault("hard_guard_applied", False)
+    out.setdefault("hard_guard_reason", "")
+
+    if not compile_health.get("healthy", True):
+        out["action"] = "agent9_replan"
+        out["repair_unit"] = _REPAIR_UNIT_STATEMENT_GAP
+        out["reason"] = "Compile health is unhealthy; theorem repair is blocked until infra recovers."
+        out["targeted_prompt"] = (
+            "Compile health is unhealthy. Avoid theorem-level patching and re-evaluate after recovery."
+        )
+        out["hard_guard_applied"] = True
+        out["hard_guard_reason"] = "compile_health_unhealthy"
+        return out
+
+    if action == "human_missing_assumption" and not AGENT8_ALLOW_AGENT5:
+        out["action"] = "agent9_replan"
+        out["repair_unit"] = _REPAIR_UNIT_STATEMENT_GAP
+        out["reason"] = "Agent5-disabled mode reroutes terminal human gate to Agent9 replan."
+        out["hard_guard_applied"] = True
+        out["hard_guard_reason"] = "agent5_disabled"
+        return out
+
+    if action == "agent7_signature" and zone_summary.get("in_proof_body"):
+        out["action"] = "agent3_tactical"
+        out["error_subtype"] = (
+            _SUBTYPE_PROOF_API_MISMATCH
+            if any(m in errors_text.lower() for m in _PROOF_API_SHAPE_MARKERS)
+            else _SUBTYPE_PROOF_TACTIC_FAILURE
+        )
+        out["repair_unit"] = _REPAIR_UNIT_LOCAL_PATCH
+        out["reason"] = "Hard guard: error line is after := by, so this is a proof-body repair."
+        out["targeted_prompt"] = (
+            "[HARD GUARD] Error is inside the proof body. "
+            + str(out.get("targeted_prompt", "") or "")
+        ).strip()
+        out["hard_guard_applied"] = True
+        out["hard_guard_reason"] = "proof_body_after_by"
+        return out
+
+    if action == "agent3_tactical" and subtype == _SUBTYPE_DECLARATION_API_MISMATCH and zone_summary.get("in_declaration_zone"):
+        out["action"] = "agent7_signature"
+        out["reason"] = "Hard guard: declaration-zone API mismatches must go through Agent7."
+        out["hard_guard_applied"] = True
+        out["hard_guard_reason"] = "declaration_zone_api"
+        return out
+
+    return out
+
+
+def _log_agent8_decision(
+    *,
+    tick: int,
+    target_file: str,
+    decision: dict[str, Any],
+    compile_health: dict[str, Any],
+) -> None:
+    AuditLogger.get().log_context_entry(
+        "decision_hub",
+        "decision",
+        tick=int(tick),
+        target_file=target_file,
+        canonical_error_signature=str(decision.get("canonical_error_signature", "")),
+        error_subtype=str(decision.get("error_subtype", "")),
+        action=str(decision.get("action", "")),
+        repair_unit=str(decision.get("repair_unit", "")),
+        target_region=str(decision.get("target_region", "")),
+        reason=str(decision.get("reason", "")),
+        hard_guard_applied=bool(decision.get("hard_guard_applied", False)),
+        hard_guard_reason=str(decision.get("hard_guard_reason", "")),
+        compile_health_summary={
+            "healthy": bool(compile_health.get("healthy", True)),
+            "import_resolves": bool(compile_health.get("import_resolves", True)),
+            "olean_available": bool(compile_health.get("olean_available", True)),
+            "verify_backend_healthy": bool(compile_health.get("verify_backend_healthy", True)),
+            "verify_backend_used": str(compile_health.get("verify_backend_used", "")),
+            "verify_backend_reason": str(compile_health.get("verify_backend_reason", "")),
+        },
+    )
+
+
 def _agent8_run_agent3(
     target_file: str,
     agent2_plan: str,
@@ -399,8 +713,6 @@ def _agent8_run_agent3(
     error_subtype: str = "",
     repair_unit: str = _REPAIR_UNIT_LOCAL_PATCH,
     target_region: str = "",
-    target_decl_name: str = "",
-    active_target: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Dispatch Agent3 through the Agent3 search kernel.
 
@@ -408,10 +720,9 @@ def _agent8_run_agent3(
     """
     from orchestrator.phase3_agent3 import run_agent3_search_kernel
 
+    _ = allowed_edit_lines
     max_turns = max_turns or int(RETRY_LIMITS.get("AGENT8_AGENT3_MAX_TURNS", 15))
     if repair_unit == _REPAIR_UNIT_BLOCK_RESTRUCTURE and not transactional_mode:
-        transactional_mode = True
-        patch_guard_mode = True
         max_turns = min(
             max_turns,
             int(RETRY_LIMITS.get("AGENT8_AGENT3_SAMPLE_MAX_TURNS_PER_CANDIDATE", 8)),
@@ -420,7 +731,7 @@ def _agent8_run_agent3(
         target_file,
         agent2_plan,
         targeted_prompt,
-        allowed_edit_lines,
+        None,
         max_turns=max_turns,
         compile_first_mode=compile_first_mode,
         patch_guard_mode=patch_guard_mode,
@@ -429,8 +740,6 @@ def _agent8_run_agent3(
         error_subtype=error_subtype,
         repair_unit=repair_unit,
         target_region=target_region,
-        target_decl_name=target_decl_name,
-        active_target=active_target,
         run_single_candidate=_agent8_run_agent3_single,
     )
 
@@ -581,7 +890,7 @@ def run_agent8_loop(
     best_checkpoint: dict | None = None,
     agent9_plan: dict | None = None,
 ) -> tuple[bool, str, str]:
-    """Run deterministic Agent8 routing until success or exhaustion."""
+    """Run Agent8 routing until success or exhaustion."""
     from orchestrator.tools import run_lean_verify
 
     _ = agent2
@@ -595,7 +904,7 @@ def run_agent8_loop(
     if best_checkpoint and isinstance(best_checkpoint, dict):
         current_errors = _coerce_errors_text(best_checkpoint.get("errors", current_errors))
 
-    console.rule("[bold magenta]Agent8 Decision Hub — Deterministic Router")
+    console.rule("[bold magenta]Agent8 Decision Hub — LLM Router")
     console.print(f"  Target: {target_file} | Max steps: {max_steps}")
 
     for tick in range(1, max_steps + 1):
@@ -603,6 +912,20 @@ def run_agent8_loop(
         fresh_errors = _coerce_errors_text(fresh.get("errors", current_errors))
         fresh["errors"] = fresh_errors
         current_errors = fresh_errors
+        compile_health = check_compile_health(fresh, target_file=target_file)
+        if not compile_health.get("healthy", True):
+            health_registry = ToolRegistry()
+            health_registry.register_default_tools()
+            recovery = recover_compile_health(
+                target_file,
+                registry=health_registry,
+                verify_result=fresh,
+            )
+            fresh = dict(recovery.get("verify_result", fresh))
+            fresh_errors = _coerce_errors_text(fresh.get("errors", current_errors))
+            fresh["errors"] = fresh_errors
+            current_errors = fresh_errors
+            compile_health = dict(recovery.get("health", compile_health))
 
         fresh_ok, fresh_repo_errors = _require_repo_clean_for_success(target_file, fresh)
         if fresh_ok:
@@ -611,14 +934,33 @@ def run_agent8_loop(
             fresh["errors"] = fresh_repo_errors
             current_errors = fresh_repo_errors
 
-        subtype = _classify_error_subtype(
-            current_errors,
-            target_file,
-            decision_history=decision_history,
-        )
+        subtype = _classify_error_subtype(current_errors, target_file, decision_history=decision_history)
         canonical_sig = _canonical_error_signature(current_errors)
-        action, repair_unit, reason = _route_for_subtype(subtype, decision_history, canonical_sig)
         target_region = _target_region_from_errors(current_errors)
+        decision = _run_agent8_llm_router(
+            target_file=target_file,
+            errors_text=current_errors,
+            current_plan=current_plan_text,
+            decision_history=decision_history,
+            agent9_plan=current_plan_dict,
+            compile_health=compile_health,
+        )
+        decision = _apply_agent8_hard_guards(
+            decision,
+            target_file=target_file,
+            errors_text=current_errors,
+            compile_health=compile_health,
+        )
+        _log_agent8_decision(
+            tick=tick,
+            target_file=target_file,
+            decision=decision,
+            compile_health=compile_health,
+        )
+        action = str(decision.get("action", "agent3_tactical"))
+        repair_unit = str(decision.get("repair_unit", _REPAIR_UNIT_LOCAL_PATCH))
+        reason = str(decision.get("reason", ""))
+        subtype = str(decision.get("error_subtype", subtype))
 
         console.print(
             f"  [Agent8] tick={tick} action={action} subtype={subtype} "
@@ -642,10 +984,7 @@ def run_agent8_loop(
             return False, current_plan_text, current_errors
 
         if action == "agent7_signature":
-            a7_prompt = (
-                f"[deterministic route] {reason}\n"
-                f"Current errors:\n{current_errors[:2000]}"
-            )
+            a7_prompt = _resolve_decision_prompt(decision, "agent7_targeted_prompt", reason) or reason
             a7_plan, _raw = _agent8_run_agent7(target_file, current_errors, a7_prompt)
             _execute_agent7_direct_apply(target_file, a7_plan)
             result = dict(run_lean_verify(target_file))
@@ -665,8 +1004,9 @@ def run_agent8_loop(
             theorem_hint = ""
             if isinstance(current_plan_dict, dict):
                 theorem_hint = _build_agent9_theorem_context(current_plan_dict, algo_name)
+            prompt = _resolve_decision_prompt(decision, "targeted_prompt", reason)
             prompt = (
-                f"[deterministic route] {reason}\n"
+                f"{prompt}\n"
                 f"Error subtype: {subtype}\n"
                 f"Target region: {target_region}\n"
                 + theorem_hint
@@ -675,11 +1015,13 @@ def run_agent8_loop(
                 target_file,
                 current_plan_text,
                 prompt,
-                None,
+                str(decision.get("allowed_edit_lines") or ""),
                 compile_first_mode=False,
                 transactional_mode=False,
-                patch_guard_mode=False,
-                search_allowed=(repair_unit == _REPAIR_UNIT_BLOCK_RESTRUCTURE),
+                patch_guard_mode=True,
+                # Keep Agent3 kernel default policy (APOLLO parity):
+                # search remains enabled unless transactional mode explicitly disables it.
+                search_allowed=None,
                 error_subtype=subtype,
                 repair_unit=repair_unit,
                 target_region=target_region,
@@ -721,21 +1063,44 @@ def run_agent8_midcheck(
     turns_elapsed: int = 0,
     baseline_errors: str = "",
 ) -> dict[str, Any]:
-    """Return a deterministic soft-gate decision for the Agent3 inner loop."""
+    """Return an LLM-routed soft-gate decision for the Agent3 inner loop."""
     from orchestrator.tools import run_lean_verify
 
     _ = (agent2, agent9_plan, baseline_errors)
     history = decision_history or []
     fresh = dict(run_lean_verify(target_file))
     fresh_errors = _coerce_errors_text(fresh.get("errors", current_errors))
-    subtype = _classify_error_subtype(fresh_errors, target_file, decision_history=history)
-    canonical_sig = _canonical_error_signature(fresh_errors)
-    action, repair_unit, reason = _route_for_subtype(subtype, history, canonical_sig)
-    target_region = _target_region_from_errors(fresh_errors)
-    _, search_reason = _prefer_agent3_search_owner(
-        subtype,
-        no_progress_streak=_no_progress_streak(history, canonical_sig, window=6),
+    compile_health = check_compile_health(fresh, target_file=target_file)
+    decision = _run_agent8_llm_router(
+        target_file=target_file,
+        errors_text=fresh_errors,
+        current_plan=current_plan,
+        decision_history=history,
+        agent9_plan=agent9_plan,
+        compile_health=compile_health,
+        midcheck_mode=True,
+        turns_elapsed=turns_elapsed,
+        baseline_errors=baseline_errors,
     )
+    decision = _apply_agent8_hard_guards(
+        decision,
+        target_file=target_file,
+        errors_text=fresh_errors,
+        compile_health=compile_health,
+    )
+    _log_agent8_decision(
+        tick=max(0, int(turns_elapsed)),
+        target_file=target_file,
+        decision=decision,
+        compile_health=compile_health,
+    )
+    subtype = str(decision.get("error_subtype") or _classify_error_subtype(fresh_errors, target_file, decision_history=history))
+    canonical_sig = _canonical_error_signature(fresh_errors)
+    action = str(decision.get("action", "agent3_tactical"))
+    repair_unit = str(decision.get("repair_unit", _REPAIR_UNIT_LOCAL_PATCH))
+    reason = str(decision.get("reason", ""))
+    target_region = str(decision.get("target_region") or _target_region_from_errors(fresh_errors))
+    _, search_reason = _prefer_agent3_search_owner(subtype, no_progress_streak=_no_progress_streak(history, canonical_sig, window=6))
 
     agent3_execution_mode = (
         "search"
@@ -744,24 +1109,26 @@ def run_agent8_midcheck(
     )
 
     return {
+        **decision,
         "action": action,
-        "priority_level": "P1" if action != "agent3_tactical" else "P4",
+        "priority_level": str(decision.get("priority_level", "P1" if action != "agent3_tactical" else "P4")),
         "reason": reason,
-        "targeted_prompt": (
-            f"[midcheck turn {turns_elapsed}] {reason}\n"
-            f"Current errors:\n{fresh_errors[:2000]}\n"
+        "targeted_prompt": _resolve_decision_prompt(
+            decision,
+            "targeted_prompt",
+            f"[midcheck turn {turns_elapsed}] {reason}\nCurrent errors:\n{fresh_errors[:2000]}\n",
         ),
         "error_signature": _extract_error_signature(fresh_errors),
         "canonical_error_signature": canonical_sig,
-        "hypothesis": reason,
-        "confidence": 1.0,
-        "counterfactual": "deterministic router replaces Agent8 self-LLM arbitration",
+        "hypothesis": str(decision.get("hypothesis", reason)),
+        "confidence": float(decision.get("confidence", 1.0)),
+        "counterfactual": str(decision.get("counterfactual", "LLM router selected the current best route.")),
         "error_subtype": subtype,
         "repair_unit": repair_unit,
         "target_region": target_region,
         "agent3_execution_mode": agent3_execution_mode,
-        "agent7_targeted_prompt": f"[midcheck] {reason}",
-        "agent6_targeted_prompt": f"[midcheck] {reason}",
+        "agent7_targeted_prompt": _resolve_decision_prompt(decision, "agent7_targeted_prompt", f"[midcheck] {reason}"),
+        "agent6_targeted_prompt": _resolve_decision_prompt(decision, "agent6_targeted_prompt", f"[midcheck] {reason}"),
         "blocker_status": (
             _BLOCKER_CERTIFIED_STATEMENT_GAP
             if repair_unit == _REPAIR_UNIT_STATEMENT_GAP
@@ -777,8 +1144,8 @@ def run_agent8_midcheck(
             if repair_unit == _REPAIR_UNIT_STATEMENT_GAP
             else {}
         ),
-        "investigation_success": False,
-        "investigation_failures": [],
+        "investigation_success": bool(decision.get("investigation_success", False)),
+        "investigation_failures": list(decision.get("investigation_failures", [])),
         "search_reason": search_reason,
         "current_plan_preview": current_plan[:200] if current_plan else "",
     }

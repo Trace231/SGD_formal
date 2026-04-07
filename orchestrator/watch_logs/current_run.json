@@ -1,0 +1,16 @@
+{
+  "run_id": "20260322_102841_sorry_sample",
+  "session_name": "sample_sorry",
+  "window_name": "20260322_102841_sorry_sample",
+  "tmux_target": "sample_sorry:20260322_102841_sorry_sample",
+  "runner_pane": "%1",
+  "watcher_pane": "%2",
+  "command": "python -m orchestrator.main --algorithm sorry --update-rule w_\\{t+1\\}\\ =\\ w_t\\ -\\ η\\ g_t --proof-sketch Use\\ the\\ existing\\ scaffold --archetype B --target-file Algorithms/sorry.lean --skip-to-agent9 --progress-detail compact",
+  "target_file": "Algorithms/sorry.lean",
+  "start_time": "2026-03-22T18:28:41+08:00",
+  "run_dir": "/root/SGD/SGD_codex/orchestrator/watch_logs/20260322_102841_sorry_sample",
+  "cleanup_log": "/root/SGD/SGD_codex/orchestrator/watch_logs/20260322_102841_sorry_sample/cleanup.json",
+  "runner_log": "/root/SGD/SGD_codex/orchestrator/watch_logs/20260322_102841_sorry_sample/runner.log",
+  "stop_sentinel": "/root/SGD/SGD_codex/orchestrator/watch_logs/20260322_102841_sorry_sample/STOP",
+  "stop_policy": "manual_only"
+}

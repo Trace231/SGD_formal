@@ -1,0 +1,27 @@
+{
+  "rewrite_files": [
+    "docs/CATALOG.md",
+    "docs/GLUE_TRICKS.md",
+    "docs/METHODOLOGY.md"
+  ],
+  "regex_replacements": [
+    {
+      "path": "docs/APOLLO_ABLATION_GUIDE.md",
+      "count": 0
+    },
+    {
+      "path": "docs/APOLLO_ABLATION_GUIDE.md",
+      "count": 0
+    },
+    {
+      "path": "docs/APOLLO_ABLATION_GUIDE.md",
+      "count": 0
+    },
+    {
+      "path": "docs/APOLLO_ABLATION_GUIDE.md",
+      "count": 0
+    }
+  ],
+  "deleted_files": [],
+  "missing_files": []
+}

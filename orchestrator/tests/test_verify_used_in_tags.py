@@ -45,3 +45,33 @@ def test_check_used_in_tags_flags_structure_without_tag(tmp_path: Path, monkeypa
     )
 
     assert check_used_in_tags([target]) == ["Foo.lean:FooSetup"]
+
+
+def test_extract_new_lemmas_keeps_qualified_def_name(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(verify_mod, "PROJECT_ROOT", tmp_path)
+    target = tmp_path / "Foo.lean"
+    target.write_text(
+        "/-- Used in: `main` (Foo.lean, setup) -/\n"
+        "structure Foo where\n"
+        "  x : Nat\n\n"
+        "def Foo.bar : Nat := 0\n",
+        encoding="utf-8",
+    )
+
+    assert extract_new_lemmas(target) == ["Foo", "Foo.bar"]
+
+
+def test_check_used_in_tags_does_not_collapse_qualified_name(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(verify_mod, "PROJECT_ROOT", tmp_path)
+    target = tmp_path / "Foo.lean"
+    target.write_text(
+        "/-- Setup object.\n"
+        "Used in: `main` (Foo.lean, setup)\n"
+        "-/\n"
+        "structure Foo where\n"
+        "  x : Nat\n\n"
+        "def Foo.bar : Nat := 0\n",
+        encoding="utf-8",
+    )
+
+    assert check_used_in_tags([target]) == ["Foo.lean:Foo.bar"]
