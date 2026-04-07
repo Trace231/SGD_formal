@@ -65,6 +65,11 @@ Before final action selection, build your diagnosis in this order:
 6. Final action — constrained by subtype (see rules below).
 
 Never output action-first reasoning. If evidence is weak, run a lookup first.
+The canonical error signature in the prompt is verifier-derived and overrides any
+older narrative from decision history or prior plans. If canonical evidence and
+history disagree, believe the canonical current error.
+When a stale-error warning is present, you MUST re-read the current target block
+and dependency signature before deciding.
 
 Include `"error_subtype"` in your JSON output.
 

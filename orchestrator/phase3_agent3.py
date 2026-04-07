@@ -1739,36 +1739,43 @@ def phase3_prove(
                 # Patch symbol pre-check: warn Agent3 about unverified identifiers
                 # before applying the patch (P1 - symbol existence gate).
                 if tool_name == "edit_file_patch":
-                    # Runtime trajectory check (P2): warn if Agent3 patches without
-                    # any preceding lookup in this attempt.
+                    _patch_warning = _check_patch_symbols(arguments, registry)
+                    # Hard gate: if a patch introduces unverifiable external symbols,
+                    # Agent3 must perform lookup first even on the first patch turn.
+                    if not _lookup_done_since_last_edit and _patch_warning:
+                        console.print(
+                            f"  [PatchSymbolGate] attempt {attempt} turn {tool_turn + 1} — "
+                            "blocking patch until lookup evidence exists"
+                        )
+                        _gate_msg = (
+                            "## BLOCKED — LOOKUP EVIDENCE REQUIRED BEFORE PATCH\n"
+                            "Your patch introduces external identifiers that are not backed by "
+                            "lookup evidence from this attempt.\n\n"
+                            f"{_patch_warning}\n\n"
+                            "Do NOT patch again yet. First call search_codebase, search_in_file, "
+                            "read_file, or check_lean_expr to verify the exact current API, then "
+                            "re-issue a minimal edit_file_patch."
+                        )
+                        raw_reply = agent3.call(_gate_msg)
+                        token_char_budget += len(_gate_msg) + len(raw_reply)
+                        continue
+
+                    # Runtime trajectory check (kept for pure local/syntax patches):
+                    # if no lookup occurred, remind Agent3 to verify before broader edits.
                     if not _lookup_done_since_last_edit and tool_turn > 0:
                         _patch_without_lookup_count += 1
                         if _patch_without_lookup_count <= 2:
                             _traj_warning = (
                                 "## ⚠ TRAJECTORY VIOLATION — PATCH WITHOUT LOOKUP\n"
-                                "You are about to apply a patch without having called "
-                                "search_codebase, search_in_file, or read_file since the "
-                                "last edit in this attempt.\n\n"
-                                "We STRONGLY RECOMMEND verifying identifiers before patching.\n\n"
-                                "Call search_codebase or search_in_file for the identifiers in "
-                                "your REPLACE block NOW, then re-issue your edit_file_patch.\n\n"
-                                "Exception: if these are Lean built-in tactics (simp, ring, etc.) "
-                                "or local binders, you may ignore this warning."
+                                "You are patching without having called search_codebase, "
+                                "search_in_file, or read_file since the last edit.\n\n"
+                                "This is only acceptable for purely local syntax/binder fixes. "
+                                "If the patch touches any external API, verify it first.\n"
                             )
                             raw_reply = agent3.call(_traj_warning)
                             token_char_budget += len(_traj_warning) + len(raw_reply)
-                            continue  # let Agent3 do a lookup before patching
+                            continue
                     _lookup_done_since_last_edit = False  # reset after edit
-
-                    _patch_warning = _check_patch_symbols(arguments, registry)
-                    if _patch_warning:
-                        console.print(
-                            f"  [PatchSymbolCheck] attempt {attempt} turn {tool_turn + 1} — "
-                            "unverified identifiers detected, feeding back to Agent3"
-                        )
-                        raw_reply = agent3.call(_patch_warning)
-                        token_char_budget += len(_patch_warning) + len(raw_reply)
-                        continue  # let Agent3 self-correct before applying patch
 
                 # Pre-edit snapshot: capture file content before Agent3's patch so
                 # we can rollback if protected content (from DirectApply) is removed.

@@ -107,7 +107,7 @@ APOLLO_PROJECT_PATH = Path(
     os.getenv("APOLLO_PROJECT_PATH", str(PROJECT_ROOT.parent / "APOLLO"))
 )
 APOLLO_REPL_WORKSPACE = Path(
-    os.getenv("APOLLO_REPL_WORKSPACE", str(APOLLO_PROJECT_PATH / "repl"))
+    os.getenv("APOLLO_REPL_WORKSPACE", str(PROJECT_ROOT.parent / "repl428"))
 )
 APOLLO_LAKE_PATH = os.getenv(
     "APOLLO_LAKE_PATH",
@@ -357,9 +357,9 @@ RETRY_LIMITS: dict[str, int] = {
     # a distilled plan summary (math plan + best checkpoint + failed approaches blacklist).
     "AGENT2_CONTEXT_EVICT_EVERY_N": 4,
     # Agent8 Decision Hub: maximum decision ticks before escalating to Agent5.
-    "AGENT8_MAX_STEPS": 15,
+    "AGENT8_MAX_STEPS": 25,
     # Agent8: maximum Agent3 tool turns per dispatch (simplified loop).
-    "AGENT8_AGENT3_MAX_TURNS": 15,
+    "AGENT8_AGENT3_MAX_TURNS": 25,
     # Agent3 APOLLO-aligned sampling/search controls.
     "AGENT8_AGENT3_SAMPLE_CANDIDATES": 3,
     "AGENT8_AGENT3_SAMPLE_MAX_CANDIDATES": 3,

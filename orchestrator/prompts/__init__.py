@@ -721,6 +721,9 @@ Before writing your protocol, for EVERY symbol involved in the error:
 
 This is NON-NEGOTIABLE. Do not guess a signature — verify it with check_lean_expr first.
 The tool is fast (reuses pre-built .olean files). It prevents wrong direct_apply patches.
+Before final JSON, re-check the CURRENT target block and ensure every symbol in
+`mismatch_table` is backed by lookup/check_lean_expr evidence from THIS run.
+If a symbol is not evidenced in this run, do not emit it in the protocol.
 
 Examples of check_lean_expr usage:
   check_lean_expr("integral_nonneg")

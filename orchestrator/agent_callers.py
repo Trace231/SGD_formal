@@ -18,6 +18,67 @@ from orchestrator.error_classifier import _json_candidates
 
 console = Console()
 
+
+def _agent7_symbol_evidence_ok(
+    symbol: str,
+    lookup_rounds: list[dict],
+) -> bool:
+    """Return True when Agent7 produced concrete lookup evidence for ``symbol``."""
+    sym = str(symbol or "").strip()
+    if not sym:
+        return True
+    for item in lookup_rounds:
+        try:
+            blob = json.dumps(item, ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            blob = str(item)
+        if sym in blob:
+            return True
+        leaf = sym.split(".")[-1]
+        if leaf and leaf != sym and leaf in blob:
+            return True
+    return False
+
+
+def _validate_agent7_protocol(
+    obj: dict,
+    lookup_rounds: list[dict],
+) -> str | None:
+    """Runtime hard gate for Agent7 final protocol."""
+    if not lookup_rounds:
+        return (
+            "Agent7 must perform at least one lookup/check_lean_expr round before "
+            "returning final JSON."
+        )
+
+    _tool_names = {
+        str(item.get("tool", ""))
+        for item in lookup_rounds
+        if isinstance(item, dict)
+    }
+    if not (_tool_names & {"check_lean_expr", "search_codebase", "search_in_file", "read_file"}):
+        return "Agent7 final JSON has no valid lookup evidence."
+
+    mismatch_table = obj.get("mismatch_table")
+    if isinstance(mismatch_table, list):
+        missing_symbols = []
+        for row in mismatch_table:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol", "")).strip()
+            if symbol and not _agent7_symbol_evidence_ok(symbol, lookup_rounds):
+                missing_symbols.append(symbol)
+        if missing_symbols:
+            return (
+                "Missing concrete lookup/check_lean_expr evidence for symbols: "
+                + ", ".join(missing_symbols[:6])
+            )
+
+    ordered_steps = obj.get("ordered_steps")
+    if not isinstance(ordered_steps, list) or not ordered_steps:
+        return "Agent7 final JSON must contain non-empty ordered_steps."
+    return None
+
 def _call_agent2_with_tools(
     agent2: "Agent",
     registry: "ToolRegistry",
@@ -127,6 +188,7 @@ def _call_agent7_with_tools(
 ) -> tuple[dict | None, str]:
     """Call Agent7 with read-only lookup support and parse strict JSON protocol."""
     reply = agent7.call(user_msg)
+    _lookup_rounds: list[dict] = []
     for _ in range(max_tool_rounds):
         payload = None
         try:
@@ -151,7 +213,9 @@ def _call_agent7_with_tools(
                 result = registry.call(tool_name, **args)
             except Exception as exc:  # noqa: BLE001
                 result = {"error": str(exc)}
-            results.append({"tool": tool_name, "arguments": args, "result": result})
+            result_entry = {"tool": tool_name, "arguments": args, "result": result}
+            results.append(result_entry)
+            _lookup_rounds.append(result_entry)
         results_text = json.dumps(results, indent=2, ensure_ascii=False)
         reply = agent7.call(
             "Lookup results:\n"
@@ -159,17 +223,61 @@ def _call_agent7_with_tools(
             + "\n\nReturn the final strict JSON protocol now (no prose)."
         )
 
-    for candidate in _json_candidates(reply.strip()):
-        try:
-            obj = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if (
-            isinstance(obj, dict)
-            and isinstance(obj.get("ordered_steps"), list)
-            and obj.get("root_cause")
-        ):
-            return obj, reply
+    for _retry in range(3):
+        for candidate in _json_candidates(reply.strip()):
+            try:
+                obj = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(obj, dict)
+                and isinstance(obj.get("ordered_steps"), list)
+                and obj.get("root_cause")
+            ):
+                _validation_error = _validate_agent7_protocol(obj, _lookup_rounds)
+                if _validation_error is None:
+                    return obj, reply
+                reply = agent7.call(
+                    "Runtime validation failed for your final JSON.\n"
+                    f"Reason: {_validation_error}\n\n"
+                    "Issue the missing lookup/check_lean_expr requests first, then return "
+                    "the final strict JSON protocol again. No prose."
+                )
+                for _ in range(max_tool_rounds):
+                    try:
+                        _payload = json.loads(reply)
+                    except (json.JSONDecodeError, ValueError):
+                        _payload = None
+                    _is_lookup = (
+                        isinstance(_payload, dict)
+                        and _payload.get("type") == "lookup"
+                        and isinstance(_payload.get("tool_calls"), list)
+                        and len(_payload["tool_calls"]) > 0
+                    )
+                    if not _is_lookup:
+                        break
+                    _results: list[dict] = []
+                    for _tc in _payload["tool_calls"]:
+                        if not isinstance(_tc, dict):
+                            continue
+                        _tool_name = _tc.get("tool", "")
+                        _args = _tc.get("arguments", {}) if isinstance(_tc.get("arguments"), dict) else {}
+                        try:
+                            _result = registry.call(_tool_name, **_args)
+                        except Exception as exc:  # noqa: BLE001
+                            _result = {"error": str(exc)}
+                        _entry = {"tool": _tool_name, "arguments": _args, "result": _result}
+                        _results.append(_entry)
+                        _lookup_rounds.append(_entry)
+                    _results_text = json.dumps(_results, indent=2, ensure_ascii=False)
+                    reply = agent7.call(
+                        "Lookup results:\n"
+                        + _results_text
+                        + "\n\nReturn the final strict JSON protocol now (no prose)."
+                    )
+                break
+        else:
+            break
     return None, reply
 
 

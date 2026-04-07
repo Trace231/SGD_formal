@@ -44,11 +44,17 @@ from orchestrator.config import (
     RETRY_LIMITS,
 )
 from orchestrator.context_builders import (
+    _build_stale_error_hint,
     _build_escalation_file_context,
     _extract_imported_algo_sigs,
+    _prioritize_error_text,
     _prequery_dependency_signatures,
 )
-from orchestrator.error_classifier import _extract_first_error_line, _json_candidates
+from orchestrator.error_classifier import (
+    _extract_first_error_line,
+    _json_candidates,
+    _parse_lean_errors,
+)
 from orchestrator.file_io import load_file, snapshot_file
 
 console = Console()
@@ -76,6 +82,23 @@ def _extract_error_signature(errors_text: str) -> str:
         if len(line) > 10:
             return line[:60]
     return errors_text.strip()[:60]
+
+
+def _canonical_error_signature(errors_text: str) -> str:
+    """Stable verifier-derived primary error signature."""
+    if not errors_text:
+        return ""
+    for line in errors_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("--"):
+            continue
+        m = re.match(r"(.*?):(\d+):(\d+):\s*(?:error:\s*)?(.*)", line)
+        if m:
+            file_part = Path(m.group(1)).name
+            msg = re.sub(r"\s+", " ", m.group(4).strip()).lower()
+            return f"{file_part}:{m.group(2)}:{msg[:160]}"
+        return re.sub(r"\s+", " ", line).lower()[:160]
+    return re.sub(r"\s+", " ", errors_text.strip()).lower()[:160]
 
 
 def _is_structural_error(error_signature: str, errors_text: str) -> bool:
@@ -661,6 +684,9 @@ def _build_agent8_tick_context(
     pending_lemma_status: dict | None = None,
     baseline_errors: str = "",
     error_subtype: str = "",
+    canonical_error_signature: str = "",
+    stale_error_hint: str = "",
+    reset_hypothesis_bias: bool = False,
 ) -> str:
     """Build a minimal, non-truncated diagnostic prompt for Agent8.
 
@@ -873,19 +899,42 @@ def _build_agent8_tick_context(
             "This is a heuristic signal — override with compile evidence if conflicting.\n\n"
         )
 
+    _canonical_block = ""
+    if canonical_error_signature:
+        _canonical_block = (
+            "## Canonical Current Error (verifier-derived)\n"
+            f"`{canonical_error_signature}`\n"
+            "Treat this as the source of truth for routing and anti-loop logic.\n\n"
+        )
+
+    _reset_block = ""
+    if reset_hypothesis_bias:
+        _reset_block = (
+            "## Hypothesis Reset\n"
+            "The canonical primary error changed across recent ticks. Discard stale root-cause "
+            "stories and re-diagnose from the current verifier output only.\n\n"
+        )
+
+    _stale_block = ""
+    if stale_error_hint:
+        _stale_block = f"{stale_error_hint}\n"
+
     return (
         f"{_midcheck_banner}"
         f"{_new_plan_banner}"
+        f"{_reset_block}"
         "## Current Algorithm File (smart-truncated around error lines)\n"
         f"File: {target_file}\n"
         f"```lean\n{algo_display}\n```\n\n"
         f"{_baseline_block}"
         f"```\n{errors_text[:_err_chars]}\n```\n\n"
+        f"{_canonical_block}"
         f"## Proof Plan (current)\n{agent2_plan[:_plan_chars]}\n\n"
         f"## Library Files Available\n{lib_desc}\n\n"
         f"{_a9_block}"
         f"{_subtype_block}"
         f"{_api_shape_block}"
+        f"{_stale_block}"
         f"{_pending_lemma_block}"
         f"## Decision History (recent)\n{history_block}\n\n"
         f"{dep_sigs}"
@@ -1809,6 +1858,7 @@ def run_agent8_loop(
     decision_history: list[dict] = []
     current_plan = agent2_plan
     current_errors = last_errors
+    _baseline_errors = last_errors
     _consecutive_parse_failures = 0
     _consecutive_same_error: int = 0
     _last_error_sig: str = ""
@@ -1878,6 +1928,23 @@ def run_agent8_loop(
         _compile_first_mode = (_fresh_exit != 0 and _fresh_sorry == 0)
         # Always use fresh verifier output as the source of truth.
         current_errors = _fresh_errors
+        _current_structured_errors = _parse_lean_errors(current_errors)
+        _current_error_line = _extract_first_error_line(current_errors)
+        _prioritized_current_errors = _prioritize_error_text(
+            _current_structured_errors,
+            current_errors,
+            _current_error_line,
+            target_file,
+        )
+        _baseline_structured_errors = _parse_lean_errors(_baseline_errors)
+        _baseline_error_line = _extract_first_error_line(_baseline_errors)
+        _prioritized_baseline_errors = _prioritize_error_text(
+            _baseline_structured_errors,
+            _baseline_errors,
+            _baseline_error_line,
+            target_file,
+        )
+        _canonical_sig = _canonical_error_signature(current_errors)
         _current_sorry_count = _fresh_sorry
 
         # Classify error subtype before building context so it can be injected.
@@ -1898,12 +1965,46 @@ def run_agent8_loop(
             )
 
         # 1. Build context
+        _recent_canonicals = [
+            str(e.get("canonical_error_signature", "")).strip()
+            for e in decision_history[-2:]
+            if str(e.get("canonical_error_signature", "")).strip()
+        ]
+        _reset_hypothesis_bias = (
+            len(_recent_canonicals) == 2
+            and _recent_canonicals[0] != _recent_canonicals[1]
+            and _recent_canonicals[1] != _canonical_sig
+        )
+        _same_sig_streak = 1
+        for _entry in reversed(decision_history):
+            if str(_entry.get("canonical_error_signature", "")) == _canonical_sig:
+                _same_sig_streak += 1
+            else:
+                break
+        _stale_hint = ""
+        if _same_sig_streak >= 3:
+            try:
+                _ctx_registry = ToolRegistry()
+                _ctx_registry.register_readonly_tools()
+                _stale_hint = _build_stale_error_hint(
+                    _ctx_registry,
+                    target_file,
+                    current_errors,
+                    _current_error_line,
+                    _same_sig_streak,
+                )
+            except Exception:  # noqa: BLE001
+                _stale_hint = ""
         ctx = _build_agent8_tick_context(
-            target_file, current_errors, current_plan, decision_history,
+            target_file, _prioritized_current_errors, current_plan, decision_history,
             agent9_plan=agent9_plan,
             plan_updated_tick=_plan_updated_tick,
             pending_lemma_status=_pending_lemma_status,
+            baseline_errors=_prioritized_baseline_errors,
             error_subtype=_error_subtype,
+            canonical_error_signature=_canonical_sig,
+            stale_error_hint=_stale_hint,
+            reset_hypothesis_bias=_reset_hypothesis_bias,
         )
         if _force_lookup_next_tick:
             ctx += (
@@ -1969,11 +2070,11 @@ def run_agent8_loop(
                     "priority_level": "P2",
                     "reason": "Agent8 JSON parse failures — falling back to replan",
                     "targeted_prompt": "Revise the proof strategy.",
-                    "error_signature": _extract_error_signature(current_errors),
+                    "error_signature": _canonical_sig,
                     "hypothesis": "Current decision protocol output is malformed; regenerate a fresh structured plan.",
                     "evidence": [
                         {"source": "agent8_parse", "snippet": _parse_error},
-                        {"source": "lean_verify", "snippet": _extract_error_signature(current_errors)},
+                        {"source": "lean_verify", "snippet": _canonical_sig},
                     ],
                     "confidence": 0.4,
                     "counterfactual": "Do not keep local tactical loop when decision JSON is repeatedly invalid.",
@@ -1993,9 +2094,11 @@ def run_agent8_loop(
                 if decision is None:
                     continue
         _consecutive_parse_failures = 0
+        decision["error_signature"] = _canonical_sig
+        decision["canonical_error_signature"] = _canonical_sig
 
         if _is_structural_error(
-            decision.get("error_signature", ""),
+            _canonical_sig,
             current_errors,
         ) and _investigation_rounds_this_tick == 0:
             console.print(
@@ -2042,15 +2145,15 @@ def run_agent8_loop(
             decision2, parse_err2 = _parse_agent8_decision(raw_reply)
             if decision2 is not None:
                 decision = decision2
+                decision["error_signature"] = _canonical_sig
+                decision["canonical_error_signature"] = _canonical_sig
             else:
                 console.print(f"  [Agent8] Mandatory lookup re-parse failed: {parse_err2}")
         if _investigation_rounds_this_tick > 0:
             _force_lookup_next_tick = False
 
         action = decision.get("action", "agent3_tactical")
-        error_sig = decision.get(
-            "error_signature", _extract_error_signature(current_errors)
-        )
+        error_sig = _canonical_sig
         targeted_prompt = decision.get("targeted_prompt", "")
         hypothesis = str(decision.get("hypothesis", "")).strip()
         evidence = _normalize_evidence(decision.get("evidence"))
@@ -2747,6 +2850,7 @@ def run_agent8_loop(
             "action": action,
             "target_theorem": decision.get("target_theorem"),
             "error_signature": error_sig,
+            "canonical_error_signature": _canonical_sig,
             "hypothesis": hypothesis,
             "evidence_hash": _evidence_hash(evidence),
             "error_subtype": _error_subtype,
@@ -2859,11 +2963,32 @@ def run_agent8_midcheck(
     """
     algo_name = Path(target_file).stem
     _decision_history: list[dict] = decision_history or []
+    from orchestrator.tools import run_lean_verify as _midcheck_verify
 
     console.print(
         f"\n[bold magenta][Agent8 MidCheck] Soft-gate at turn {turns_elapsed} "
         f"for {algo_name}"
     )
+
+    _fresh = _midcheck_verify(target_file)
+    current_errors = _coerce_errors_text(_fresh.get("errors", current_errors))
+    _structured_errors = _parse_lean_errors(current_errors)
+    _current_error_line = _extract_first_error_line(current_errors)
+    _prioritized_current_errors = _prioritize_error_text(
+        _structured_errors,
+        current_errors,
+        _current_error_line,
+        target_file,
+    )
+    _baseline_structured_errors = _parse_lean_errors(baseline_errors)
+    _baseline_error_line = _extract_first_error_line(baseline_errors)
+    _prioritized_baseline_errors = _prioritize_error_text(
+        _baseline_structured_errors,
+        baseline_errors,
+        _baseline_error_line,
+        target_file,
+    )
+    _canonical_sig = _canonical_error_signature(current_errors)
 
     # Classify error subtype for mid-check (same logic as main loop).
     _mc_error_subtype = _classify_error_subtype(
@@ -2873,17 +2998,39 @@ def run_agent8_midcheck(
     console.print(f"  [Agent8 MidCheck] error_subtype={_mc_error_subtype}")
 
     # Build context — reuse existing helper, no plan-update banner needed here.
+    _same_sig_streak = 1
+    for _entry in reversed(_decision_history):
+        if str(_entry.get("canonical_error_signature", "")) == _canonical_sig:
+            _same_sig_streak += 1
+        else:
+            break
+    _stale_hint = ""
+    if _same_sig_streak >= 3:
+        try:
+            _ctx_registry = ToolRegistry()
+            _ctx_registry.register_readonly_tools()
+            _stale_hint = _build_stale_error_hint(
+                _ctx_registry,
+                target_file,
+                current_errors,
+                _current_error_line,
+                _same_sig_streak,
+            )
+        except Exception:  # noqa: BLE001
+            _stale_hint = ""
     ctx = _build_agent8_tick_context(
         target_file,
-        current_errors,
+        _prioritized_current_errors,
         current_plan,
         _decision_history,
         agent9_plan=agent9_plan,
         plan_updated_tick=0,
         midcheck_mode=True,
         midcheck_turns_elapsed=turns_elapsed,
-        baseline_errors=baseline_errors,
+        baseline_errors=_prioritized_baseline_errors,
         error_subtype=_mc_error_subtype,
+        canonical_error_signature=_canonical_sig,
+        stale_error_hint=_stale_hint,
     )
 
     # Call Agent8 (single round, reduced investigation budget for speed).
@@ -2946,12 +3093,12 @@ def run_agent8_midcheck(
             "action": "agent3_tactical",
             "reason": "Mid-check parse failure — letting Agent3 continue",
             "targeted_prompt": "",
-            "error_signature": _extract_error_signature(current_errors),
+            "error_signature": _canonical_sig,
             "priority_level": "P3",
             "hypothesis": "Keep local tactical iteration when mid-check response is malformed.",
             "evidence": [
                 {"source": "midcheck", "snippet": "decision parse failed"},
-                {"source": "lean_verify", "snippet": _extract_error_signature(current_errors)},
+                {"source": "lean_verify", "snippet": _canonical_sig},
             ],
             "confidence": 0.2,
             "counterfactual": "Do not escalate based on malformed routing response.",
@@ -3011,6 +3158,8 @@ def run_agent8_midcheck(
     if _mc_hard_reason:
         console.print(f"  [HardRouteGate/MidCheck] {action} ← {_mc_hard_reason}")
         decision["action"] = action
+    decision["error_signature"] = _canonical_sig
+    decision["canonical_error_signature"] = _canonical_sig
 
     _prev_errors = (
         str(_decision_history[-1].get("errors_after", ""))

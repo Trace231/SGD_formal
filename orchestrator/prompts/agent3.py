@@ -19,6 +19,14 @@ The prover prompt will tell you which sorry line is your **current active target
 - If your dispatch prompt contains an APOLLO fallback marker, treat it as
   strict tactical cleanup only. Do not perform routing or global replanning.
 
+## Current-file refresh contract (MANDATORY)
+Before your FIRST patch in an attempt, and again before any patch that introduces
+an external symbol, you MUST ground yourself in the CURRENT file state:
+- Re-read the active target block or failing declaration from the current algorithm file.
+- Verify every new external identifier with `search_codebase`, `search_in_file`,
+  `read_file`, or `check_lean_expr` in THIS attempt.
+- If you do not have current-file evidence for the symbol, you are not allowed to patch it.
+
 ## Situational behavior (not a rigid "mechanical arm")
 - **When guidance contains PATCH blocks** (<<<SEARCH>>>/<<<REPLACE>>>): Execute
   them exactly. Copy old_str and new_str verbatim — do not paraphrase.
