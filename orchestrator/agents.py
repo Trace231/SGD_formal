@@ -9,16 +9,13 @@ from rich.console import Console
 from rich.panel import Panel
 
 from orchestrator.config import (
-    AGENT3_MINIMAL_CONTEXT,
-    AGENT9_MINIMAL_CONTEXT,
     AGENT_CONFIGS,
     MAX_TOKENS,
     RETRY_LIMITS,
-    should_use_codex_backend,
 )
 from orchestrator.file_io import generate_project_manifest, load_files
 from orchestrator.prompts import AGENT_FILES, SYSTEM_PROMPTS
-from orchestrator.providers import call_llm, call_llm_qwen_sdk_with_retry, call_llm_sdk_with_retry
+from orchestrator.providers import call_llm
 
 console = Console()
 
@@ -149,170 +146,13 @@ class ToolRegistry:
 
 
 # ---------------------------------------------------------------------------
-# Agent backends
-# ---------------------------------------------------------------------------
-
-
-class AgentBackend:
-    """Backend strategy used by Agent.call()."""
-
-    name = "base"
-
-    def call(self, agent: "Agent", *, system: str, messages: list[dict[str, str]], max_tokens: int) -> str:
-        raise NotImplementedError
-
-
-class HttpAgentBackend(AgentBackend):
-    """Existing HTTP-style provider backend."""
-
-    name = "http"
-
-    def call(self, agent: "Agent", *, system: str, messages: list[dict[str, str]], max_tokens: int) -> str:
-        agent.llm_transport = "api"
-        agent.sdk_model = ""
-        return call_llm(
-            provider=agent.provider,
-            model=agent.model,
-            system=system,
-            messages=messages,
-            max_tokens=max_tokens,
-        )
-
-
-class CodexAgentBackend(HttpAgentBackend):
-    """Codex-oriented backend shim (provider-compatible, stateful messages)."""
-
-    name = "codex"
-
-    _CODEX_HINT = (
-        "[CODEX RUNTIME MODE]\n"
-        "Use concise reasoning, prefer tool-based verification loops, and return strictly "
-        "structured outputs when schema is requested.\n\n"
-    )
-
-    def call(self, agent: "Agent", *, system: str, messages: list[dict[str, str]], max_tokens: int) -> str:
-        from orchestrator import config as runtime_config
-
-        codex_system = self._CODEX_HINT + system
-        transport = str(getattr(runtime_config, "CODEX_TRANSPORT", "sdk")).strip().lower()
-        sdk_key = str(runtime_config.API_KEYS.get("openai", "")).strip()
-
-        # Explicitly requested legacy API transport.
-        if transport == "api":
-            return super().call(agent, system=codex_system, messages=messages, max_tokens=max_tokens)
-
-        # Qwen provider uses SDK chat-completions transport (no OPENAI_API_KEY required).
-        if str(agent.provider).strip().lower() == "qwen":
-            try:
-                reply = call_llm_qwen_sdk_with_retry(
-                    model=agent.model,
-                    system=codex_system,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    timeout=getattr(runtime_config, "CODEX_SDK_TIMEOUT", 120),
-                )
-                agent.llm_transport = "sdk-chat"
-                agent.sdk_model = agent.model
-                agent.degraded_to_api = False
-                agent.degrade_reason = ""
-                return reply
-            except Exception as exc:
-                agent.degraded_to_api = True
-                cause = getattr(exc, "__cause__", None)
-                if cause is not None:
-                    agent.degrade_reason = (
-                        f"sdk_qwen_error:{type(exc).__name__}:{exc};cause={type(cause).__name__}:{cause}"
-                    )
-                else:
-                    agent.degrade_reason = f"sdk_qwen_error:{type(exc).__name__}:{exc}"
-                if not getattr(runtime_config, "CODEX_SDK_FALLBACK_TO_API", True):
-                    raise
-                return super().call(agent, system=codex_system, messages=messages, max_tokens=max_tokens)
-
-        # Non-Qwen SDK path requires OPENAI_API_KEY.
-        if not sdk_key:
-            agent.degraded_to_api = True
-            agent.degrade_reason = "missing_openai_api_key"
-            if not getattr(runtime_config, "CODEX_SDK_FALLBACK_TO_API", True):
-                raise RuntimeError("OPENAI_API_KEY missing and fallback disabled")
-            return super().call(agent, system=codex_system, messages=messages, max_tokens=max_tokens)
-
-        sdk_model = str(getattr(runtime_config, "CODEX_SDK_MODEL", "gpt-5-codex") or "gpt-5-codex")
-        try:
-            reply = call_llm_sdk_with_retry(
-                model=sdk_model,
-                system=codex_system,
-                messages=messages,
-                max_tokens=max_tokens,
-                timeout=getattr(runtime_config, "CODEX_SDK_TIMEOUT", 120),
-            )
-            agent.llm_transport = "sdk"
-            agent.sdk_model = sdk_model
-            agent.degraded_to_api = False
-            agent.degrade_reason = ""
-            return reply
-        except Exception as exc:
-            agent.degraded_to_api = True
-            cause = getattr(exc, "__cause__", None)
-            if cause is not None:
-                agent.degrade_reason = (
-                    f"sdk_error:{type(exc).__name__}:{exc};cause={type(cause).__name__}:{cause}"
-                )
-            else:
-                agent.degrade_reason = f"sdk_error:{type(exc).__name__}:{exc}"
-            if not getattr(runtime_config, "CODEX_SDK_FALLBACK_TO_API", True):
-                raise
-            return super().call(agent, system=codex_system, messages=messages, max_tokens=max_tokens)
-
-
-def _resolve_runtime(role: str, runtime_hint: str | None) -> str:
-    if runtime_hint:
-        hint = str(runtime_hint).strip().lower()
-        if hint in {"http", "codex"}:
-            return hint
-    return "codex" if should_use_codex_backend(role) else "http"
-
-
-def _build_backend(runtime: str) -> AgentBackend:
-    if runtime == "codex":
-        return CodexAgentBackend()
-    return HttpAgentBackend()
-
-
-def _role_prefers_minimal_context(role: str) -> bool:
-    if role == "sorry_closer":
-        return bool(AGENT3_MINIMAL_CONTEXT)
-    if role == "strategy_planner":
-        return bool(AGENT9_MINIMAL_CONTEXT)
-    return False
-
-
-def _build_extra_file_context(role: str, extra_files: list[str] | None) -> tuple[str, str]:
-    if not extra_files:
-        return "", "full"
-    if not _role_prefers_minimal_context(role):
-        return load_files(extra_files), "full"
-
-    from orchestrator.context_builders import _build_escalation_file_context
-
-    blocks: list[str] = []
-    for path in extra_files:
-        try:
-            snippet = _build_escalation_file_context(str(path), None)
-        except Exception:
-            snippet = "(file missing or unreadable)"
-        blocks.append(f'<file path="{path}">\n{snippet}\n</file>')
-    return "\n\n".join(blocks), "minimal"
-
-
-# ---------------------------------------------------------------------------
 # Agent class — wraps a role, provider config, and conversation history
 # ---------------------------------------------------------------------------
 
 class Agent:
     """A stateful LLM agent with a fixed role and multi-turn memory."""
 
-    def __init__(self, role: str, extra_files: list[str] | None = None, runtime_hint: str | None = None):
+    def __init__(self, role: str, extra_files: list[str] | None = None):
         cfg = AGENT_CONFIGS[role]
         self.role = role
         self.provider = cfg["provider"]
@@ -320,47 +160,20 @@ class Agent:
         self.max_tokens: int = cfg.get("max_tokens", MAX_TOKENS)
         self.system = SYSTEM_PROMPTS[role]
         self.messages: list[dict[str, str]] = []
-        self.runtime = _resolve_runtime(role, runtime_hint)
-        self._backend = _build_backend(self.runtime)
-        self.backend_name = self._backend.name
-        self.llm_transport = "api"
-        self.sdk_model = ""
-        self.degraded_to_api = False
-        self.degrade_reason = ""
-        self.extra_files = list(extra_files or [])
-        self.active_target_file = self.extra_files[0] if self.extra_files else ""
-        self.context_mode = "full"
 
         files = list(AGENT_FILES.get(role, []))
         use_manifest: bool = cfg.get("use_manifest", False)
-        context_mode = "full"
         if use_manifest:
             # Manifest mode: shared context files are indexed compactly so the
             # agent uses read_file / search_in_file to fetch actual signatures.
             # The target algorithm file (extra_files) is always loaded in full.
             self._file_context = generate_project_manifest(files)
-            extra_ctx, extra_mode = _build_extra_file_context(role, extra_files)
-            if "[FILE NOT FOUND]" in self._file_context:
-                context_mode = "minimal"
-            if extra_ctx:
-                self._file_context += "\n\n" + extra_ctx
-                context_mode = extra_mode if extra_mode == "minimal" else context_mode
+            if extra_files:
+                self._file_context += "\n\n" + load_files(extra_files)
         else:
             if extra_files:
                 files.extend(extra_files)
             self._file_context = load_files(files) if files else ""
-        self.context_mode = context_mode
-        try:
-            from orchestrator.audit_logger import AuditLogger
-
-            AuditLogger.get().log_event(
-                "context_mode",
-                role=role,
-                context_mode=context_mode,
-                manifest_enabled=bool(use_manifest),
-            )
-        except Exception:  # noqa: BLE001
-            pass
 
     def call(self, user_msg: str) -> str:
         """Send *user_msg* (prepended with file context on the first call)
@@ -383,14 +196,10 @@ class Agent:
                 break
             del self.messages[1:3]  # remove oldest (assistant, user) pair
 
-        self.llm_transport = "api"
-        self.sdk_model = ""
-        self.degraded_to_api = False
-        self.degrade_reason = ""
-
         start = time.perf_counter()
-        reply = self._backend.call(
-            self,
+        reply = call_llm(
+            provider=self.provider,
+            model=self.model,
             system=self.system,
             messages=self.messages,
             max_tokens=self.max_tokens,
@@ -406,13 +215,6 @@ class Agent:
                 prompt_full=full_msg,
                 reply_full=reply,
                 elapsed_ms=elapsed_ms,
-                backend=self.backend_name,
-                llm_transport=self.llm_transport,
-                sdk_model=self.sdk_model,
-                degraded_to_api=self.degraded_to_api,
-                degrade_reason=self.degrade_reason,
-                target_file=self.active_target_file,
-                context_mode=self.context_mode,
             )
         except Exception:  # noqa: BLE001
             pass  # audit must not break agent execution

@@ -13,57 +13,6 @@ from orchestrator.config import PROJECT_ROOT
 from orchestrator.file_io import load_file
 
 console = Console()
-_GIT_WARNED = False
-
-
-def _warn_git_unavailable(message: str) -> None:
-    """Emit one warning when git metadata is unavailable for this run."""
-    global _GIT_WARNED
-    if _GIT_WARNED:
-        return
-    _GIT_WARNED = True
-    console.print(f"[yellow][Git] {message} — continuing without git metadata[/yellow]")
-
-
-def _run_git(args: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str] | None:
-    """Run a git command with fail-open behavior for sandbox/CI edge cases."""
-    try:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError:
-        _warn_git_unavailable("git executable not found")
-        if check:
-            raise
-        return None
-
-    if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        if result.returncode == 128:
-            _warn_git_unavailable(
-                f"git {' '.join(args)} failed with code 128 ({stderr or 'repository state unavailable'})"
-            )
-            if check:
-                raise subprocess.CalledProcessError(
-                    result.returncode,
-                    ["git", *args],
-                    output=result.stdout,
-                    stderr=result.stderr,
-                )
-            return None
-        if check:
-            raise subprocess.CalledProcessError(
-                result.returncode,
-                ["git", *args],
-                output=result.stdout,
-                stderr=result.stderr,
-            )
-    return result
-
 
 def _file_hash(path: str | Path) -> str | None:
     """Return MD5 hex-digest of *path*, or None if the file does not exist."""
@@ -76,17 +25,23 @@ def _file_hash(path: str | Path) -> str | None:
 
 def _git_diff_files() -> set[str]:
     """Return tracked files with unstaged/staged modifications."""
-    result = _run_git(["diff", "--name-only"])
-    if result is None:
-        return set()
+    result = subprocess.run(
+        ["git", "diff", "--name-only"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
     return set(result.stdout.splitlines())
 
 
 def _git_untracked_files() -> set[str]:
     """Return untracked files in the repository."""
-    result = _run_git(["ls-files", "--others", "--exclude-standard"])
-    if result is None:
-        return set()
+    result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
     return set(result.stdout.splitlines())
 
 
@@ -113,17 +68,25 @@ class GitRunSnapshot:
 
 def _git_head_sha() -> str:
     """Return current HEAD commit SHA."""
-    result = _run_git(["rev-parse", "HEAD"])
-    if result is None:
-        return "unknown"
-    return result.stdout.strip() or "unknown"
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
 
 
 def _git_is_dirty() -> bool:
     """Return True when tracked or untracked changes are present."""
-    result = _run_git(["status", "--porcelain"])
-    if result is None:
-        return False
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
     return bool(result.stdout.strip())
 
 
@@ -135,19 +98,22 @@ def _capture_git_run_snapshot(run_id: str) -> GitRunSnapshot:
     restore the exact pre-run disk state (including any uncommitted local edits)
     rather than falling back to the last git commit.
     """
-    _ = run_id
     start_sha = _git_head_sha()
 
     # Walk docs/ and any other tracked .md files for a pre-run disk snapshot.
     md_snapshots: dict[str, str] = {}
-    result = _run_git(["ls-files", "--", "*.md"])
-    if result is not None:
-        for rel in result.stdout.splitlines():
-            p = PROJECT_ROOT / rel
-            try:
-                md_snapshots[rel] = p.read_text(encoding="utf-8")
-            except OSError:
-                pass
+    result = subprocess.run(
+        ["git", "ls-files", "--", "*.md"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    for rel in result.stdout.splitlines():
+        p = PROJECT_ROOT / rel
+        try:
+            md_snapshots[rel] = p.read_text(encoding="utf-8")
+        except OSError:
+            pass
 
     return GitRunSnapshot(
         start_sha=start_sha,
@@ -160,7 +126,6 @@ def _capture_git_run_snapshot(run_id: str) -> GitRunSnapshot:
 
 def _restore_snapshot_on_success(snapshot: GitRunSnapshot) -> None:
     """No-op: source and lib files are intentionally left in their run-end state."""
-    _ = snapshot
     return
 
 
@@ -193,15 +158,19 @@ def _rollback_to_snapshot(snapshot: GitRunSnapshot) -> None:
         )
 
     # Remove any *new* untracked .md files the run created (not in snapshot).
-    ls_result = _run_git(["ls-files", "--others", "--exclude-standard"])
-    if ls_result is not None:
-        for fname in ls_result.stdout.splitlines():
-            if fname.endswith(".md") and fname not in snapshots:
-                try:
-                    (PROJECT_ROOT / fname).unlink()
-                    console.print(f"[yellow][Git] Removed new doc file: {fname}")
-                except OSError:
-                    pass
+    ls_result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    for fname in ls_result.stdout.splitlines():
+        if fname.endswith(".md") and fname not in snapshots:
+            try:
+                (PROJECT_ROOT / fname).unlink()
+                console.print(f"[yellow][Git] Removed new doc file: {fname}")
+            except OSError:
+                pass
 
 
 def _get_modified_lean_files(
@@ -280,3 +249,5 @@ def _remove_algorithm_from_lakefile(algorithm: str) -> None:
 
     lakefile.write_text(updated, encoding="utf-8")
     console.print(f"[yellow][lakefile] Removed {module_name} from SGDAlgorithms roots (rollback).")
+
+

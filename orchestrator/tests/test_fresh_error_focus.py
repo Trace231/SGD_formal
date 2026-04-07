@@ -1,8 +1,7 @@
-"""Regression tests for guarded Agent8 fresh-error routing."""
+"""Regression tests for deterministic Agent8 fresh-error routing."""
 
 from __future__ import annotations
 
-import orchestrator.phase3_agent8 as a8
 from orchestrator.phase3_agent8 import _canonical_error_signature, run_agent8_midcheck
 
 
@@ -15,7 +14,6 @@ def test_canonical_error_signature_prefers_verifier_primary_line():
 
 
 def test_midcheck_uses_fresh_verify_over_stale_input(monkeypatch, tmp_path):
-    monkeypatch.setattr(a8, "AGENT8_ROUTER_MODE", "deterministic")
     target = tmp_path / 'Algo.lean'
     target.write_text('import Mathlib\n\ntheorem t : True := by\n  trivial\n', encoding='utf-8')
 
@@ -38,12 +36,11 @@ def test_midcheck_uses_fresh_verify_over_stale_input(monkeypatch, tmp_path):
 
 
 def test_midcheck_routes_declaration_errors_to_agent7(monkeypatch, tmp_path):
-    monkeypatch.setattr(a8, "AGENT8_ROUTER_MODE", "deterministic")
     target = tmp_path / 'Algo.lean'
     target.write_text('import Mathlib\n\ntheorem t : True := by\n  trivial\n', encoding='utf-8')
 
     monkeypatch.setattr('orchestrator.tools.run_lean_verify', lambda _path: {
-        'errors': 'Algo.lean:3:11: error: unknown identifier foo',
+        'errors': 'Algo.lean:4:2: error: unknown identifier foo',
         'exit_code': 1,
         'sorry_count': 0,
     })
@@ -54,7 +51,6 @@ def test_midcheck_routes_declaration_errors_to_agent7(monkeypatch, tmp_path):
 
 
 def test_midcheck_promotes_stalled_proof_to_search(monkeypatch, tmp_path):
-    monkeypatch.setattr(a8, "AGENT8_ROUTER_MODE", "deterministic")
     target = tmp_path / 'Algo.lean'
     target.write_text('import Mathlib\n\ntheorem t : True := by\n  trivial\n', encoding='utf-8')
 

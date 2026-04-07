@@ -560,7 +560,7 @@ def test_execution_profile_uses_single_candidate_for_transactional_api_shape(mon
     assert profile.candidate_count == 1
 
 
-def test_execution_profile_keeps_block_restructure_at_base_candidate_count(monkeypatch):
+def test_execution_profile_widens_candidates_for_block_restructure(monkeypatch):
     monkeypatch.setitem(a3.RETRY_LIMITS, "AGENT8_AGENT3_SAMPLE_CANDIDATES", 4)
     monkeypatch.setitem(a3.RETRY_LIMITS, "AGENT8_AGENT3_SAMPLE_MAX_CANDIDATES", 4)
     profile = a3._build_agent3_execution_profile(
@@ -572,7 +572,7 @@ def test_execution_profile_keeps_block_restructure_at_base_candidate_count(monke
         compile_first_mode=True,
     )
     assert profile.name == "block_restructure"
-    assert profile.candidate_count == 2
+    assert profile.candidate_count == 4
 
 
 def test_midcheck_handoff_triggers_for_sampled_search_mode():

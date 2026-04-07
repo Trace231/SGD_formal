@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import tempfile
 
 from orchestrator import repl_adapter
 
@@ -25,15 +24,12 @@ class _FakeStdin:
 
 class _FakeStdout:
     def __init__(self, responses: list[str]) -> None:
-        self._handle = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
-        self._handle.write("".join(responses))
-        self._handle.seek(0)
+        self._responses = list(responses)
 
     def readline(self) -> str:
-        return self._handle.readline()
-
-    def fileno(self) -> int:
-        return self._handle.fileno()
+        if not self._responses:
+            return ""
+        return self._responses.pop(0)
 
 
 class _FakeProc:
@@ -109,31 +105,6 @@ def test_verify_with_repl_timeout_maps_error(monkeypatch, tmp_path):
         assert False, "expected timeout runtime error"
     except RuntimeError as exc:
         assert "repl_timeout" in str(exc)
-
-
-def test_verify_with_repl_zero_timeout_disables_subprocess_timeout(monkeypatch, tmp_path):
-    ws = tmp_path / "replws"
-    ws.mkdir()
-    captured: dict[str, object] = {}
-
-    class _Proc:
-        stdout = json.dumps({"env": 1, "messages": [], "sorries": []})
-
-    def _fake_run(*args, **kwargs):
-        captured["timeout"] = kwargs.get("timeout")
-        return _Proc()
-
-    monkeypatch.setattr(repl_adapter.subprocess, "run", _fake_run)
-    out = repl_adapter.verify_with_repl(
-        code="theorem t : True := by\n  trivial\n",
-        repl_workspace=ws,
-        project_root=None,
-        lake_path="lake",
-        timeout=0,
-    )
-
-    assert captured["timeout"] is None
-    assert out["complete"] is True
 
 
 def test_verify_with_repl_invalid_json_maps_protocol_error(monkeypatch, tmp_path):
@@ -272,3 +243,4 @@ def test_verify_with_repl_uses_project_lake_env(monkeypatch, tmp_path):
     assert out["pass"] is True
     assert seen["args"] == ["lake", "env", str(repl_bin)]
     assert seen["cwd"] == str(project_root)
+
