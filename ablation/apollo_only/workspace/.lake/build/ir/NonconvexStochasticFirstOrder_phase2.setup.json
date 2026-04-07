@@ -1,7 +1,0 @@
-{"plugins": [],
- "package": "sgd_phase2",
- "options": {"autoImplicit": false},
- "name": "NonconvexStochasticFirstOrder_phase2",
- "isModule": false,
- "importArts": {},
- "dynlibs": []}

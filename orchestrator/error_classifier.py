@@ -297,7 +297,11 @@ def _build_decl_zone_map(lines: list[str]) -> list[tuple[int, int]]:
                 # The previous declaration was equation-style (never saw := by).
                 # Close it at the line before this new declaration starts.
                 zones.append((decl_start, i - 1))
-            decl_start = i
+            if _PROOF_BODY_RE.search(line):
+                zones.append((i, i))
+                decl_start = None
+            else:
+                decl_start = i
             continue  # don't fall into rule 1 for the opening line itself
 
         # Rule 1: proof-body opener for the current := by / := style declaration.
@@ -665,4 +669,3 @@ def _llm_classify_error(
         "suggested_strategy": "other",
         "reasoning": "LLM returned invalid JSON; fallback.",
     }
-

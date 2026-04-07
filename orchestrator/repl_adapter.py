@@ -1,8 +1,39 @@
-"""Native Lean REPL adapter with schema-compatible normalization."""
+"""Native Lean REPL adapter with schema-compatible normalization.
+
+Two verification modes are provided:
+
+``verify_with_repl``
+    One-shot subprocess (``subprocess.run``).  Each call spawns a fresh REPL
+    process, writes the full snippet, waits for the process to exit, then
+    parses stdout.  Robust against hangs because the OS reaps the process
+    once it finishes; any hang is caught by the ``timeout`` parameter which
+    triggers ``subprocess.TimeoutExpired``.
+
+``ReplSession``
+    Persistent REPL process (``subprocess.Popen``).  The process is kept
+    alive for the duration of the session so the Mathlib import environment
+    is only elaborated once (``prime_header``).  Subsequent ``verify`` calls
+    reuse the cached env_id.
+
+    **Critical implementation detail — binary IO (text=False, bufsize=0)**:
+    The Lean REPL returns multi-line JSON responses.  When ``subprocess.Popen``
+    is opened with ``text=True`` and ``bufsize=1`` (line-buffered), Python's
+    ``TextIOWrapper.readline()`` reads a full OS-pipe chunk into an internal
+    buffer on the first call.  Subsequent ``select.select()`` calls on the
+    same file descriptor then see an empty OS pipe (the bytes are in Python's
+    buffer), so they never fire — causing an infinite hang.
+
+    Fix: open the process in binary, unbuffered mode (``text=False``,
+    ``bufsize=0``) and read directly from the raw file descriptor via
+    ``os.read(fd, 8192)``.  This bypasses Python's TextIO layer entirely,
+    so ``select.select`` and ``os.read`` always operate on the real OS pipe
+    state.
+"""
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import select
 import subprocess
@@ -37,11 +68,11 @@ def _extract_header_lines(code: str) -> str:
 
 
 def _count_source_sorrys(source_text: str) -> int:
-    import re
+    import re as _re
 
-    block_comment_re = re.compile(r"/-.*?-/", re.DOTALL)
-    sorry_re = re.compile(r"\bsorry\b")
-    admit_re = re.compile(r"\badmit\b")
+    block_comment_re = _re.compile(r"/-.*?-/", _re.DOTALL)
+    sorry_re = _re.compile(r"\bsorry\b")
+    admit_re = _re.compile(r"\badmit\b")
     stripped = block_comment_re.sub("", source_text)
     count = 0
     for line in stripped.splitlines():
@@ -160,6 +191,13 @@ def verify_with_repl(
     extra_args: dict[str, Any] | None = None,
     target_label: str | None = None,
 ) -> dict[str, Any]:
+    """One-shot REPL verification via ``subprocess.run``.
+
+    Spawns a fresh REPL process for each call.  The process exits once it
+    has processed the single command, so there are no hanging persistent
+    processes.  ``subprocess.TimeoutExpired`` is caught and re-raised as
+    ``RuntimeError("repl_timeout: ...")``.
+    """
     command_args, cwd = _build_repl_command(
         repl_workspace=repl_workspace,
         lake_path=lake_path,
@@ -167,8 +205,6 @@ def verify_with_repl(
     )
 
     command: dict[str, Any] = {"cmd": code}
-    # Important: first request must NOT force env=0 for this REPL protocol.
-    # Passing env=0 can produce {"message":"Unknown environment."}.
     if last_env is not None:
         command["env"] = int(last_env)
     if extra_args:
@@ -218,7 +254,14 @@ def verify_with_repl(
 
 
 class ReplSession:
-    """Persistent REPL session with env chaining."""
+    """Persistent REPL session with env chaining.
+
+    Opens the REPL subprocess in **binary, unbuffered mode** (``text=False``,
+    ``bufsize=0``) to avoid Python's TextIOWrapper buffering issue.  All I/O
+    with the subprocess is done via raw file descriptors (``os.read`` /
+    ``os.write`` patterns) so that ``select.select`` always reflects true OS
+    pipe state.
+    """
 
     def __init__(
         self,
@@ -248,9 +291,18 @@ class ReplSession:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                # Use binary mode (text=False) + unbuffered (bufsize=0).
+                # text=True with bufsize=1 caused a critical bug: Python's
+                # TextIOWrapper.readline() reads the full OS-pipe chunk into an
+                # internal buffer, making subsequent select.select() calls
+                # report "not ready" even though the remaining response bytes
+                # are sitting in Python's buffer.  With binary/unbuffered mode
+                # we use os.read() + select.select() on the raw fd, avoiding
+                # this mismatch entirely.
+                text=False,
+                bufsize=0,
                 cwd=str(cwd),
-                bufsize=1,
+                start_new_session=True,  # own process group → kill all lake children together
             )
         except FileNotFoundError as exc:
             raise RuntimeError(f"repl_binary_missing: {self._lake_path}") from exc
@@ -274,12 +326,24 @@ class ReplSession:
         *,
         env: int | None = None,
         target_label: str | None = None,
+        timeout: int | None = None,
     ) -> dict[str, Any]:
+        """Send *code* to the persistent REPL and return normalised output.
+
+        Parameters
+        ----------
+        code:          Lean snippet to verify.
+        env:           Optional env_id to chain from (pass ``header_env_id``
+                       from ``prime_header`` for tactic verification).
+        target_label:  Optional prefix for formatted error messages.
+        timeout:       Override the session-level timeout for this call.
+                       Useful for short no-op commands or complex tactics.
+        """
         start = time.time()
         command: dict[str, Any] = {"cmd": code}
         if env is not None:
             command["env"] = int(env)
-        raw = self._send_cmd(command)
+        raw = self._send_cmd(command, timeout=timeout)
         elapsed = time.time() - start
         return _normalize_repl_output(
             raw=raw,
@@ -288,10 +352,24 @@ class ReplSession:
             target_label=target_label,
         )
 
-    def _send_cmd(self, command: dict[str, Any]) -> dict[str, Any]:
+    def _send_cmd(
+        self,
+        command: dict[str, Any],
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
+        """Send *command* JSON to the REPL and read the response.
+
+        Uses raw file-descriptor I/O (``os.read``) to bypass Python's
+        TextIOWrapper buffering — see module docstring for the full
+        explanation.
+        """
         if self._closed:
             raise RuntimeError("repl_session_dead: session is closed")
-        payload = json.dumps(command, ensure_ascii=False) + "\r\n\r\n"
+
+        # Payload is bytes because the process is opened in binary mode.
+        payload = (json.dumps(command, ensure_ascii=False) + "\r\n\r\n").encode("utf-8")
+        effective_timeout = timeout if timeout is not None else self._timeout
+
         with self._lock:
             try:
                 assert self._proc.stdin is not None
@@ -302,30 +380,54 @@ class ReplSession:
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(f"repl_session_write_error: {exc}") from exc
 
-            chunks: list[str] = []
+            # Use raw file-descriptor reads via os.read() rather than
+            # TextIOWrapper.readline().  Python's TextIO buffer reads a chunk
+            # from the OS pipe on the first readline() call (all bytes up to
+            # its buffer size), so subsequent select.select() calls on the
+            # same fd see an empty OS pipe and never fire — even though the
+            # remaining response lines are sitting in Python's internal buffer.
+            # Using os.read() on the raw fd bypasses that layer entirely.
+            assert self._proc.stdout is not None
+            stdout_fd = self._proc.stdout.fileno()
+            buf = b""
             raw: dict[str, Any] | None = None
-            deadline = time.time() + self._timeout
+            deadline = time.time() + effective_timeout
+
             while time.time() < deadline:
                 poll = self._proc.poll()
                 if poll is not None and poll != 0:
-                    stderr = ""
+                    stderr_text = ""
                     if self._proc.stderr is not None:
                         try:
-                            stderr = self._proc.stderr.read() or ""
-                        except Exception:
-                            stderr = ""
+                            stderr_bytes = b""
+                            while True:
+                                ready_e, _, _ = select.select(
+                                    [self._proc.stderr], [], [], 0
+                                )
+                                if not ready_e:
+                                    break
+                                chunk = os.read(self._proc.stderr.fileno(), 4096)
+                                if not chunk:
+                                    break
+                                stderr_bytes += chunk
+                            stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+                        except Exception:  # noqa: BLE001
+                            pass
                     raise RuntimeError(
-                        f"repl_session_dead: exit_code={poll}; stderr={stderr[:300]}"
+                        f"repl_session_dead: exit_code={poll}; stderr={stderr_text[:300]}"
                     )
-                assert self._proc.stdout is not None
-                ready, _, _ = select.select([self._proc.stdout], [], [], 0.2)
+
+                ready, _, _ = select.select([stdout_fd], [], [], 0.2)
                 if not ready:
                     continue
-                line = self._proc.stdout.readline()
-                if not line:
+                try:
+                    chunk = os.read(stdout_fd, 8192)
+                except OSError:
                     continue
-                chunks.append(line)
-                candidate = "".join(chunks).strip()
+                if not chunk:
+                    continue
+                buf += chunk
+                candidate = buf.decode("utf-8", errors="replace").strip()
                 if not candidate:
                     continue
                 try:
@@ -333,8 +435,9 @@ class ReplSession:
                     break
                 except json.JSONDecodeError:
                     continue
+
             if raw is None:
-                raise RuntimeError(f"repl_session_timeout: {self._timeout}s")
+                raise RuntimeError(f"repl_session_timeout: {effective_timeout}s")
 
         if not isinstance(raw, dict):
             raise RuntimeError("repl_session_protocol_error: non-object response")
