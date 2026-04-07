@@ -39,7 +39,6 @@ from orchestrator.assumption_repair import (
     goals_to_patch_list,
 )
 from orchestrator.config import (
-    AGENT8_ALLOW_AGENT5,
     AGENT3_CANDIDATE_COUNT,
     AGENT3_NO_IMPROVEMENT_WINDOW,
     AGENT3_RECURSION_DEPTH,
@@ -55,7 +54,6 @@ from orchestrator.config import (
     APOLLO_REPL_WORKSPACE,
     AUDIT_FLUSH_INTERVAL_SECONDS,
     ALGORITHM_REFERENCES,
-    CODEX_SDK_RETRY_LIMIT,
     DOC_ANCHORS,
     LIB_GLUE_ANCHORS,
     MAX_PHASE3_RETRIES,
@@ -66,9 +64,7 @@ from orchestrator.config import (
     ROUTING_PARAMS,
     UNKNOWN_IDENTIFIER_RENAME_MAP,
     _get_default_references,
-    should_use_codex_backend,
 )
-from orchestrator.compile_health import check_compile_health, recover_compile_health
 from orchestrator.file_io import (
     load_file,
     snapshot_file,
@@ -194,26 +190,6 @@ from orchestrator.phase3.prompting import _build_preemptive_agent7_prompt
 from orchestrator.phase3.state import Phase3Progress, Phase3Runtime, Phase3State
 
 console = Console()
-
-
-def _build_agent_with_runtime(
-    role: str,
-    *,
-    extra_files: list[str] | None = None,
-    runtime_hint: str | None = None,
-):
-    """Construct Agent while remaining compatible with legacy/mocked signatures."""
-    kwargs: dict[str, Any] = {}
-    if extra_files is not None:
-        kwargs["extra_files"] = extra_files
-    if runtime_hint is not None:
-        kwargs["runtime_hint"] = runtime_hint
-    try:
-        return Agent(role, **kwargs)
-    except TypeError:
-        kwargs.pop("runtime_hint", None)
-        return Agent(role, **kwargs)
-
 
 # Agent3 single-step interactive loop: maximum tool turns per attempt.
 # Archetype B gets a 1.5× multiplier applied in phase3_prove.
@@ -360,6 +336,15 @@ def _build_agent3_execution_profile(
     elif repair_unit == "block_restructure":
         profile_name = "block_restructure"
         prefer_lean_decomposition = True
+        candidate_count = max(
+            candidate_count,
+            int(
+                RETRY_LIMITS.get(
+                    "AGENT8_AGENT3_SAMPLE_MAX_CANDIDATES",
+                    RETRY_LIMITS.get("AGENT8_AGENT3_SAMPLE_CANDIDATES", candidate_count),
+                )
+            ),
+        )
         strategy_hints = [
             "split long calc/have chains into explicit intermediate steps",
             "rewrite one local block before touching adjacent proof code",
@@ -692,12 +677,6 @@ def run_agent3_search_kernel(
     )
     best_failed_summary: dict[str, Any] = {}
     strategy_hints = list(profile.strategy_hints)
-    default_retry_limit = max(0, int(CODEX_SDK_RETRY_LIMIT or 0))
-
-    def _attach_execution_meta(payload: dict[str, Any]) -> dict[str, Any]:
-        payload.setdefault("candidate_count", candidate_count)
-        payload.setdefault("retry_limit", default_retry_limit)
-        return payload
 
     try:
         if not search_enabled:
@@ -738,7 +717,7 @@ def run_agent3_search_kernel(
                     "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
                 },
             )
-            return _attach_execution_meta(out)
+            return out
 
         while depth <= max_depth:
             best_result: dict[str, Any] | None = None
@@ -784,7 +763,7 @@ def run_agent3_search_kernel(
                     ):
                         target_path.write_text(probe_content, encoding="utf-8")
                         probe_path.unlink(missing_ok=True)
-                        return _attach_execution_meta({
+                        return {
                             **probe_norm,
                             "candidate_id": f"d{depth + 1}.probe",
                             "candidate_score": list(probe_score),
@@ -801,7 +780,7 @@ def run_agent3_search_kernel(
                                 **search_timing,
                                 "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
                             },
-                        })
+                        }
 
             def _run_parallel_candidate(idx0: int) -> tuple[int, dict[str, Any], str, Path]:
                 cand_idx = idx0 + 1
@@ -931,7 +910,7 @@ def run_agent3_search_kernel(
                             },
                         }
                     )
-                    return _attach_execution_meta(clean)
+                    return clean
             search_timing["selection_ms"] += int((time.perf_counter() - selection_started) * 1000.0)
 
             for p in candidate_paths:
@@ -967,7 +946,7 @@ def run_agent3_search_kernel(
                     **search_timing,
                     "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
                 }
-                return _attach_execution_meta(best_result)
+                return best_result
             no_improve_rounds += 1
 
             # No improvement: recurse to next subproblem if budget allows.
@@ -1022,7 +1001,7 @@ def run_agent3_search_kernel(
                     **search_timing,
                     "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
                 }
-                return _attach_execution_meta(best_result)
+                return best_result
 
             if depth >= max_depth:
                 best_result["best_candidate_reason"] = "max_recursion_depth_reached"
@@ -1030,7 +1009,7 @@ def run_agent3_search_kernel(
                     **search_timing,
                     "search_kernel_total_ms": int((time.perf_counter() - search_started) * 1000.0),
                 }
-                return _attach_execution_meta(best_result)
+                return best_result
 
             if graph:
                 node = graph[0]
@@ -1086,7 +1065,7 @@ def run_agent3_search_kernel(
                 "execution_profile": profile.name,
             },
         }
-        return _attach_execution_meta(fallback)
+        return fallback
     finally:
         if repl_session is not None:
             repl_session.close()
@@ -1191,8 +1170,7 @@ def phase3_prove(
         max_tool_turns = MAX_AGENT3_TOOL_TURNS
     if archetype.upper() == "B":
         max_tool_turns = int(max_tool_turns * 1.5)
-    _agent3_runtime = "codex" if should_use_codex_backend("sorry_closer", skip_to_agent9=skip_to_agent9) else "http"
-    agent3 = _build_agent_with_runtime("sorry_closer", extra_files=[target_file], runtime_hint=_agent3_runtime)
+    agent3 = Agent("sorry_closer", extra_files=[target_file])
     registry = ToolRegistry()
     registry.register_default_tools()
     _algo_name = Path(target_file).stem
@@ -1519,38 +1497,12 @@ def phase3_prove(
         registry.call("run_lean_verify", target_file)
         if _target_exists_overlay() else {}
     )
-    _pre_agent9_health = check_compile_health(_pre_agent9_verify, target_file=target_file)
-    if not _pre_agent9_health.get("healthy", True):
-        _recovery = recover_compile_health(
-            target_file,
-            registry=registry,
-            verify_result=_pre_agent9_verify,
-        )
-        _pre_agent9_verify = dict(_recovery.get("verify_result", _pre_agent9_verify))
-        _pre_agent9_health = dict(_recovery.get("health", _pre_agent9_health))
-    _agent9_runtime = "codex" if should_use_codex_backend("strategy_planner", skip_to_agent9=skip_to_agent9) else "http"
-    if _pre_agent9_health.get("healthy", True):
-        try:
-            _agent9_plan: dict = _run_agent9_plan(
-                target_file,
-                guidance,
-                _algo_name,
-                verify_state=_pre_agent9_verify if _pre_agent9_verify else None,
-                runtime_hint=_agent9_runtime,
-            )
-        except TypeError:
-            _agent9_plan = _run_agent9_plan(
-                target_file,
-                guidance,
-                _algo_name,
-                verify_state=_pre_agent9_verify if _pre_agent9_verify else None,
-            )
-    else:
-        console.print(
-            "[yellow][CompileHealth] Agent9 skipped until compile health recovers. "
-            "Agent8 will start from recovery-aware mode.[/yellow]"
-        )
-        _agent9_plan = {}
+    _agent9_plan: dict = _run_agent9_plan(
+        target_file,
+        guidance,
+        _algo_name,
+        verify_state=_pre_agent9_verify if _pre_agent9_verify else None,
+    )
     # Phase 5 is now Agent8-owned regardless of whether Agent9 managed to
     # produce a structured plan. Keep the legacy retry loop bypassed so the
     # deterministic Agent8 router remains the single proof-fill driver.
@@ -1573,8 +1525,7 @@ def phase3_prove(
         )
     _prog_advance()  # Phase 4/7
     if agent2 is None:
-        _planner_runtime = "codex" if should_use_codex_backend("planner", skip_to_agent9=skip_to_agent9) else "http"
-        agent2 = _build_agent_with_runtime("planner", runtime_hint=_planner_runtime)
+        agent2 = Agent("planner")
 
     # ------------------------------------------------------------------
     # Phase 5/7 — Proof Fill: Agent3 / Agent8 close all sorry placeholders.
@@ -4555,33 +4506,6 @@ def phase3_prove(
     console.print(
         "  [Agent8→Agent5] All agent memories cleared before Agent5 escalation."
     )
-
-    if not AGENT8_ALLOW_AGENT5:
-        console.print(
-            "[yellow][Agent8] Exhausted current budget with Agent5 disabled. "
-            "Returning current failure state without Agent5 escalation."
-        )
-        return False, attempts, last_errors, {
-            "execution_history": [r.__dict__ for r in execution_history],
-            "decision_history": decision_history,
-            "blocker_reports": blocker_reports,
-            "attempt_failures": attempt_failures,
-            "failure_ledger": _failure_ledger,
-            "agent7_invocations": agent7_invocations,
-            "agent7_step_execution_log": agent7_step_execution_log,
-            "agent7_plan_revisions": agent7_plan_revisions,
-            "agent7_blocked_actions": agent7_blocked_actions,
-            "agent7_forced_trigger_count": agent7_forced_trigger_count,
-            "agent7_force_gate_entries": agent7_force_gate_entries,
-            "agent7_force_gate_rejections": agent7_force_gate_rejections,
-            "agent7_force_gate_reason_samples": agent7_force_gate_reason_samples,
-            "estimated_token_consumption": max(1, token_char_budget // 4),
-            "retry_count": sum(
-                1
-                for r in execution_history
-                if r.status_code in {"ERROR", "BLOCKED"}
-            ),
-        }
 
     console.print("[red bold]Agent8 exhausted — escalating to Agent5.")
     if diag_log:

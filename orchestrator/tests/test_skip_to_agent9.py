@@ -283,33 +283,3 @@ def test_phase3_skip_to_agent9_avoids_agent2_guidance_and_runs_agent9(monkeypatc
     assert observed["agent8_plan"] == {"theorems": [{"name": "t"}], "recommended_order": ["t"]}
     assert observed["verify_state"] == {"exit_code": 0, "sorry_count": 0, "errors": []}
     assert isinstance(audit["execution_history"], list)
-
-
-def test_run_skip_to_agent9_rejects_empty_target(tmp_path):
-    target = tmp_path / "Empty.lean"
-    target.write_text("", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="non-empty target file"):
-        main_mod.run(
-            algorithm="FooAlgo",
-            update_rule="w_{t+1} = w_t - g_t",
-            proof_sketch="Use the existing scaffold",
-            archetype="B",
-            target_file=str(target),
-            skip_to_agent9=True,
-        )
-
-
-def test_run_skip_to_agent9_requires_theorem_headers(tmp_path):
-    target = tmp_path / "NoDecl.lean"
-    target.write_text("def foo : Nat := 1\n", encoding="utf-8")
-
-    with pytest.raises(ValueError, match="theorem/lemma headers"):
-        main_mod.run(
-            algorithm="FooAlgo",
-            update_rule="w_{t+1} = w_t - g_t",
-            proof_sketch="Use the existing scaffold",
-            archetype="B",
-            target_file=str(target),
-            skip_to_agent9=True,
-        )

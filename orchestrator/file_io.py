@@ -5,25 +5,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from orchestrator.config import PROJECT_ROOT, RUNTIME_ARTIFACT_EXCLUDE_GLOBS
+from orchestrator.config import PROJECT_ROOT
 
 _LEAN_DECL_RE = re.compile(
     r"^(?:theorem|lemma|noncomputable\s+def|def|structure|class|abbrev)\s+\w+",
 )
-
-
-def _is_excluded_runtime_path(path: str | Path) -> bool:
-    import fnmatch
-
-    p = Path(path)
-    rel = str(p)
-    if p.is_absolute():
-        try:
-            rel = str(p.relative_to(PROJECT_ROOT))
-        except ValueError:
-            rel = str(p)
-    rel = rel.lstrip("./")
-    return any(fnmatch.fnmatch(rel, glob) for glob in RUNTIME_ARTIFACT_EXCLUDE_GLOBS)
 
 
 # ---------------------------------------------------------------------------
@@ -46,8 +32,6 @@ def load_files(paths: list[str | Path]) -> str:
     """
     parts: list[str] = []
     for p in paths:
-        if _is_excluded_runtime_path(p):
-            continue
         try:
             content = load_file(p)
             parts.append(f'<file path="{p}">\n{content}\n</file>')
@@ -72,11 +56,8 @@ def generate_project_manifest(paths: list[str | Path]) -> str:
     issue targeted ``read_file`` calls instead of loading full file content.
     """
     parts: list[str] = []
-    seen_blocks: set[str] = set()
     for p in paths:
         p_str = str(p)
-        if _is_excluded_runtime_path(p_str):
-            continue
         try:
             content = load_file(p)
             lines = content.splitlines()
@@ -88,19 +69,10 @@ def generate_project_manifest(paths: list[str | Path]) -> str:
                 body = "\n".join(decl_lines) if decl_lines else "  (no top-level declarations)"
             else:
                 headings = [line.rstrip() for line in lines if line.startswith("#")]
-                headings = list(dict.fromkeys(headings))
                 body = "\n".join(headings) if headings else "  (no headings)"
-            block = f'<manifest path="{p}">\n{body}\n</manifest>'
-            if block in seen_blocks:
-                continue
-            seen_blocks.add(block)
-            parts.append(block)
+            parts.append(f'<manifest path="{p}">\n{body}\n</manifest>')
         except FileNotFoundError:
-            block = f'<manifest path="{p}">\n[FILE NOT FOUND]\n</manifest>'
-            if block in seen_blocks:
-                continue
-            seen_blocks.add(block)
-            parts.append(block)
+            parts.append(f'<manifest path="{p}">\n[FILE NOT FOUND]\n</manifest>')
     return "\n\n".join(parts)
 
 
