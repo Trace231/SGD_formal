@@ -21,5 +21,5 @@ lean_lib Main where
 -- Depends on Main (for SGDSetup, sgdProcess, etc.) which itself depends on StochOptLib
 lean_lib SGDAlgorithms where
   roots := #[`Algorithms.SGD, `Algorithms.WeightDecaySGD,
-             `Algorithms.ProjectedGD, `Algorithms.SVRG, `Algorithms.SVRGOuterLoop, `Algorithms.SubgradientMethod, `Algorithms.StochasticMirrorDescent,`Algorithms.SubgradientMethod_with_sorry]
+             `Algorithms.ProjectedGD, `Algorithms.SVRG, `Algorithms.SVRGOuterLoop, `Algorithms.SubgradientMethod, `Algorithms.StochasticMirrorDescent,`Algorithms.SubgradientMethod_with_sorry, `Algorithms.sorry]
   extraDepTargets := #[`Main]

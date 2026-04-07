@@ -48,6 +48,10 @@ class RunRecord:
     lib_density_rate: float = 0.0
     phase3_retry_count: int = 0
     estimated_token_consumption: int = 0
+    # API-reported Qwen (Dashscope) usage when streaming responses include ``usage``; else 0.
+    qwen_api_prompt_tokens: int = 0
+    qwen_api_completion_tokens: int = 0
+    qwen_api_total_tokens: int = 0
     doc_code_alignment_ok: bool = True
     doc_code_alignment_missing: list[str] | None = None
 
@@ -207,6 +211,9 @@ def capture_physical_metrics(
     phase3_execution_history: list[dict[str, Any]] | None = None,
     phase3_attempts: int = 0,
     estimated_token_consumption: int = 0,
+    qwen_api_prompt_tokens: int = 0,
+    qwen_api_completion_tokens: int = 0,
+    qwen_api_total_tokens: int = 0,
 ) -> RunRecord:
     """Capture repository-grounded metrics instead of agent-estimated values."""
     repo_verify = run_repo_verify()
@@ -252,6 +259,9 @@ def capture_physical_metrics(
         lib_density_rate=lib_density,
         phase3_retry_count=retries,
         estimated_token_consumption=estimated_token_consumption,
+        qwen_api_prompt_tokens=qwen_api_prompt_tokens,
+        qwen_api_completion_tokens=qwen_api_completion_tokens,
+        qwen_api_total_tokens=qwen_api_total_tokens,
         doc_code_alignment_ok=alignment_ok,
         doc_code_alignment_missing=alignment_missing,
     )

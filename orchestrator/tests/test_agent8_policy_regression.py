@@ -15,6 +15,7 @@ from orchestrator.phase3_agent8 import (
     _coerce_errors_text,
     _error_count_from_verify,
     _is_structural_error,
+    _apply_agent8_hard_guards,
     _prefer_agent3_search_owner,
     _resolve_decision_prompt,
     _route_for_subtype,
@@ -49,6 +50,13 @@ def test_classify_unknown_identifier_is_declaration():
 def test_classify_unexpected_token_is_declaration_syntax_failure():
     errors = "Foo.lean:7:18: error: unexpected token '*'; expected '}'"
     assert _classify_error_subtype(errors) == _SUBTYPE_DECLARATION_SYNTAX_FAILURE
+
+
+def test_classify_unknown_identifier_in_proof_body_uses_zone_over_string(tmp_path):
+    target = tmp_path / "Foo.lean"
+    target.write_text("theorem t : True := by\n  exact myLemma\n", encoding="utf-8")
+    errors = f"{target}:2:8: error: unknown identifier 'myLemma'"
+    assert _classify_error_subtype(errors, str(target)) == _SUBTYPE_PROOF_TACTIC_FAILURE
 
 
 def test_classify_tactic_failure_no_api():
@@ -125,6 +133,24 @@ def test_route_for_strategy_mismatch_replans_then_humans():
     assert repair_unit2 == _REPAIR_UNIT_STATEMENT_GAP
 
 
+def test_hard_guard_reroutes_agent7_when_error_is_in_proof_body(tmp_path):
+    target = tmp_path / "Foo.lean"
+    target.write_text("theorem t : True := by\n  exact myLemma\n", encoding="utf-8")
+    decision = _apply_agent8_hard_guards(
+        {
+            "action": "agent7_signature",
+            "error_subtype": _SUBTYPE_DECLARATION_API_MISMATCH,
+            "repair_unit": _REPAIR_UNIT_LOCAL_PATCH,
+            "targeted_prompt": "old prompt",
+        },
+        target_file=str(target),
+        errors_text=f"{target}:2:8: error: unknown identifier 'myLemma'",
+        compile_health={"healthy": True},
+    )
+    assert decision["action"] == "agent3_tactical"
+    assert decision["error_subtype"] != _SUBTYPE_DECLARATION_API_MISMATCH
+
+
 def test_agent9_theorem_context_supports_legacy_fields():
     legacy_plan = {
         "theorems": [
@@ -177,6 +203,7 @@ def test_run_agent8_loop_requires_repo_verify_for_initial_clean(monkeypatch):
     import orchestrator.tools as tools_mod
     import orchestrator.phase3_agent8 as a8
 
+    monkeypatch.setattr(a8, "AGENT8_ROUTER_MODE", "deterministic")
     monkeypatch.setattr(
         tools_mod,
         "run_lean_verify",
@@ -208,6 +235,7 @@ def test_run_agent8_loop_requires_repo_verify_after_agent3_clean(monkeypatch):
     import orchestrator.tools as tools_mod
     import orchestrator.phase3_agent8 as a8
 
+    monkeypatch.setattr(a8, "AGENT8_ROUTER_MODE", "deterministic")
     verify_calls = {"n": 0}
 
     def _verify(_path):
@@ -232,3 +260,47 @@ def test_run_agent8_loop_requires_repo_verify_after_agent3_clean(monkeypatch):
     success, _plan, errors = run_agent8_loop(None, "Algorithms/Foo.lean", "plan", "old errors")
     assert success is False
     assert "build failed" in errors
+
+
+def test_run_agent8_loop_leaves_search_policy_to_agent3_kernel(monkeypatch):
+    import orchestrator.tools as tools_mod
+    import orchestrator.phase3_agent8 as a8
+
+    monkeypatch.setattr(a8, "AGENT8_ROUTER_MODE", "deterministic")
+    monkeypatch.setattr(
+        tools_mod,
+        "run_lean_verify",
+        lambda _path: {
+            "exit_code": 1,
+            "sorry_count": 1,
+            "errors": "Algorithms/Foo.lean:10:2: error: rewrite failed",
+        },
+    )
+    monkeypatch.setitem(a8.RETRY_LIMITS, "AGENT8_MAX_STEPS", 1)
+    monkeypatch.setattr(
+        a8,
+        "_classify_error_subtype",
+        lambda *_args, **_kwargs: _SUBTYPE_PROOF_TACTIC_FAILURE,
+    )
+    monkeypatch.setattr(
+        a8,
+        "_route_for_subtype",
+        lambda *_args, **_kwargs: (
+            "agent3_tactical",
+            _REPAIR_UNIT_LOCAL_PATCH,
+            "test local patch route",
+        ),
+    )
+
+    seen: dict[str, object] = {}
+
+    def _fake_agent3(*_args, **kwargs):
+        seen["search_allowed"] = kwargs.get("search_allowed")
+        return {"exit_code": 1, "sorry_count": 1, "errors": "still failing"}
+
+    monkeypatch.setattr(a8, "_agent8_run_agent3", _fake_agent3)
+
+    success, _plan, errors = run_agent8_loop(None, "Algorithms/Foo.lean", "plan", "old errors")
+    assert success is False
+    assert "still failing" in errors
+    assert seen["search_allowed"] is None

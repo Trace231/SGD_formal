@@ -20,6 +20,11 @@ LIB_DIR = PROJECT_ROOT / "Lib"
 ALGORITHMS_DIR = PROJECT_ROOT / "Algorithms"
 METRICS_PATH = PROJECT_ROOT / "orchestrator" / "metrics.json"
 AUDIT_DIR = PROJECT_ROOT / "orchestrator" / "audits"
+CONTEXT_JOURNAL_DIR = PROJECT_ROOT / "orchestrator" / "context_journal"
+WATCH_LOG_DIR = PROJECT_ROOT / "orchestrator" / "watch_logs"
+SAMPLE_TEST_DIR = PROJECT_ROOT / "orchestrator" / "sample_test"
+SAMPLE_TEST_CLEANUP_SPEC = SAMPLE_TEST_DIR / "cleanup_spec.json"
+SAMPLE_TEST_CURRENT_RUN = WATCH_LOG_DIR / "current_run.json"
 AUDIT_ENABLED = os.getenv("ORCHESTRATOR_AUDIT", "1") != "0"
 
 # Full-audit controls (default ON; can be disabled via env for privacy/volume).
@@ -31,6 +36,26 @@ AUDIT_FLUSH_INTERVAL_SECONDS = int(os.getenv("ORCHESTRATOR_AUDIT_FLUSH_INTERVAL"
 # Default "a" for unattended/Trae automation.
 AGENT5_DEFAULT_ACTION: str = os.getenv("AGENT5_DEFAULT_ACTION", "a")
 
+
+def _parse_csv_env(name: str, default: str = "") -> tuple[str, ...]:
+    raw = os.getenv(name, default)
+    items = [item.strip() for item in raw.replace("\n", ",").split(",")]
+    return tuple(item for item in items if item)
+
+
+# Sample-test / long-run monitoring controls.
+SAMPLE_TEST_MODE: bool = os.getenv("SAMPLE_TEST_MODE", "0") != "0"
+DISABLE_PHASE4_PERSISTENCE: bool = os.getenv("DISABLE_PHASE4_PERSISTENCE", "0") != "0"
+CONTEXT_JOURNAL_ENABLED: bool = os.getenv("CONTEXT_JOURNAL_ENABLED", "0") != "0"
+MANUAL_STOP_ONLY: bool = os.getenv("MANUAL_STOP_ONLY", "0") != "0"
+WATCH_INTERVAL_SEC: int = max(60, int(os.getenv("WATCH_INTERVAL_SEC", "600")))
+WATCH_ANALYSIS_EVERY_N: int = max(1, int(os.getenv("WATCH_ANALYSIS_EVERY_N", "10")))
+RUN_ID_OVERRIDE: str = os.getenv("ORCHESTRATOR_RUN_ID_OVERRIDE", "").strip()
+RUNTIME_ARTIFACT_EXCLUDE_GLOBS: tuple[str, ...] = _parse_csv_env(
+    "RUNTIME_ARTIFACT_EXCLUDE_GLOBS",
+    "orchestrator/audits/**,orchestrator/context_journal/**,orchestrator/watch_logs/**",
+)
+
 # ---------------------------------------------------------------------------
 # API keys (loaded from .env or environment)
 # ---------------------------------------------------------------------------
@@ -39,6 +64,7 @@ API_KEYS: dict[str, str] = {
     "qwen": os.getenv("QWEN_API_KEY", "sk-sp-4626175acf3049baa139a39a53b87105"),
     "deepseek": os.getenv("DEEPSEEK_API_KEY", "sk-2f6d72eb427d44d8b96b96da7c6f9b5c"),
     "anthropic": os.getenv("ANTHROPIC_API_KEY", ""),
+    "openai": os.getenv("OPENAI_API_KEY", ""),
 }
 
 # ---------------------------------------------------------------------------
@@ -72,10 +98,10 @@ AGENT_CONFIGS: dict[str, dict] = {
     "orchestrator_spec":  {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768},  # Agent1B (JSON spec mode)
     "planner":            {"provider": "qwen", "model": "qwen3-max-2026-01-23", "max_tokens": 32768},  # Agent2
     # "sorry_closer":     {"provider": "deepseek", "model": "deepseek-reasoner", "temperature": 0.0, "max_tokens": 8192, "use_manifest": True},
-    "sorry_closer":       {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768, "use_manifest": True},  # Agent3
-    "strategy_planner":   {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 16384, "use_manifest": True},  # Agent9
+    "sorry_closer":       {"provider": "qwen", "model": "qwen3-coder-plus", "max_tokens": 32768, "use_manifest": True},  # Agent3
+    "strategy_planner":   {"provider": "qwen", "model": "qwen3-max-2026-01-23", "max_tokens": 16384, "use_manifest": True},  # Agent9
     "persister":          {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 32768},  # Agent4
-    "diagnostician":      {"provider": "qwen", "model": "qwen3.5-plus", "max_tokens": 16384},   # Agent5
+    "diagnostician":      {"provider": "qwen", "model": "qwen3-coder-plus", "max_tokens": 16384},   # Agent5
     "glue_filler":        {"provider": "qwen", "model": "qwen3-max-2026-01-23", "max_tokens": 32768, "use_manifest": True},  # Agent6
     "interface_auditor":  {"provider": "qwen", "model": "qwen3-max-2026-01-23", "max_tokens": 32768},  # Agent7
     "decision_hub":       {"provider": "qwen", "model": "qwen3-max-2026-01-23", "max_tokens": 32768},  # Agent8
@@ -92,6 +118,42 @@ LEAN_VERIFY_PATHS = ["Algorithms/", "Lib/"]
 # Root-level Lean files that agents may read (but never write) to inspect
 # the project import graph and detect circular dependencies before adding imports.
 READ_ONLY_PATHS = ["Algorithms/", "Lib/", "docs/", "Main.lean", "lakefile.lean"]
+
+# Agent runtime controls (HTTP-compatible default with optional Codex runtime).
+_AGENT_RUNTIME_RAW = os.getenv("AGENT_RUNTIME", "hybrid").strip().lower()
+AGENT_RUNTIME = _AGENT_RUNTIME_RAW if _AGENT_RUNTIME_RAW in {"http", "codex", "hybrid"} else "hybrid"
+CODEX_SKIP_ONLY = os.getenv("CODEX_SKIP_ONLY", "1") != "0"
+# Runtime context injected by main.run for skip-to-agent9 specialization.
+CURRENT_SKIP_TO_AGENT9 = False
+
+# Verify backend override used by CLI flag --lean-verify-backend.
+# Values: auto (prefer LeanLSP, fallback lake), leanlsp, lake
+_LEAN_VERIFY_BACKEND_OVERRIDE_RAW = os.getenv("LEAN_VERIFY_BACKEND_OVERRIDE", "auto").strip().lower()
+LEAN_VERIFY_BACKEND_OVERRIDE = (
+    _LEAN_VERIFY_BACKEND_OVERRIDE_RAW
+    if _LEAN_VERIFY_BACKEND_OVERRIDE_RAW in {"auto", "leanlsp", "lake"}
+    else "auto"
+)
+
+# Codex transport controls.
+_CODEX_TRANSPORT_RAW = os.getenv("CODEX_TRANSPORT", "sdk").strip().lower()
+CODEX_TRANSPORT = _CODEX_TRANSPORT_RAW if _CODEX_TRANSPORT_RAW in {"sdk", "api"} else "sdk"
+CODEX_SDK_MODEL = os.getenv("CODEX_SDK_MODEL", "gpt-5-codex")
+_OPENAI_BASE_URL_RAW = os.getenv("OPENAI_BASE_URL", "").strip()
+OPENAI_BASE_URL = _OPENAI_BASE_URL_RAW
+_CODEX_SDK_TIMEOUT_RAW = os.getenv("CODEX_SDK_TIMEOUT", "120").strip()
+try:
+    CODEX_SDK_TIMEOUT = int(_CODEX_SDK_TIMEOUT_RAW)
+except Exception:
+    CODEX_SDK_TIMEOUT = 120
+CODEX_SDK_RETRY_LIMIT = int(os.getenv("CODEX_SDK_RETRY_LIMIT", "1"))
+CODEX_OPENAI_COMPAT_MAX_RETRIES = int(os.getenv("CODEX_OPENAI_COMPAT_MAX_RETRIES", "1"))
+CODEX_SDK_FALLBACK_TO_API = os.getenv("CODEX_SDK_FALLBACK_TO_API", "1") != "0"
+CODEX_SDK_DISABLE_ENV_PROXY = os.getenv("CODEX_SDK_DISABLE_ENV_PROXY", "0") == "1"
+CODEX_SDK_PROXY = os.getenv("CODEX_SDK_PROXY", "").strip()
+# Qwen SDK (OpenAI-compatible Chat Completions) defaults to direct path.
+CODEX_QWEN_SDK_DISABLE_ENV_PROXY = os.getenv("CODEX_QWEN_SDK_DISABLE_ENV_PROXY", "1") == "1"
+CODEX_QWEN_SDK_PROXY = os.getenv("CODEX_QWEN_SDK_PROXY", "").strip()
 
 # ---------------------------------------------------------------------------
 # Lean verify backend controls (low-intrusion APOLLO integration)
@@ -401,6 +463,11 @@ RETRY_LIMITS: dict[str, int] = {
     "AGENT9_PLAN_CHARS": 3000,
     # Agent9: how many chars of Agent2's guidance to feed into Agent9's prompt.
     "AGENT9_GUIDANCE_CHARS": 4000,
+    # Agent9: max scaffold chars injected into planning/replanning prompts.
+    "AGENT9_FILE_CHARS": 60000,
+    # Agent9 replan: max error and previous-plan chars to avoid context blow-up.
+    "AGENT9_REPLAN_ERROR_CHARS": 2000,
+    "AGENT9_REPLAN_PLAN_CHARS": 2000,
     # Agent10 (scaffold_verifier): max parse retries for the JSON verdict response.
     "AGENT10_MAX_PARSE_RETRIES": 3,
     # Agent10: how many chars of the approved plan to include in the verification prompt.
@@ -477,6 +544,22 @@ AGENT8_DEBUG: bool = os.getenv("AGENT8_DEBUG", "0") != "0"
 # 1 = decision + outcome only, 2 = +ctx summary (first 500 chars), 3 = +raw_reply truncated.
 AGENT8_DEBUG_LEVEL: int = int(os.getenv("AGENT8_DEBUG_LEVEL", "1"))
 
+# Agent8 routing mode.
+AGENT8_ROUTER_MODE: str = os.getenv("AGENT8_ROUTER_MODE", "llm_guarded").strip().lower()
+if AGENT8_ROUTER_MODE not in {"deterministic", "llm_guarded"}:
+    AGENT8_ROUTER_MODE = "llm_guarded"
+AGENT8_ROUTER_MODEL: str = os.getenv("AGENT8_ROUTER_MODEL", "qwen3-max-2026-01-23").strip() or "qwen3-max-2026-01-23"
+AGENT8_ALLOW_AGENT5: bool = os.getenv("AGENT8_ALLOW_AGENT5", "0") != "0"
+
+# Compile-health soft gate.
+COMPILE_HEALTH_ENABLED: bool = os.getenv("COMPILE_HEALTH_ENABLED", "1") != "0"
+COMPILE_HEALTH_MAX_RETRIES: int = max(1, int(os.getenv("COMPILE_HEALTH_MAX_RETRIES", "2")))
+
+# Context shrinking controls.
+AGENT_CONTEXT_WINDOW_LINES: int = max(10, int(os.getenv("AGENT_CONTEXT_WINDOW_LINES", "60")))
+AGENT9_MINIMAL_CONTEXT: bool = os.getenv("AGENT9_MINIMAL_CONTEXT", "1") != "0"
+AGENT3_MINIMAL_CONTEXT: bool = os.getenv("AGENT3_MINIMAL_CONTEXT", "1") != "0"
+
 # Hard trigger: if the same error_signature appears >= this many consecutive
 # ticks with different actions, force human_missing_assumption.
 AGENT8_HUMAN_GATE_CONSECUTIVE_THRESHOLD: int = 3
@@ -504,7 +587,7 @@ AGENT8_MIDCHECK_MIN_TURN: int = int(os.getenv("AGENT8_MIDCHECK_MIN_TURN", "8"))
 
 # Agent3 search-kernel controls (APOLLO core parity, MVP).
 AGENT3_SEARCH_ENABLED: bool = os.getenv("AGENT3_SEARCH_ENABLED", "1") != "0"
-AGENT3_CANDIDATE_COUNT: int = max(1, int(os.getenv("AGENT3_CANDIDATE_COUNT", "3")))
+AGENT3_CANDIDATE_COUNT: int = max(1, int(os.getenv("AGENT3_CANDIDATE_COUNT", "1")))
 AGENT3_RECURSION_DEPTH: int = max(0, int(os.getenv("AGENT3_RECURSION_DEPTH", "0")))
 AGENT3_NO_IMPROVEMENT_WINDOW: int = max(
     1, int(os.getenv("AGENT3_NO_IMPROVEMENT_WINDOW", "2"))
@@ -560,3 +643,61 @@ MAX_PROVE_RETRIES = MAX_PHASE3_RETRIES
 LEAN_BUILD_TIMEOUT = TIMEOUTS["LEAN_BUILD_TIMEOUT"]
 LEVERAGE_THRESHOLD = 0.5
 MAX_TOKENS = 32768
+
+
+def set_runtime_overrides(
+    *,
+    agent_runtime: str | None = None,
+    codex_skip_only: bool | None = None,
+    lean_verify_backend: str | None = None,
+    codex_transport: str | None = None,
+    skip_to_agent9: bool | None = None,
+) -> None:
+    """Set mutable runtime overrides from CLI wiring."""
+    global AGENT_RUNTIME, CODEX_SKIP_ONLY, LEAN_VERIFY_BACKEND_OVERRIDE, CODEX_TRANSPORT, CURRENT_SKIP_TO_AGENT9
+
+    if agent_runtime is not None:
+        ar = str(agent_runtime).strip().lower()
+        if ar not in {"http", "codex", "hybrid"}:
+            raise ValueError(f"Invalid agent_runtime: {agent_runtime}")
+        AGENT_RUNTIME = ar
+
+    if codex_skip_only is not None:
+        CODEX_SKIP_ONLY = bool(codex_skip_only)
+
+    if lean_verify_backend is not None:
+        vb = str(lean_verify_backend).strip().lower()
+        if vb not in {"auto", "leanlsp", "lake"}:
+            raise ValueError(f"Invalid lean_verify_backend: {lean_verify_backend}")
+        LEAN_VERIFY_BACKEND_OVERRIDE = vb
+
+    if codex_transport is not None:
+        ct = str(codex_transport).strip().lower()
+        if ct not in {"sdk", "api"}:
+            raise ValueError(f"Invalid codex_transport: {codex_transport}")
+        CODEX_TRANSPORT = ct
+
+    if skip_to_agent9 is not None:
+        CURRENT_SKIP_TO_AGENT9 = bool(skip_to_agent9)
+
+
+def should_use_codex_backend(role: str, *, skip_to_agent9: bool | None = None) -> bool:
+    """Decide if a role should run on Codex backend under current runtime policy."""
+    runtime = str(AGENT_RUNTIME).strip().lower()
+    codex_roles = {"strategy_planner", "decision_hub", "sorry_closer", "planner"}
+
+    if role not in codex_roles:
+        return False
+    if runtime == "http":
+        return False
+    if runtime == "codex":
+        return True
+
+    # hybrid mode
+    if runtime != "hybrid":
+        return False
+
+    if CODEX_SKIP_ONLY:
+        active_skip = CURRENT_SKIP_TO_AGENT9 if skip_to_agent9 is None else bool(skip_to_agent9)
+        return bool(active_skip)
+    return True

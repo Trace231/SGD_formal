@@ -26,6 +26,7 @@ import json
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,6 +51,7 @@ from orchestrator.config import (
     AGENT_CONFIGS,
     AUDIT_FLUSH_INTERVAL_SECONDS,
     ALGORITHM_REFERENCES,
+    DISABLE_PHASE4_PERSISTENCE,
     DOC_ANCHORS,
     LIB_GLUE_ANCHORS,
     MAX_PHASE3_RETRIES,
@@ -59,6 +61,7 @@ from orchestrator.config import (
     ROUTING_PARAMS,
     UNKNOWN_IDENTIFIER_RENAME_MAP,
     _get_default_references,
+    set_runtime_overrides,
 )
 from orchestrator.file_io import (
     load_file,
@@ -85,7 +88,11 @@ from orchestrator.verify import (
     check_leverage_gate,
     check_used_in_tags,
 )
-from orchestrator.providers import call_llm
+from orchestrator.providers import (
+    call_llm,
+    reset_api_token_meters,
+    start_token_usage_heartbeat,
+)
 from orchestrator.error_classifier import (
     _LEAN_ERROR_LINE_RE,
     _LEAN_STRUCTURED_ERROR_RE,
@@ -250,6 +257,7 @@ def phase3b_fix_tags(
     registry.register_default_tools()
     agent3 = Agent("sorry_closer")
 
+    missing = list(dict.fromkeys(missing))
     missing_str = "\n".join(f"  - {m}" for m in missing)
     guidance = (
         "DOCSTRING-ONLY TASK — DO NOT MODIFY ANY PROOF LOGIC OR TACTIC LINES.\n"
@@ -305,7 +313,7 @@ def phase3b_fix_tags(
             except Exception as exc:  # noqa: BLE001
                 console.print(f"  [Gate 4b] tool '{tool_name}' error: {exc}")
 
-        missing_now = check_used_in_tags([target_file])
+        missing_now = list(dict.fromkeys(check_used_in_tags([target_file])))
         if not missing_now:
             console.print("[green]\\[Gate 4b] All Used-in tags patched.")
             return
@@ -336,8 +344,36 @@ def run(
     progress_detail: str = "normal",
     skip_to_agent9: bool = False,
     spec_file: str | None = None,
+    agent_runtime: str = "hybrid",
+    codex_skip_only: bool = True,
+    lean_verify_backend: str = "auto",
+    codex_transport: str = "sdk",
 ) -> None:
     """Execute the full 5-phase pipeline."""
+
+    reset_api_token_meters()
+    set_runtime_overrides(
+        agent_runtime=agent_runtime,
+        codex_skip_only=codex_skip_only,
+        lean_verify_backend=lean_verify_backend,
+        codex_transport=codex_transport,
+        skip_to_agent9=skip_to_agent9,
+    )
+
+    from orchestrator import config as runtime_config
+    _a9_codex = int(runtime_config.should_use_codex_backend("strategy_planner", skip_to_agent9=skip_to_agent9))
+    _a3_codex = int(runtime_config.should_use_codex_backend("sorry_closer", skip_to_agent9=skip_to_agent9))
+    console.print(
+        "[cyan][Runtime][/cyan] "
+        f"agent_runtime={runtime_config.AGENT_RUNTIME} "
+        f"codex_skip_only={int(runtime_config.CODEX_SKIP_ONLY)} "
+        f"codex_transport={runtime_config.CODEX_TRANSPORT} "
+        f"skip_to_agent9={int(bool(skip_to_agent9))}"
+    )
+    console.print(
+        "[cyan][Runtime][/cyan] "
+        f"strategy_planner_codex={_a9_codex} sorry_closer_codex={_a3_codex}"
+    )
 
     if target_file is None:
         target_file = f"Algorithms/{algorithm}.lean"
@@ -348,6 +384,17 @@ def run(
             raise FileNotFoundError(
                 "--skip-to-agent9 requires an existing target file; "
                 f"missing: {target_file}"
+            )
+        target_text = target_path.read_text(encoding="utf-8")
+        if not target_text.strip():
+            raise ValueError(
+                "--skip-to-agent9 requires a non-empty target file containing theorem/lemma declarations; "
+                f"file is empty: {target_file}"
+            )
+        if not re.search(r"^\s*(theorem|lemma)\s+\S+", target_text, re.MULTILINE):
+            raise ValueError(
+                "--skip-to-agent9 requires theorem/lemma headers in the target file; "
+                f"none found in: {target_file}"
             )
         skip_guidance = _build_skip_to_agent9_guidance(
             algorithm,
@@ -391,7 +438,10 @@ def run(
         "retry_count": 0,
     }
 
+    stop_token_hb: Callable[[], None] | None = None
     try:
+        _hb_interval = float(__import__("os").getenv("ORCHESTRATOR_TOKEN_HEARTBEAT_SECONDS", "600"))
+        stop_token_hb = start_token_usage_heartbeat(_hb_interval)
         with Progress(
             SpinnerColumn(),
             TextColumn("{task.description}"),
@@ -513,29 +563,36 @@ def run(
             # Phase 6
             audit.set_phase(4)
             progress.update(task, description="Phase 6/7: Persisting docs  [Agent4]...")
-            try:
-                new_tricks = phase4_persist(
-                    algorithm,
-                    target_file,
-                    plan,
-                    baseline_tracked=baseline_tracked,
-                    baseline_untracked=baseline_untracked,
-                )
-            except Gate4Error as exc:
+            if DISABLE_PHASE4_PERSISTENCE:
                 console.print(
-                    f"[yellow]\\[Gate 4] Missing Used-in tags detected "
-                    f"({len(exc.missing)} declaration(s)).  "
-                    "Entering tag-fixup loop …"
+                    "[yellow][Phase 4] Documentation persistence disabled by runtime policy.[/yellow]"
                 )
-                phase3b_fix_tags(target_file, exc.missing)
-                # Retry Phase 4 now that all tags are present.
-                new_tricks = phase4_persist(
-                    algorithm,
-                    target_file,
-                    plan,
-                    baseline_tracked=baseline_tracked,
-                    baseline_untracked=baseline_untracked,
-                )
+                audit.log_event("phase4_skipped", reason="disabled_by_runtime_policy")
+                new_tricks = 0
+            else:
+                try:
+                    new_tricks = phase4_persist(
+                        algorithm,
+                        target_file,
+                        plan,
+                        baseline_tracked=baseline_tracked,
+                        baseline_untracked=baseline_untracked,
+                    )
+                except Gate4Error as exc:
+                    console.print(
+                        f"[yellow]\\[Gate 4] Missing Used-in tags detected "
+                        f"({len(exc.missing)} declaration(s)).  "
+                        "Entering tag-fixup loop …"
+                    )
+                    phase3b_fix_tags(target_file, exc.missing)
+                    # Retry Phase 4 now that all tags are present.
+                    new_tricks = phase4_persist(
+                        algorithm,
+                        target_file,
+                        plan,
+                        baseline_tracked=baseline_tracked,
+                        baseline_untracked=baseline_untracked,
+                    )
             progress.advance(task)
 
             # Phase 7
@@ -557,6 +614,8 @@ def run(
             docs_in_diff = {f for f in _git_diff_files() if f.startswith("docs/")}
             files_modified = sorted(set(all_modified) | docs_in_diff)
     finally:
+        if stop_token_hb is not None:
+            stop_token_hb()
         if git_snapshot is not None:
             if success:
                 try:
@@ -651,6 +710,16 @@ def main() -> None:
                             "Jump directly to Agent9 strategy planning. "
                             "Requires target file to already exist."
                         ))
+    parser.add_argument("--agent-runtime", choices=["http", "codex", "hybrid"], default="hybrid",
+                        help="Agent runtime backend policy (default: hybrid).")
+    parser.add_argument("--codex-skip-only", dest="codex_skip_only", action="store_true", default=True,
+                        help="Enable Codex runtime only for --skip-to-agent9 flow (default).")
+    parser.add_argument("--no-codex-skip-only", dest="codex_skip_only", action="store_false",
+                        help="Allow Codex runtime on non-skip flows too.")
+    parser.add_argument("--lean-verify-backend", choices=["auto", "leanlsp", "lake"], default="auto",
+                        help="Lean verify backend preference: auto=leanlsp first then lake fallback.")
+    parser.add_argument("--codex-transport", choices=["sdk", "api"], default="sdk",
+                        help="Codex backend transport: sdk (Responses API) or api (legacy call_llm).")
     parser.add_argument("--spec-file", type=str, default=None,
                         help=(
                             "Path to a structured JSON algorithm specification file "
@@ -707,6 +776,10 @@ def main() -> None:
         progress_detail=args.progress_detail,
         skip_to_agent9=args.skip_to_agent9,
         spec_file=args.spec_file,
+        agent_runtime=args.agent_runtime,
+        codex_skip_only=args.codex_skip_only,
+        lean_verify_backend=args.lean_verify_backend,
+        codex_transport=args.codex_transport,
     )
 
 

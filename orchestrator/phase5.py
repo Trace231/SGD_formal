@@ -5,6 +5,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from orchestrator.metrics import MetricsStore, capture_physical_metrics
+from orchestrator.providers import get_qwen_tokens
 
 console = Console()
 
@@ -18,6 +19,7 @@ def phase5_finalize(
     console.rule("[bold cyan]Phase 7/7 — Finalize Metrics")
 
     store = MetricsStore()
+    qwen_usage = get_qwen_tokens()
     record = capture_physical_metrics(
         algorithm=algorithm,
         new_tricks_added=new_tricks,
@@ -26,6 +28,9 @@ def phase5_finalize(
         estimated_token_consumption=int(
             phase3_audit.get("estimated_token_consumption", 0)
         ),
+        qwen_api_prompt_tokens=int(qwen_usage.get("prompt_tokens", 0)),
+        qwen_api_completion_tokens=int(qwen_usage.get("completion_tokens", 0)),
+        qwen_api_total_tokens=int(qwen_usage.get("total_tokens", 0)),
     )
     store.append(record)
 
@@ -48,6 +53,9 @@ def phase5_finalize(
         f"P3 retries:         {record.phase3_retry_count}\n"
         f"Sorry attempts:     {total_attempts}\n"
         f"Est. token usage:   {record.estimated_token_consumption}\n"
+        f"Qwen API (reported): prompt={record.qwen_api_prompt_tokens} "
+        f"completion={record.qwen_api_completion_tokens} "
+        f"total={record.qwen_api_total_tokens}\n"
         f"\n"
         f"── Documentation ───────────────────────────────────────\n"
         f"Total glue lemmas:  {record.total_glue_lemmas}\n"

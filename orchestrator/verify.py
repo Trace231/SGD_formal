@@ -249,8 +249,9 @@ def check_glue_tricks_gate(
 # ---------------------------------------------------------------------------
 
 _USED_IN_DECL_KINDS = r"(?:theorem|lemma|noncomputable\s+def|def|structure)"
+_DECL_NAME_TOKEN = r"[^\s:({\[]+"
 _LEMMA_DEF_RE = re.compile(
-    rf"^{_USED_IN_DECL_KINDS}\s+(\w+)",
+    rf"^{_USED_IN_DECL_KINDS}\s+({_DECL_NAME_TOKEN})",
     re.MULTILINE,
 )
 
@@ -270,7 +271,7 @@ def _get_docstring_for_lemma(content: str, lemma_name: str) -> str:
     """Extract the docstring (/-  … -/) immediately preceding *lemma_name*."""
     pattern = re.compile(
         rf"(/\-\-.*?\-/)\s*\n\s*(?:omit\b[^\n]*\n\s*)?{_USED_IN_DECL_KINDS}\s+"
-        + re.escape(lemma_name),
+        + rf"{re.escape(lemma_name)}(?=$|\s|:|\(|\{{|\[)",
         re.DOTALL,
     )
     m = pattern.search(content)
@@ -284,7 +285,7 @@ def _is_simp_lemma(content: str, lemma_name: str) -> bool:
     exempt from the Convention 4 ``Used in:`` requirement.
     """
     decl_pat = re.compile(
-        rf"^{_USED_IN_DECL_KINDS}\s+" + re.escape(lemma_name),
+        rf"^{_USED_IN_DECL_KINDS}\s+" + rf"{re.escape(lemma_name)}(?=$|\s|:|\(|\{{|\[)",
         re.MULTILINE,
     )
     m = decl_pat.search(content)
@@ -316,7 +317,8 @@ def check_used_in_tags(modified_files: list[str | Path]) -> list[str]:
             doc = _get_docstring_for_lemma(content, lemma)
             if "Used in:" not in doc:
                 missing.append(f"{p.relative_to(PROJECT_ROOT)}:{lemma}")
-    return missing
+    # Keep order stable while suppressing duplicate reports.
+    return list(dict.fromkeys(missing))
 
 
 # ---------------------------------------------------------------------------

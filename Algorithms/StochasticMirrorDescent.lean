@@ -1,5 +1,6 @@
 import Mathlib.Analysis.InnerProductSpace.Basic
 import Mathlib.Analysis.Convex.Strong
+import Mathlib.Analysis.Calculus.FDeriv.Basic
 import Mathlib.MeasureTheory.Integral.Bochner.Basic
 import Mathlib.Probability.ConditionalExpectation
 import Mathlib.Topology.MetricSpace.Basic
@@ -35,7 +36,7 @@ noncomputable def V (v : E → ℝ) (grad_v : E → E) (x z : E) : ℝ :=
 
 /-- Non-negativity under 1-strong convexity.
 Used in: `stochasticMirrorDescent_convergence` (this file) -/
-theorem V_nonneg {v : E → ℝ} {grad_v : E → E} {X : Set E} (hv : StrongConvexOn ℝ X 1 v)
+theorem V_nonneg {v : E → ℝ} {grad_v : E → E} {X : Set E} (hv : StrongConvexOn X 1 v)
     (hx : x ∈ X) (hz : z ∈ X) (hdiff : DifferentiableAt ℝ v x) :
     0 ≤ V v grad_v x z := by sorry
 
@@ -48,7 +49,7 @@ theorem bregman_three_point_identity (v : E → ℝ) (grad_v : E → E) (x_t x_n
 /-- Three-point lemma (Lemma 3.4 from Lan).
 Used in: `stochasticMirrorDescent_convergence` (this file) -/
 theorem lemma_3_4 {v : E → ℝ} {grad_v : E → E} {X : Set E} {g : E} {x_t x_next x : E} {γ : ℝ}
-    (hv : StrongConvexOn ℝ X 1 v)
+    (hv : StrongConvexOn X 1 v)
     (hx_t : x_t ∈ X) (hx_next : x_next ∈ X) (hx : x ∈ X)
     (hdiff_t : DifferentiableAt ℝ v x_t) (hdiff_next : DifferentiableAt ℝ v x_next)
     (h_prox_opt : ∀ y ∈ X, ⟪γ • g + grad_v x_next - grad_v x_t, y - x_next⟫_ℝ ≥ 0) :
@@ -133,7 +134,7 @@ structure MirrorDescentSetup
   hP : IsProbabilityMeasure P
   hX_closed : IsClosed X
   hX_convex : Convex ℝ X
-  hv_strong_convex : StrongConvexOn ℝ X 1 v
+  hv_strong_convex : StrongConvexOn X 1 v
   hv_diff : ∀ x ∈ X, DifferentiableAt ℝ v x
   hG_meas : ∀ t, AEStronglyMeasurable (G t) P
   hξ_meas : ∀ t, Measurable (ξ t)

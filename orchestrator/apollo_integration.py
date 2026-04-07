@@ -138,6 +138,7 @@ def verify_with_apollo(
     apollo_root = Path(apollo_project_path).resolve()
     workspace = Path(repl_workspace).resolve()
     execution_root = Path(project_root).resolve()
+    verify_timeout = None if int(timeout) <= 0 else int(timeout)
     _validate_repl_binding(project_root=execution_root, repl_workspace=workspace)
 
     # Path A: native REPL adapter
@@ -145,7 +146,7 @@ def verify_with_apollo(
     try:
         return verify_with_repl(
             code=code,
-            timeout=timeout,
+            timeout=0 if verify_timeout is None else verify_timeout,
             repl_workspace=workspace,
             project_root=execution_root,
             lake_path=lake_path,
@@ -176,7 +177,7 @@ def verify_with_apollo(
     try:
         out = verify_lean4_file(
             code=code,
-            timeout=timeout,
+            timeout=verify_timeout,
             lean_workspace=str(workspace),
             lake_path=lake_path,
             repl_binary_path=str(workspace / ".lake" / "build" / "bin" / "repl"),
@@ -192,4 +193,3 @@ def verify_with_apollo(
             "apollo_runtime_error: APOLLO verification failed: "
             f"{exc}; prior_repl_error={repl_error}\n{traceback.format_exc(limit=2)}"
         ) from exc
-

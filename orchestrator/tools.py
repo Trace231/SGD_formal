@@ -27,6 +27,7 @@ from orchestrator.config import (
     LEAN_VERIFY_PATHS,
     PROJECT_ROOT,
     READ_ONLY_PATHS,
+    RUNTIME_ARTIFACT_EXCLUDE_GLOBS,
     VERIFY_BACKEND_STRICT,
     WHITELIST_PATHS,
 )
@@ -41,6 +42,19 @@ _READ_ONLY_ALLOWLIST = tuple(p.rstrip("/") for p in READ_ONLY_PATHS)
 _REQUIRED_IMPORTS_BY_FILE: dict[str, set[str]] = {
     "Algorithms/SubgradientMethod.lean": {"import Main"},
 }
+
+
+def _path_matches_runtime_exclude(path: str | Path) -> bool:
+    import fnmatch
+
+    rel = str(path)
+    if isinstance(path, Path):
+        try:
+            rel = str(path.relative_to(PROJECT_ROOT))
+        except ValueError:
+            rel = str(path)
+    rel = rel.lstrip("./")
+    return any(fnmatch.fnmatch(rel, glob) for glob in RUNTIME_ARTIFACT_EXCLUDE_GLOBS)
 
 
 def _to_rel(path: Path) -> str:
@@ -802,6 +816,7 @@ def check_lean_have(
     The original file is never modified.  The temp file is deleted regardless
     of whether compilation succeeded.
     """
+    import fnmatch
     import subprocess
     import uuid
 
@@ -1058,6 +1073,52 @@ def get_lean_goal(
     )
 
 
+class LeanLSPService:
+    """LeanLSP-oriented service wrapper used by run_lean_verify/tooling."""
+
+    def __init__(self, project_root: Path):
+        self.project_root = project_root
+
+    def verify(self, rel_path: str, *, timeout: int | None = None) -> dict[str, Any]:
+        """Elaborate a Lean file and return diagnostics-compatible payload."""
+        import subprocess
+
+        _timeout = int(timeout or LEAN_BUILD_TIMEOUT)
+        started = time.perf_counter()
+        proc = subprocess.run(
+            ["lake", "env", "lean", rel_path],
+            cwd=self.project_root,
+            capture_output=True,
+            text=True,
+            timeout=_timeout,
+        )
+        raw = (proc.stdout or "") + (proc.stderr or "")
+        if proc.returncode == 0:
+            errors: list[str] = []
+        else:
+            errors = _extract_lean_error_lines(raw)
+            if not errors:
+                errors = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        elapsed_ms = int((time.perf_counter() - started) * 1000.0)
+        return {
+            "exit_code": int(proc.returncode),
+            "errors": errors,
+            "diagnostics": errors,
+            "elapsed_ms": elapsed_ms,
+            "backend_used": "leanlsp",
+            "backend_reason": "leanlsp_direct_elab",
+        }
+
+    def goal_at(self, file_path: str | Path, sorry_line: int, timeout: int = 120) -> dict[str, Any]:
+        return get_lean_goal(file_path=file_path, sorry_line=sorry_line, timeout=timeout)
+
+    def check_expr(self, expr: str) -> dict[str, Any]:
+        return check_lean_expr(expr)
+
+    def check_have(self, file_path: str | Path, sorry_line: int, have_statement: str) -> dict[str, Any]:
+        return check_lean_have(file_path=file_path, sorry_line=sorry_line, have_statement=have_statement)
+
+
 def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     """Run Lean verification and return a JSON-serializable result.
 
@@ -1069,6 +1130,8 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
     resolved = _resolve_allowed_path(file_path, _LEAN_VERIFY_ALLOWLIST)
     source_path = resolved
     verify_start = time.perf_counter()
+
+    from orchestrator import config as runtime_config
 
     # Guard: do not run lake build if the target file does not yet exist.
     if not source_path.exists():
@@ -1090,12 +1153,54 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
         }
 
     rel = str(resolved.relative_to(PROJECT_ROOT))
+    _leanlsp_degrade_warning = ""
     _apollo_degrade_warning = ""
+
+    backend_override = str(getattr(runtime_config, "LEAN_VERIFY_BACKEND_OVERRIDE", "auto")).strip().lower()
+    force_lake_backend = False
+    if backend_override in {"auto", "leanlsp"}:
+        try:
+            leanlsp = LeanLSPService(PROJECT_ROOT)
+            _lsp = leanlsp.verify(rel, timeout=LEAN_BUILD_TIMEOUT)
+            _lsp_exit = int(_lsp.get("exit_code", 1))
+            _lsp_errors = _lsp.get("errors", [])
+            if isinstance(_lsp_errors, str):
+                _lsp_errors = [ln for ln in _lsp_errors.splitlines() if ln.strip()]
+            elif not isinstance(_lsp_errors, list):
+                _lsp_errors = [str(_lsp_errors)] if _lsp_errors else []
+            _lsp_sorry = count_sorrys(rel)
+            _lsp_blocked = max(0, _lsp_sorry)
+            verify_wall_ms = int((time.perf_counter() - verify_start) * 1000.0)
+            return {
+                "target": rel,
+                "success": _lsp_exit == 0 and _lsp_sorry == 0,
+                "exit_code": _lsp_exit,
+                "sorry_count": _lsp_sorry,
+                "sorry_declarations": 0,
+                "blocked_sorry_count": _lsp_blocked,
+                "error_count": len(_lsp_errors),
+                "errors": _lsp_errors,
+                "warnings": [],
+                "verify_backend_used": "leanlsp",
+                "verify_backend_reason": str(_lsp.get("backend_reason", "leanlsp_success")),
+                "verify_time": verify_wall_ms / 1000.0,
+                "verify_wall_ms": verify_wall_ms,
+                "backend_invoke_ms": int(_lsp.get("elapsed_ms", 0) or 0),
+            }
+        except Exception as exc:
+            _leanlsp_degrade_warning = f"LeanLSP verify failure; degraded to lake: {exc}"
+            force_lake_backend = True
+
     _verify_backend_used = "lake"
     _verify_backend_reason = "lake_default"
 
     # Backend gate: keep lake as the default path to preserve current semantics.
-    backend = str(LEAN_VERIFY_BACKEND).strip().lower()
+    if backend_override == "lake":
+        backend = "lake"
+    elif force_lake_backend:
+        backend = "lake"
+    else:
+        backend = str(getattr(runtime_config, "LEAN_VERIFY_BACKEND", LEAN_VERIFY_BACKEND)).strip().lower()
     if backend == "apollo":
         from orchestrator.apollo_integration import (
             normalize_apollo_result,
@@ -1244,6 +1349,8 @@ def run_lean_verify(file_path: str | Path) -> dict[str, Any]:
         )
 
     blocked_sorry_count = max(0, sorry_count - compiler_sorry_count)
+    if _leanlsp_degrade_warning:
+        warning_lines = [_leanlsp_degrade_warning] + warning_lines
     if _apollo_degrade_warning:
         warning_lines = [_apollo_degrade_warning] + warning_lines
         _verify_backend_used = "lake"
@@ -1318,21 +1425,23 @@ def search_codebase(
           formatted (human-readable string grouped by file),
           matches (list of {file, line, content, context}).
     """
-    import fnmatch
     import subprocess
 
     rg_result = None
     try:
+        rg_cmd = [
+            "rg",
+            "--glob", file_glob,
+            "--line-number",
+            "--no-heading",
+            "--color", "never",
+            f"--context={context_lines}",
+        ]
+        for glob in RUNTIME_ARTIFACT_EXCLUDE_GLOBS:
+            rg_cmd.extend(["-g", f"!{glob}"])
+        rg_cmd.append(pattern)
         proc = subprocess.run(
-            [
-                "rg",
-                "--glob", file_glob,
-                "--line-number",
-                "--no-heading",
-                "--color", "never",
-                f"--context={context_lines}",
-                pattern,
-            ],
+            rg_cmd,
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -1387,6 +1496,8 @@ def search_codebase(
             }
         for p in sorted(PROJECT_ROOT.rglob("*")):
             if not p.is_file():
+                continue
+            if _path_matches_runtime_exclude(p):
                 continue
             if not fnmatch.fnmatch(p.name, file_glob):
                 continue

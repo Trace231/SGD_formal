@@ -48,7 +48,7 @@ This module runs in isolation and does **not** modify `orchestrator/main.py`.
 - `ablation/apollo_only/reports/parity_report.py`
 - `ablation/apollo_only/configs/apollo_api_parity.py`
 - `ablation/apollo_only/configs/apollo_vllm_parity.py`
-- `ablation/apollo_only/datasets/subgradient_single.jsonl`
+- `ablation/apollo_only/datasets/sample_single.jsonl`
 
 ## 3) Environment Requirements
 
@@ -89,7 +89,7 @@ Each JSONL row should contain:
 Example:
 
 ```json
-{"name":"SubgradientMethod_scaffold_main_theorem","split":"ablation","target_file":"Algorithms/SubgradientMethod_scaffold.lean","theorem_name":"subgradient_convergence_convex","informal_prefix":"Goal: fill the main convex convergence theorem proof..."}
+{"name":"SampleMethod_scaffold_main_theorem","split":"ablation","target_file":"Algorithms/SampleMethod_scaffold.lean","theorem_name":"subgradient_convergence_convex","informal_prefix":"Goal: fill the main convex convergence theorem proof..."}
 ```
 
 ## 5) Run Commands
@@ -102,14 +102,14 @@ python ablation/apollo_only/scripts/bootstrap_workspace.py --force
 ```
 
 This step snapshots `Lib/docs/Main` and migrates
-`Algorithms/sorry.lean -> workspace/Algorithms/SubgradientMethod_scaffold.lean`.
+`Algorithms/sorry.lean -> workspace/Algorithms/SampleMethod_scaffold.lean`.
 
 ## 5.1 Default parity run (API-first)
 
 ```bash
 cd /root/SGD/SGD_APOLLO
 python -m ablation.apollo_only.runner \
-  --dataset ablation/apollo_only/datasets/subgradient_single.jsonl \
+  --dataset ablation/apollo_only/datasets/sample_single.jsonl \
   --config ablation/apollo_only/configs/apollo_api_parity.py
 ```
 
@@ -117,7 +117,7 @@ python -m ablation.apollo_only.runner \
 
 ```bash
 python -m ablation.apollo_only.runner \
-  --dataset ablation/apollo_only/datasets/subgradient_single.jsonl \
+  --dataset ablation/apollo_only/datasets/sample_single.jsonl \
   --config ablation/apollo_only/configs/apollo_vllm_parity.py
 ```
 
@@ -125,7 +125,7 @@ python -m ablation.apollo_only.runner \
 
 ```bash
 python -m ablation.apollo_only.runner \
-  --dataset ablation/apollo_only/datasets/subgradient_single.jsonl \
+  --dataset ablation/apollo_only/datasets/sample_single.jsonl \
   --config ablation/apollo_only/configs/apollo_api_parity.py \
   --model-backend api \
   --provider qwen \
@@ -249,7 +249,7 @@ Typical errors:
 Fix:
 
 1. Keep `execution_root` in `ablation/apollo_only/workspace`.
-2. Keep `target_file` relative (example: `Algorithms/SubgradientMethod_scaffold.lean`).
+2. Keep `target_file` relative (example: `Algorithms/SampleMethod_scaffold.lean`).
 3. Re-run bootstrap if workspace files are missing.
 
 ## 10.8 Queue/worker stalls
