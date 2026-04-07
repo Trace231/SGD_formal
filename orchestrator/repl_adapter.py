@@ -175,6 +175,7 @@ def verify_with_repl(
         command.update(extra_args)
     payload = json.dumps(command, ensure_ascii=False)
 
+    run_timeout = None if int(timeout) <= 0 else int(timeout)
     start = time.time()
     try:
         with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as temp_file:
@@ -186,10 +187,10 @@ def verify_with_repl(
                 capture_output=True,
                 text=True,
                 cwd=str(cwd),
-                timeout=timeout,
+                timeout=run_timeout,
             )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"repl_timeout: {timeout}s") from exc
+        raise RuntimeError(f"repl_timeout: {run_timeout}s") from exc
     except FileNotFoundError as exc:
         raise RuntimeError(f"repl_binary_missing: {lake_path}") from exc
     except Exception as exc:  # noqa: BLE001
@@ -364,4 +365,3 @@ class ReplSession:
 
     def __exit__(self, *_args: Any) -> None:
         self.close()
-

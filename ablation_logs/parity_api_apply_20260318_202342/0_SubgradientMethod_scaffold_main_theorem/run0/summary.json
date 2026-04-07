@@ -1,0 +1,13 @@
+{
+  "problem_idx": 0,
+  "problem_name": "SubgradientMethod_scaffold_main_theorem",
+  "prob_runname": "SubgradientMethod_scaffold_main_theorem/run0",
+  "sample_count": 8,
+  "success_count": 0,
+  "sample_time": 2287.3645737171173,
+  "verify_time": 1.608569622039795,
+  "algorithm": "Sampling",
+  "apply_best_candidate": true,
+  "applied_updates": 0,
+  "best_applied_score": []
+}

@@ -84,6 +84,52 @@ def test_search_kernel_early_stops_on_clean_candidate(monkeypatch, tmp_path):
     assert sorted(calls) == [1, 2, 3]
 
 
+def test_search_kernel_rejects_clean_candidate_missing_target_declaration(monkeypatch, tmp_path):
+    target = _mk_target(tmp_path)
+    monkeypatch.setattr(a3, "AGENT3_SEARCH_ENABLED", True)
+    monkeypatch.setattr(a3, "AGENT3_CANDIDATE_COUNT", 1)
+    monkeypatch.setattr(a3, "AGENT3_RECURSION_DEPTH", 0)
+    monkeypatch.setattr(a3, "AGENT3_NO_IMPROVEMENT_WINDOW", 1)
+
+    import orchestrator.tools as tools_mod
+    import orchestrator.apollo_sorrify as sor
+    import orchestrator.repl_adapter as repl_mod
+
+    monkeypatch.setattr(
+        tools_mod,
+        "run_lean_verify",
+        lambda _path: {"exit_code": 1, "sorry_count": 1, "error_count": 1, "errors": ["e"]},
+    )
+    monkeypatch.setattr(sor, "build_apollo_verify_callable", lambda: (lambda _code: {"pass": False, "complete": False, "errors": []}))
+    monkeypatch.setattr(sor, "apply_syntax_correction", lambda code: (code, {"ok": True, "changed": False}))
+    monkeypatch.setattr(sor, "apply_sorrify", lambda code, _v: (code, {"ok": True, "changed": False}))
+    monkeypatch.setattr(sor, "apply_hint_repair", lambda code, _v: (code, {"ok": True, "changed": False}))
+
+    class _SessFail:
+        def __init__(self, **_kwargs):
+            raise RuntimeError("session unavailable")
+
+    monkeypatch.setattr(repl_mod, "ReplSession", _SessFail)
+
+    def _fake_single(target_file, *_args, **_kwargs):
+        Path(target_file).write_text("theorem renamed : True := by\n  trivial\n", encoding="utf-8")
+        return {"exit_code": 0, "sorry_count": 0, "errors": "", "verify_time": 0.01}
+
+    out = a3.run_agent3_search_kernel(
+        target,
+        "plan",
+        "prompt",
+        None,
+        transactional_mode=True,
+        patch_guard_mode=True,
+        target_decl_name="t",
+        repair_unit="block_restructure",
+        run_single_candidate=_fake_single,
+    )
+    assert out["best_candidate_reason"] != "clean_candidate_preserved_target_early_stop"
+    assert out["target_validation_status"] == "renamed_target_declaration"
+
+
 def test_search_kernel_recursion_returns_failure_contract(monkeypatch, tmp_path):
     target = _mk_target(tmp_path)
     monkeypatch.setattr(a3, "AGENT3_SEARCH_ENABLED", True)

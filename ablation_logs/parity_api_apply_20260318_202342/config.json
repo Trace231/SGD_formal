@@ -1,0 +1,51 @@
+{
+  "APOLLO_LAKE_PATH": "/root/.elan/bin/lake",
+  "APOLLO_PROJECT_PATH": "/root/SGD/APOLLO",
+  "APOLLO_VERIFY_TIMEOUT": 300,
+  "PROJECT_ROOT": "/root/SGD/SGD_APOLLO",
+  "apollo_project_path": "/root/SGD/APOLLO",
+  "batch_size": 8,
+  "data_repeat": 1,
+  "data_split": null,
+  "execution_root": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace",
+  "lake_path": "/root/.elan/bin/lake",
+  "lean_max_concurrent_requests": 4,
+  "max_tokens": 4096,
+  "model": "qwen3.5-plus",
+  "model_args": {
+    "provider": "qwen",
+    "model": "qwen3.5-plus",
+    "max_tokens": 4096,
+    "temperature": 0.7,
+    "top_p": 0.95
+  },
+  "model_backend": "api",
+  "monitor_interval_sec": 5.0,
+  "monitor_stall_sec": 480.0,
+  "n_search_procs": 4,
+  "provider": "qwen",
+  "repl_workspace": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace",
+  "request_timeout_sec": 360.0,
+  "sampler": {
+    "sample_num": 8,
+    "log_interval": 2,
+    "mode": "cot_goedel_v2",
+    "prompt_formatter": "cot_goedel_v2",
+    "few_shot_dataset": "",
+    "few_shot_num": 0,
+    "model_args": {
+      "provider": "qwen",
+      "model": "qwen3.5-plus",
+      "max_tokens": 4096,
+      "temperature": 0.7,
+      "top_p": 0.95
+    }
+  },
+  "system_prompt": "You are an expert in Lean 4 formal proofs. Return Lean code only.",
+  "temperature": 0.7,
+  "timeout_verify_sec": 300,
+  "top_p": 0.95,
+  "verify_timeout": 300,
+  "workspace_root": "/root/SGD/SGD_APOLLO/ablation/apollo_only/workspace",
+  "apply_best_candidate": true
+}

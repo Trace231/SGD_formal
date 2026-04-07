@@ -399,6 +399,8 @@ def _agent8_run_agent3(
     error_subtype: str = "",
     repair_unit: str = _REPAIR_UNIT_LOCAL_PATCH,
     target_region: str = "",
+    target_decl_name: str = "",
+    active_target: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Dispatch Agent3 through the Agent3 search kernel.
 
@@ -406,9 +408,10 @@ def _agent8_run_agent3(
     """
     from orchestrator.phase3_agent3 import run_agent3_search_kernel
 
-    _ = allowed_edit_lines
     max_turns = max_turns or int(RETRY_LIMITS.get("AGENT8_AGENT3_MAX_TURNS", 15))
     if repair_unit == _REPAIR_UNIT_BLOCK_RESTRUCTURE and not transactional_mode:
+        transactional_mode = True
+        patch_guard_mode = True
         max_turns = min(
             max_turns,
             int(RETRY_LIMITS.get("AGENT8_AGENT3_SAMPLE_MAX_TURNS_PER_CANDIDATE", 8)),
@@ -417,7 +420,7 @@ def _agent8_run_agent3(
         target_file,
         agent2_plan,
         targeted_prompt,
-        None,
+        allowed_edit_lines,
         max_turns=max_turns,
         compile_first_mode=compile_first_mode,
         patch_guard_mode=patch_guard_mode,
@@ -426,6 +429,8 @@ def _agent8_run_agent3(
         error_subtype=error_subtype,
         repair_unit=repair_unit,
         target_region=target_region,
+        target_decl_name=target_decl_name,
+        active_target=active_target,
         run_single_candidate=_agent8_run_agent3_single,
     )
 

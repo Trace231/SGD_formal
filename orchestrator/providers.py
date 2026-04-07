@@ -221,6 +221,17 @@ def _call_llm_once(
     full_messages = [{"role": "system", "content": system}, *messages]
 
     if provider == "qwen":
+        def _qwen_non_stream_fallback() -> str:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=full_messages,
+                max_tokens=max_tokens,
+            )
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                _accumulate_qwen_usage(usage)
+            return resp.choices[0].message.content or ""
+
         # enable_thinking requires stream=True on Dashscope; include_usage when supported
         _stream_kwargs: dict[str, Any] = {
             "model": model,
@@ -234,22 +245,34 @@ def _call_llm_once(
                 **_stream_kwargs,
                 stream_options={"include_usage": True},
             )
-        except Exception:
+        except Exception as exc:
+            if _is_retryable_llm_error(exc):
+                return strip_think_tags(_qwen_non_stream_fallback())
             # Some gateways reject ``stream_options``; retry without usage hints.
-            stream = client.chat.completions.create(**_stream_kwargs)
+            try:
+                stream = client.chat.completions.create(**_stream_kwargs)
+            except Exception as stream_exc:
+                if _is_retryable_llm_error(stream_exc):
+                    return strip_think_tags(_qwen_non_stream_fallback())
+                raise
         text = ""
         last_usage: Any = None
-        for chunk in stream:
-            # Usage-only chunks (e.g. final chunk with ``stream_options.include_usage``)
-            # may have empty ``choices`` — do not index ``choices[0]``.
-            ch = getattr(chunk, "choices", None) or []
-            if ch:
-                delta = ch[0].delta
-                if hasattr(delta, "content") and delta.content:
-                    text += delta.content
-            u = getattr(chunk, "usage", None)
-            if u is not None:
-                last_usage = u
+        try:
+            for chunk in stream:
+                # Usage-only chunks (e.g. final chunk with ``stream_options.include_usage``)
+                # may have empty ``choices`` — do not index ``choices[0]``.
+                ch = getattr(chunk, "choices", None) or []
+                if ch:
+                    delta = ch[0].delta
+                    if hasattr(delta, "content") and delta.content:
+                        text += delta.content
+                u = getattr(chunk, "usage", None)
+                if u is not None:
+                    last_usage = u
+        except Exception as exc:
+            if _is_retryable_llm_error(exc):
+                return strip_think_tags(_qwen_non_stream_fallback())
+            raise
         if last_usage is not None:
             _accumulate_qwen_usage(last_usage)
     else:

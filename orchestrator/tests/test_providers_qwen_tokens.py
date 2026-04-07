@@ -99,3 +99,53 @@ def test_deepseek_does_not_touch_qwen_meter(monkeypatch: pytest.MonkeyPatch) -> 
         max_tokens=10,
     )
     assert p.get_qwen_tokens()["total_tokens"] == 0
+
+
+def test_qwen_stream_retryable_failure_falls_back_to_non_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RemoteProtocolError(Exception):
+        pass
+
+    class _StreamChunk:
+        choices = [type("Choice", (), {"delta": type("Delta", (), {"content": "partial"})()})()]
+        usage = None
+
+    class _Usage:
+        prompt_tokens = 7
+        completion_tokens = 4
+        total_tokens = 11
+
+    class _Resp:
+        choices = [type("Choice", (), {"message": type("Msg", (), {"content": "fallback answer"})()})()]
+        usage = _Usage()
+
+    class _BrokenStream:
+        def __iter__(self):
+            yield _StreamChunk()
+            raise RemoteProtocolError("incomplete chunked read")
+
+    class _Completions:
+        def create(self, **kwargs):  # noqa: ANN003
+            if kwargs.get("stream"):
+                return _BrokenStream()
+            return _Resp()
+
+    class _Client:
+        chat = type("Chat", (), {"completions": _Completions()})()
+
+    monkeypatch.setattr(p, "get_client", lambda _prov: _Client())
+
+    text = p._call_llm_once(
+        "qwen",
+        "qwen3.5-plus",
+        "s",
+        [{"role": "user", "content": "x"}],
+        max_tokens=10,
+    )
+
+    assert text == "fallback answer"
+    t = p.get_qwen_tokens()
+    assert t["prompt_tokens"] == 7
+    assert t["completion_tokens"] == 4
+    assert t["total_tokens"] == 11

@@ -79,7 +79,7 @@ def test_agent8_wrapper_caps_turns_for_block_restructure_sampling(monkeypatch, t
         repair_unit="block_restructure",
     )
     assert seen["repair_unit"] == "block_restructure"
-    assert seen["transactional_mode"] is False
+    assert seen["transactional_mode"] is True
     assert seen["max_turns"] == 8
 
 
